@@ -94,6 +94,7 @@ from zipvoice.utils.optim import ScaledAdam
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, LRScheduler]
 
+torch.autograd.set_detect_anomaly(True)
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -413,7 +414,7 @@ def get_params() -> AttributeDict:
             "best_train_epoch": -1,
             "best_valid_epoch": -1,
             "batch_idx_train": 0,
-            "log_interval": 50,
+            "log_interval": 10,
             "reset_interval": 200,
             "env_info": get_env_info(),
         }
@@ -549,7 +550,6 @@ def train_one_epoch(
         )
 
     for batch_idx, batch in enumerate(train_dl):
-
         if batch_idx % 10 == 0:
             if params.finetune:
                 set_batch_count(model, get_adjusted_batch_count(params) + 100000)
