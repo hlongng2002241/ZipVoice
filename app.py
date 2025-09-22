@@ -75,36 +75,42 @@ CHECKPOINT_CONFIGS = {
     #     "default_tokenizer": "espeak",
     #     "default_lang": "vi",
     # },
-    # "ZipVoice Telesale V2 (39 Epochs)": {
-    #     "model_dir": "exp/zipvoice_tls_train_v2",
-    #     "model_name": "epoch-39.pt",
-    #     "default_tokenizer": "espeak",
-    #     "default_lang": "vi",
-    # },
-    # "ZipVoice Vietnamese": {
-    #     "model_dir": "checkpoints/zipvoice_vi",
-    #     "model_name": "model.pt",
-    #     "default_tokenizer": "espeak",
-    #     "default_lang": "vi",
-    # },
-    "ZipVoice Origin": {
-        "model_dir": "checkpoints/zipvoice",
-        "model_name": "model.pt",
-        "default_tokenizer": "emilia",
-        "default_lang": "en-us"
+    "ZipVoice Telesale V3 (100 Epochs)": {
+        "model_dir": "exp/zipvoice_tls_train_v3",
+        "model_name": "epoch-100.pt",
+        "default_tokenizer": "espeak",
+        "default_lang": "vi",
     },
+    "ZipVoice Telesale V3 (Best valid loss)": {
+        "model_dir": "exp/zipvoice_tls_train_v3",
+        "model_name": "best-valid-loss.pt",
+        "default_tokenizer": "espeak",
+        "default_lang": "vi",
+    },
+    "ZipVoice Vietnamese": {
+        "model_dir": "checkpoints/zipvoice_vi",
+        "model_name": "model.pt",
+        "default_tokenizer": "espeak",
+        "default_lang": "vi",
+    },
+    # "ZipVoice Origin": {
+    #     "model_dir": "checkpoints/zipvoice",
+    #     "model_name": "model.pt",
+    #     "default_tokenizer": "emilia",
+    #     "default_lang": "en-us"
+    # },
 }
 
-# EXAMPLE_TEXTS = [
-#     "Hiện tại thì chương trình ưu đãi này bên em chỉ còn vài ngày nữa là hết hạn rồi. nên anh cứ suy nghĩ và cân nhắc sớm để tham gia chương trình.",
-#     "Em sẽ gọi lại sau để hỗ trợ đăng kí cho anh nhé. Chúc anh một ngày tốt lành.",
-#     "Phân tích cách họ đang cạnh tranh và hợp tác với các ngân hàng truyền thống, từ đó thay đổi cách người dùng tiếp cận dịch vụ tài chính.",
-# ]
 EXAMPLE_TEXTS = [
-    "The world is full of fascinating information and endless possibilities. I hope you have a wonderful and productive day.",
-    "It's a beautiful Monday morning here in Hanoi as the city begins a new week. I hope your day is filled with purpose and success.",
-    "Knowledge is a journey, not a destination. Let's learn something new together today.",
+    "Hiện tại thì chương trình ưu đãi này bên em chỉ còn vài ngày nữa là hết hạn rồi. nên anh cứ suy nghĩ và cân nhắc sớm để tham gia chương trình.",
+    "Em sẽ gọi lại sau để hỗ trợ đăng kí cho anh nhé. Chúc anh một ngày tốt lành.",
+    "Phân tích cách họ đang cạnh tranh và hợp tác với các ngân hàng truyền thống, từ đó thay đổi cách người dùng tiếp cận dịch vụ tài chính.",
 ]
+# EXAMPLE_TEXTS = [
+#     "The world is full of fascinating information and endless possibilities. I hope you have a wonderful and productive day.",
+#     "It's a beautiful Monday morning here in Hanoi as the city begins a new week. I hope your day is filled with purpose and success.",
+#     "Knowledge is a journey, not a destination. Let's learn something new together today.",
+# ]
 
 SAMPLING_RATE = 24000
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

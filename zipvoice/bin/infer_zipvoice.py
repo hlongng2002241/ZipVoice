@@ -523,23 +523,32 @@ def generate_sentence(
     # Tokenize text (int tokens)
     chunked_tokens = tokenizer.tokens_to_token_ids(chunked_tokens_str)
     prompt_tokens = tokenizer.tokens_to_token_ids([prompt_tokens_str])
+    
+    print("prompt_tokens =", prompt_tokens)
 
     # Batchify chunked texts for faster processing
     tokens_batches, chunked_index = batchify_tokens(
         chunked_tokens, max_duration, prompt_duration, token_duration
     )
 
+    print("tokens_batches =", tokens_batches)
+
     # Start predicting features
     chunked_features = []
     start_t = dt.datetime.now()
 
     for batch_tokens in tokens_batches:
+        batch_tokens.append(batch_tokens[-1][:80])
+        
         batch_prompt_tokens = prompt_tokens * len(batch_tokens)
 
         batch_prompt_features = prompt_features.repeat(len(batch_tokens), 1, 1)
         batch_prompt_features_lens = torch.full(
             (len(batch_tokens),), prompt_features.size(1), device=device
         )
+        
+        print("batch_tokens =", batch_tokens)
+        # import pdb; pdb.set_trace()
 
         # Generate features
         (
@@ -561,6 +570,8 @@ def generate_sentence(
 
         # Postprocess predicted features
         pred_features = pred_features.permute(0, 2, 1) / feat_scale  # (B, C, T)
+        print("pred_features_lens =", pred_features_lens)
+        import pdb; pdb.set_trace()
         chunked_features.append((pred_features, pred_features_lens))
 
     # Start vocoder processing
@@ -802,6 +813,7 @@ def main():
         params.device = torch.device("mps")
     else:
         params.device = torch.device("cpu")
+    params.device = torch.device("cuda", 0)
     logging.info(f"Device: {params.device}")
 
     model = model.to(params.device)

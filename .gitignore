@@ -198,3 +198,4 @@ checkpoints/
 data/
 history/
 exp/
+temp/

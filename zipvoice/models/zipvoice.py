@@ -397,7 +397,7 @@ class ZipVoice(nn.Module):
         duration: str = "predict",
         num_step: int = 5,
         guidance_scale: float = 0.5,
-    ) -> torch.Tensor:
+    ):
         """
         Generate acoustic features, given text tokens, prompts feature
             and prompt transcription's text tokens.
@@ -428,6 +428,9 @@ class ZipVoice(nn.Module):
                 prompt_features_lens=prompt_features_lens,
                 speed=speed,
             )
+            print("text_condition =", text_condition)
+            print("padding_mask =", padding_mask)
+            # import pdb; pdb.set_trace()
         else:
             assert features_lens is not None
             text_condition, padding_mask = self.forward_text_inference_gt_duration(
