@@ -94,7 +94,7 @@ from zipvoice.utils.optim import ScaledAdam
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, LRScheduler]
 
-torch.autograd.set_detect_anomaly(True)
+# torch.autograd.set_detect_anomaly(True)
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -164,6 +164,7 @@ def get_parser():
         """,
     )
 
+    parser.add_argument("--warmup-batches", type=int, default=500)
     parser.add_argument(
         "--base-lr", type=float, default=0.02, help="The base learning rate."
     )
@@ -957,9 +958,9 @@ def run(rank, world_size, args):
     if params.finetune:
         scheduler = FixedLRScheduler(optimizer)
     elif params.lr_hours > 0:
-        scheduler = Eden(optimizer, params.lr_batches, params.lr_hours)
+        scheduler = Eden(optimizer, params.lr_batches, params.lr_hours, params.warmup_batches)
     else:
-        scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
+        scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs, params.warmup_batches)
 
     scaler = create_grad_scaler(enabled=params.use_fp16)
 

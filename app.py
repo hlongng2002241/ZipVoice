@@ -63,18 +63,24 @@ logger = logging.getLogger(__name__)
 
 # Constants
 CHECKPOINT_CONFIGS = {
-    "ZipVoice Telesale (Best valid loss)": {
+    # "ZipVoice Telesale (Best valid loss)": {
+    #     "model_dir": "exp/zipvoice_tls",
+    #     "model_name": "best-valid-loss.pt",
+    #     "default_tokenizer": "espeak",
+    #     "default_lang": "vi",
+    # },
+    "ZipVoice Telesale (50 Epochs)": {
         "model_dir": "exp/zipvoice_tls",
-        "model_name": "best-valid-loss.pt",
+        "model_name": "epoch-50.pt",
         "default_tokenizer": "espeak",
         "default_lang": "vi",
     },
-    "ZipVoice Telesale (25 Epochs)": {
-        "model_dir": "exp/zipvoice_tls",
-        "model_name": "epoch-25.pt",
-        "default_tokenizer": "espeak",
-        "default_lang": "vi",
-    },
+    # "ZipVoice Telesale V2 (39 Epochs)": {
+    #     "model_dir": "exp/zipvoice_tls_train_v2",
+    #     "model_name": "epoch-39.pt",
+    #     "default_tokenizer": "espeak",
+    #     "default_lang": "vi",
+    # },
     "ZipVoice Vietnamese": {
         "model_dir": "checkpoints/zipvoice_vi",
         "model_name": "model.pt",

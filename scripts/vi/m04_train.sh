@@ -2,15 +2,7 @@
 
 CUDA_VISIBLE_DEVICES=1 python -m zipvoice.bin.train_zipvoice \
     \
-    --finetune True \
-    \
-    --start-epoch 26 \
-    \
-    --num-epochs 50 \
-    --exp-dir exp/zipvoice_tls \
-    --seed 8686 \
-    --save-every-n 5000 \
-    --valid-by-epoch True \
+    --finetune False \
     \
     --checkpoint checkpoints/zipvoice_vi/model.pt \
     --model-config checkpoints/zipvoice_vi/model.json \
@@ -18,13 +10,25 @@ CUDA_VISIBLE_DEVICES=1 python -m zipvoice.bin.train_zipvoice \
     --tokenizer espeak \
     --lang vi \
     \
-    --base-lr 1e-4 \
+    --seed 8686 \
+    --exp-dir exp/zipvoice_tls_train_v3 \
+    --save-every-n 50000000000 \
+    --valid-by-epoch True \
+    --keep-last-k 0 \
+    --num-epochs 100 \
+    \
+    --warmup-batches 2000 \
+    --base-lr 0.0001 \
+    --lr-epochs 100 \
+    --lr-batches 7500 \
     --use-fp16 True \
     --feat-scale 0.1 \
     --condition-drop-ratio 0.2 \
+    --min-len 1.0 \
+    --max-len 60.0 \
+    --num-buckets 60 \
     \
     --dataset custom \
     --train-manifest data/vi/manifest/custom_cuts_train_with_tokens.jsonl.gz \
     --dev-manifest data/vi/manifest/custom_cuts_test_with_tokens.jsonl.gz \
-    --max-duration 310
-    
+    --max-duration 160
