@@ -428,9 +428,6 @@ class ZipVoice(nn.Module):
                 prompt_features_lens=prompt_features_lens,
                 speed=speed,
             )
-            print("text_condition =", text_condition)
-            print("padding_mask =", padding_mask)
-            # import pdb; pdb.set_trace()
         else:
             assert features_lens is not None
             text_condition, padding_mask = self.forward_text_inference_gt_duration(
@@ -499,7 +496,7 @@ class ZipVoice(nn.Module):
         t_end: float,
         num_step: int = 1,
         guidance_scale: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ):
         """
         Generate acoustic features in intermediate timesteps.
         Args:
