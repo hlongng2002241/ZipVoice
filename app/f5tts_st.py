@@ -40,13 +40,13 @@ class F5TTSApp(VoiceCloneApp):
     """F5-TTS-specific implementation of TTS app."""
 
     def __init__(self, config: F5TTSConfig):
-        self.config: F5TTSConfig
-
         self.f5_model_name = config.f5_model_name
         self.ckpt_file = config.ckpt_file
         self.vocab_file = config.vocab_file
 
         super().__init__(config)
+
+        self.config: F5TTSConfig
 
     def load_model(self):
         """Load F5-TTS model and Vocos vocoder."""
@@ -118,6 +118,15 @@ class F5TTSApp(VoiceCloneApp):
                 help="Sway sampling coefficient for generation",
             )
 
+            mel_trunc = st.slider(
+                "Mel rear truncation",
+                min_value=0,
+                max_value=10,
+                value=2,
+                step=1,
+                help="Mel rear truncates before being fed to vocoder",
+            )
+
             return {
                 "target_rms": target_rms,
                 "cross_fade_duration": cross_fade_duration,
@@ -125,6 +134,7 @@ class F5TTSApp(VoiceCloneApp):
                 "cfg_strength": cfg_strength,
                 "sway_sampling_coef": sway_sampling_coef,
                 "speed": speed,
+                "mel_trunc": mel_trunc,
             }
 
     def generate_speech(self, text: str, **params) -> np.ndarray:
@@ -150,6 +160,7 @@ class F5TTSApp(VoiceCloneApp):
             sway_sampling_coef=params.pop("sway_sampling_coef"),
             speed=params.pop("speed"),
             device=str(self.device),
+            mel_trunc=params.pop("mel_trunc"),
         )
 
         wav = audio_segments[0].squeeze()
