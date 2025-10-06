@@ -344,6 +344,10 @@ class BaseApp(ABC):
                         wav_seconds = len(audio_array) / self.config.audio_sample_rate
                         rtf = generation_time / wav_seconds
 
+                    # Clean up after generation
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
                     # Render audio output
                     self.render_audio_output(audio_array, rtf)
 

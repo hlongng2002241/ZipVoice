@@ -68,6 +68,16 @@ st.markdown(
 
 # Predefined model configurations
 MODEL_CONFIGS: list[BaseConfig] = [
+    # ZipVoice Models
+    ZipVoiceConfig(
+        app_name="ZipVoice Origin",
+        model_type="zipvoice",
+        audio_sample_rate=24000,
+        language="en-us",
+        model_dir="checkpoints/zipvoice",
+        model_file="model.pt",
+        default_tokenizer="emilia",
+    ),
     # F5-TTS Models
     F5TTSConfig(
         app_name="F5-TTS Origin",
@@ -78,16 +88,6 @@ MODEL_CONFIGS: list[BaseConfig] = [
         ckpt_file="/data2/longnh/projects/mine/F5-TTS/ckpts/original/model_1200000.pt",
         vocab_file="/data2/longnh/projects/mine/F5-TTS/ckpts/original/vocab.txt",
         default_tokenizer="f5tts",
-    ),
-    # ZipVoice Models
-    ZipVoiceConfig(
-        app_name="ZipVoice Origin",
-        model_type="zipvoice",
-        audio_sample_rate=24000,
-        language="en-us",
-        model_dir="checkpoints/zipvoice",
-        model_file="model.pt",
-        default_tokenizer="emilia",
     ),
     # Additional ZipVoice models (commented out for now)
     # "ZipVoice Telesale V3 (100 Epochs)": ZipVoiceConfig(
@@ -129,6 +129,12 @@ def list_available_models() -> list[str]:
 @st.cache_resource
 def create_app_instance(model_name: str) -> Any:
     """Create the appropriate app instance based on model type."""
+    import torch
+
+    # Clear CUDA cache before loading new model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     config = get_model_config(model_name)
 
     if config.model_type == "zipvoice":

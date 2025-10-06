@@ -5,10 +5,12 @@ Inherits from BaseApp and implements ZipVoice-specific functionality
 """
 
 import json
+import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
 
+import numpy as np
 import safetensors.torch
 import streamlit as st
 import torch
@@ -160,24 +162,24 @@ class ZipVoiceApp(VoiceCloneApp):
             )
 
             num_step = st.slider(
-                "Number of Steps", min_value=4, max_value=64, value=32, step=1, help="Number of diffusion steps for generation"
+                "Number of Steps", min_value=4, max_value=100, value=32, step=1, help="Number of diffusion steps for generation (default 16 for zipvoice, 8 for zipvoice_distill)"
             )
 
             feat_scale = st.slider(
-                "Feature Scale", min_value=0.1, max_value=2.0, value=1.0, step=0.05, help="Scale factor for audio features"
+                "Feature Scale", min_value=0.01, max_value=0.5, value=0.1, step=0.01, help="Scale factor for audio features"
             )
 
             guidance_scale = st.slider(
                 "Guidance Scale",
                 min_value=1.0,
-                max_value=10.0,
-                value=3.5,
+                max_value=5.0,
+                value=1.0,
                 step=0.1,
-                help="Controls the strength of guidance during generation",
+                help="Controls the strength of guidance during generation (default 1.0 for zipvoice, 3.0 for zipvoice_distill)",
             )
 
             t_shift = st.slider(
-                "Time Shift", min_value=-1.0, max_value=1.0, value=0.0, step=0.05, help="Time shift parameter for generation"
+                "Time Shift", min_value=0.0, max_value=1.0, value=0.5, step=0.05, help="Time shift parameter for generation"
             )
 
             target_rms = st.slider(
@@ -212,6 +214,8 @@ class ZipVoiceApp(VoiceCloneApp):
         prompt_audio_path = params.pop("prompt_audio_path")
 
         # Convert text to tokens
+        if text[-1] not in string.punctuation:
+            text += "."
         tokens = self.tokenizer.texts_to_token_ids([text])
         prompt_tokens = self.tokenizer.texts_to_token_ids([prompt_text])
 
@@ -237,25 +241,35 @@ class ZipVoiceApp(VoiceCloneApp):
         prompt_features_lens = torch.tensor([prompt_features.size(1)], device=self.device)
 
         # Generate features
-        pred_features, _, _, _ = self.model.sample(
-            tokens=tokens,
-            prompt_tokens=prompt_tokens,
-            prompt_features=prompt_features,
-            prompt_features_lens=prompt_features_lens,
-            speed=params.pop("speed"),
-            t_shift=params.pop("t_shift"),
-            duration="predict",
-            num_step=params.pop("num_step"),
-            guidance_scale=params.pop("guidance_scale"),
-        )
+        with torch.no_grad():
+            pred_features, _, _, _ = self.model.sample(
+                tokens=tokens,
+                prompt_tokens=prompt_tokens,
+                prompt_features=prompt_features,
+                prompt_features_lens=prompt_features_lens,
+                speed=params.pop("speed"),
+                t_shift=params.pop("t_shift"),
+                duration="predict",
+                num_step=params.pop("num_step"),
+                guidance_scale=params.pop("guidance_scale"),
+            )
 
         # Convert features to audio
         pred_features = pred_features.permute(0, 2, 1) / feat_scale
-        wav = self.vocoder.decode(pred_features).squeeze(1).clamp(-1, 1)
+
+        with torch.no_grad():
+            wav = self.vocoder.decode(pred_features).squeeze(1).clamp(-1, 1)
 
         # Adjust volume
         if prompt_rms < target_rms:
             wav = wav * prompt_rms / target_rms
 
-        wav = wav.cpu().numpy().squeeze()
-        return wav
+        # Move to CPU before cleanup
+        wav_numpy = wav.cpu().numpy().squeeze()
+
+        # Clean up GPU memory
+        del tokens, prompt_tokens, prompt_features, prompt_features_lens, pred_features, wav
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return wav_numpy

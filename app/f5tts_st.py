@@ -118,15 +118,6 @@ class F5TTSApp(VoiceCloneApp):
                 help="Sway sampling coefficient for generation",
             )
 
-            mel_trunc = st.slider(
-                "Mel rear truncation",
-                min_value=0,
-                max_value=10,
-                value=2,
-                step=1,
-                help="Mel rear truncates before being fed to vocoder",
-            )
-
             return {
                 "target_rms": target_rms,
                 "cross_fade_duration": cross_fade_duration,
@@ -134,35 +125,41 @@ class F5TTSApp(VoiceCloneApp):
                 "cfg_strength": cfg_strength,
                 "sway_sampling_coef": sway_sampling_coef,
                 "speed": speed,
-                "mel_trunc": mel_trunc,
             }
 
     def generate_speech(self, text: str, **params) -> np.ndarray:
         """Generate speech using F5-TTS model."""
+        import torch
 
         # Preprocess reference audio and text
         prompt_audio_path = params.pop("prompt_audio_path")
         prompt_text = params.pop("prompt_text")
 
-        ref_audio, ref_text = preprocess_ref_audio_text(prompt_audio_path, prompt_text)
+        with torch.no_grad():
+            ref_audio, ref_text = preprocess_ref_audio_text(prompt_audio_path, prompt_text)
 
-        # Use F5-TTS inference with infer_batch
-        audio_segments, _ = infer_batch(
-            ref_audio,
-            ref_text,
-            text,
-            self.model,
-            self.vocoder,
-            target_rms=params.pop("target_rms"),
-            cross_fade_duration=params.pop("cross_fade_duration"),
-            nfe_step=params.pop("nfe_step"),
-            cfg_strength=params.pop("cfg_strength"),
-            sway_sampling_coef=params.pop("sway_sampling_coef"),
-            speed=params.pop("speed"),
-            device=str(self.device),
-            mel_trunc=params.pop("mel_trunc"),
-        )
+            # Use F5-TTS inference with infer_batch
+            audio_segments, _ = infer_batch(
+                ref_audio,
+                ref_text,
+                text,
+                self.model,
+                self.vocoder,
+                mel_spec_type="vocos",
+                target_rms=params.pop("target_rms"),
+                cross_fade_duration=params.pop("cross_fade_duration"),
+                nfe_step=params.pop("nfe_step"),
+                cfg_strength=params.pop("cfg_strength"),
+                sway_sampling_coef=params.pop("sway_sampling_coef"),
+                speed=params.pop("speed"),
+                device=str(self.device),
+            )
 
-        wav = audio_segments[0].squeeze()
+            wav = audio_segments[0].squeeze()
 
-        return wav
+            # Clean up GPU memory
+            del audio_segments, ref_audio
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            return wav
