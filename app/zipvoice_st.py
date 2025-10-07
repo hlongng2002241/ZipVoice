@@ -242,7 +242,7 @@ class ZipVoiceApp(VoiceCloneApp):
 
         # Generate features
         with torch.no_grad():
-            pred_features, _, _, _ = self.model.sample(
+            pred_features, pred_features_lens, _, _ = self.model.sample(
                 tokens=tokens,
                 prompt_tokens=prompt_tokens,
                 prompt_features=prompt_features,
@@ -253,6 +253,10 @@ class ZipVoiceApp(VoiceCloneApp):
                 num_step=params.pop("num_step"),
                 guidance_scale=params.pop("guidance_scale"),
             )
+
+        print("tokens =", tokens)
+        print("pred_features =", pred_features.shape)
+        print("pred_features_lens =", pred_features_lens)
 
         # Convert features to audio
         pred_features = pred_features.permute(0, 2, 1) / feat_scale

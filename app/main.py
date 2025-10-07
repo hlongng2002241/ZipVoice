@@ -68,6 +68,15 @@ st.markdown(
 
 # Predefined model configurations
 MODEL_CONFIGS: list[BaseConfig] = [
+    ZipVoiceConfig(
+        app_name="ZipVoice Vi",
+        model_type="zipvoice",
+        audio_sample_rate=24000,
+        language="vi",
+        model_dir="checkpoints/zipvoice_vi",
+        model_file="model.pt",
+        default_tokenizer="espeak",
+    ),
     # ZipVoice Models
     ZipVoiceConfig(
         app_name="ZipVoice Origin",
