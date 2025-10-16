@@ -103,6 +103,8 @@ class F5TTSApp(BaseApp):
 
         # Preprocess reference audio and text
         params = F5TTSParameters(**params)
+        print(params.model_dump_json(indent=4, ensure_ascii=False))
+
         ref_audio = [params.prompt_audio_path for _ in range(len(texts))]
         ref_text = [params.prompt_text for _ in range(len(texts))]
 
@@ -240,6 +242,7 @@ class ZipVoiceApp(BaseApp):
         assert self.feature_extractor is not None
 
         params = ZipvoiceParameters(**params)
+        print(params.model_dump_json(indent=4, ensure_ascii=False))
 
         if isinstance(texts, str):
             texts = [texts]
@@ -440,6 +443,57 @@ async def synthesize(inp: InputDTO, model_apps: dict[str, BaseApp] = Depends(get
     # Generate speech
     print(f"Generating audio with {inp.model} for text: {text[:50]}...")
     audio_list, sr = model_app.generate_speech(text, **params)
+
+    wav_bytes = convert_audio_to_bytes(audio_list[0], sample_rate=sr, format=audio_fmt)
+
+    return StreamingResponse(io.BytesIO(wav_bytes), media_type=f"audio/{audio_fmt}")
+
+
+@app.post("/api/synthesize_prod")
+async def synthesize_prod(inp: InputDTO, model_apps: dict[str, BaseApp] = Depends(get_model_apps)):
+    text = inp.text
+    voice = inp.voice
+    audio_fmt = "wav"
+
+    # Handle dummy models
+    if inp.model.lower().startswith("dummy"):
+        with open("temp/result.wav", "rb") as f:
+            wav_bytes = f.read()
+        return StreamingResponse(io.BytesIO(wav_bytes), media_type=f"audio/{audio_fmt}")
+
+    # Get voice reference
+    if voice not in REF_SPEAKERS_MAP:
+        raise HTTPException(status_code=400, detail=f"Unknown voice: {voice}. Available voices: {list(REF_SPEAKERS_MAP.keys())}")
+
+    ref_speaker = REF_SPEAKERS_MAP[voice]
+    prompt_audio_path = ref_speaker.audio_path
+    prompt_text = ref_speaker.text
+
+    print(f"Using voice: {voice}")
+    print(f"  Prompt text: {prompt_text}")
+    print(f"  Prompt audio: {prompt_audio_path}")
+
+    # Route to actual models
+    params = inp.params.model_dump() if inp.params is not None else {}
+    params.update(
+        {
+            "prompt_text": prompt_text,
+            "prompt_audio_path": prompt_audio_path,
+        }
+    )
+
+    model_app = model_apps.get(inp.model)
+    if model_app is None:
+        raise HTTPException(500, detail=f"Model {inp.model} is not loaded yet")
+
+    # Generate speech
+    print(f"Generating audio with {inp.model} for text: {text[:50]}...")
+    texts = [
+        text, 
+        "đây là văn bản số hai. " + text, 
+        "đây là văn bản dài hơn của văn bản gốc, văn bản số 3. " + text
+    ]
+    audio_list, sr = model_app.generate_speech(texts, **params)
 
     wav_bytes = convert_audio_to_bytes(audio_list[0], sample_rate=sr, format=audio_fmt)
 

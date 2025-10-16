@@ -1,0 +1,140 @@
+<View>
+  <Style>
+    .container {
+      padding: 20px;
+      font-family: Arial, sans-serif;
+    }
+    .header {
+      font-size: 18px;
+      font-weight: bold;
+      margin-bottom: 20px;
+      color: #333;
+    }
+    .instructions {
+      font-size: 14px;
+      color: #666;
+      margin-bottom: 30px;
+      padding: 15px;
+      background-color: #f5f5f5;
+      border-radius: 5px;
+      font-weight: bold;
+    }
+    .text-section {
+      margin-bottom: 30px;
+      padding: 15px;
+      background-color: #f9f9f9;
+      border-left: 4px solid #4CAF50;
+      font-size: 16px;
+      line-height: 1.6;
+    }
+    .audio-container {
+      display: flex;
+      gap: 30px;
+      margin-bottom: 30px;
+    }
+    .audio-item {
+      flex: 1;
+      padding: 20px;
+      background-color: #ffffff;
+      border: 2px solid #e0e0e0;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .audio-label {
+      font-size: 18px;
+      font-weight: bold;
+      color: #555;
+      margin-bottom: 15px;
+      text-align: center;
+    }
+    .rating-label {
+      font-size: 14px;
+      color: #666;
+      margin-top: 15px;
+      margin-bottom: 8px;
+      text-align: center;
+    }
+    .comments-section {
+      margin-top: 30px;
+      padding: 15px;
+      background-color: #f9f9f9;
+      border-radius: 5px;
+    }
+    .label-text {
+      font-weight: bold;
+      margin-bottom: 10px;
+    }
+  </Style>
+
+  <View className="container">
+    <View className="header">
+      TTS Quality Evaluation
+    </View>
+
+    <View className="instructions">
+      📝 Instructions: Listen to both audio samples and rate their quality from 1 (poor) to 5 (excellent).
+      Consider naturalness, clarity, pronunciation, and overall quality.
+    </View>
+
+    <View className="text-section">
+      <View className="label-text">Text:</View>
+      <Text name="text" value="$text" />
+    </View>
+
+    <View className="audio-container">
+      <!-- Audio A -->
+      <View className="audio-item">
+        <View className="audio-label">🔊 Audio A</View>
+        <Audio
+          name="audio_a"
+          value="$audio_a"
+          hotkey="1"
+        />
+        <View className="rating-label">
+          Rate Audio A (1 = Poor, 5 = Excellent)
+        </View>
+        <Rating
+          name="rating_a"
+          toName="audio_a"
+          maxRating="5"
+          icon="star"
+          size="large"
+          required="true"
+        />
+      </View>
+
+      <!-- Audio B -->
+      <View className="audio-item">
+        <View className="audio-label">🔊 Audio B</View>
+        <Audio
+          name="audio_b"
+          value="$audio_b"
+          hotkey="2"
+        />
+        <View className="rating-label">
+          Rate Audio B (1 = Poor, 5 = Excellent)
+        </View>
+        <Rating
+          name="rating_b"
+          toName="audio_b"
+          maxRating="5"
+          icon="star"
+          size="large"
+          required="true"
+        />
+      </View>
+    </View>
+
+    <!-- Optional Comments -->
+    <View className="comments-section">
+      <View className="label-text">Additional Comments (Optional):</View>
+      <TextArea
+        name="comments"
+        toName="text"
+        placeholder="Any observations about the audio quality, issues, or preferences..."
+        rows="3"
+        maxSubmissions="1"
+      />
+    </View>
+  </View>
+</View>
