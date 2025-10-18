@@ -4,6 +4,7 @@ import io
 import abc
 import json
 import string
+import logging
 import tempfile
 from contextlib import asynccontextmanager
 from importlib.resources import files
@@ -32,6 +33,11 @@ from zipvoice.tokenizer.tokenizer import (
 from zipvoice.utils.checkpoint import load_checkpoint
 from zipvoice.utils.feature import VocosFbank
 from data.ref_audio.metadata import REF_SPEAKERS_MAP
+from app.text.normalizer.models.normalizer_forward import AutoTextNormalizer
+from quick_utils.common.timer import Timer
+
+
+logging.basicConfig(level=logging.INFO)
 
 
 class BaseApp(abc.ABC):
@@ -103,7 +109,7 @@ class F5TTSApp(BaseApp):
 
         # Preprocess reference audio and text
         params = F5TTSParameters(**params)
-        print(params.model_dump_json(indent=4, ensure_ascii=False))
+        print(params.model_dump_json(indent=4))
 
         ref_audio = [params.prompt_audio_path for _ in range(len(texts))]
         ref_text = [params.prompt_text for _ in range(len(texts))]
@@ -242,7 +248,7 @@ class ZipVoiceApp(BaseApp):
         assert self.feature_extractor is not None
 
         params = ZipvoiceParameters(**params)
-        print(params.model_dump_json(indent=4, ensure_ascii=False))
+        print(params.model_dump_json(indent=4))
 
         if isinstance(texts, str):
             texts = [texts]
@@ -317,18 +323,24 @@ class ZipVoiceApp(BaseApp):
 MODEL_APP_CONFIGS = {
     "F5TTS_vi": F5TTSConfig(
         f5_model_name="F5TTS_Base",
-        ckpt_file="../F5-TTS/ckpts/f5tts_vi/model_last.pt",
-        vocab_file="../F5-TTS/ckpts/f5tts_vi/vocab.txt",
+        ckpt_file="../F5-TTS/ckpts/f5_tts_vi/model_last.pt",
+        vocab_file="../F5-TTS/ckpts/f5_tts_vi/vocab.txt",
         tokenizer_type="f5tts",
     ),
     "Zipvoice_vi": ZipVoiceConfig(
-        model_dir="checkpoints/zipvoice_vi",
-        model_file="model.pt",
+        model_dir="exp/version_0",
+        model_file="best-valid-loss.pt",
         tokenizer_type="espeak",
         language="vi",
         audio_sample_rate=24000,
     ),
 }
+
+
+class Pack:
+    def __init__(self, model_apps: dict[str, BaseApp], normalizer: AutoTextNormalizer) -> None:
+        self.model_apps = model_apps
+        self.normalizer = normalizer
 
 
 @asynccontextmanager
@@ -340,7 +352,7 @@ async def lifespan(app: FastAPI):
     print("Loading TTS models...")
     print("=" * 70)
 
-    # Load F5-TTS model
+    # Load models
     for app_name, config in MODEL_APP_CONFIGS.items():
         if config.model_type == "f5tts":
             model_app = F5TTSApp(config, device="cuda:0")
@@ -362,7 +374,14 @@ async def lifespan(app: FastAPI):
     print("API server ready!")
     print("=" * 70)
 
-    app.state.model_apps = model_apps
+    # Load normalizer
+    normalizer = AutoTextNormalizer(
+        model_path="checkpoints/tagger/tagger_10_mMimiLM_v2_bi/checkpoint-4207",
+        tokenizer_name="microsoft/Multilingual-MiniLM-L12-H384",
+        label_matching="match_goal_tags",
+    )
+
+    app.state.pack = Pack(model_apps=model_apps, normalizer=normalizer)
 
     yield
 
@@ -374,8 +393,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-def get_model_apps(request: Request) -> dict[str, BaseApp]:
-    return request.app.state.model_apps
+def get_pack(request: Request) -> Pack:
+    return request.app.state.pack
 
 
 def convert_audio_to_bytes(audio: np.ndarray, sample_rate: int, format: str):
@@ -390,12 +409,63 @@ def convert_audio_to_bytes(audio: np.ndarray, sample_rate: int, format: str):
 class InputDTO(BaseModel):
     model: str
     text: str
-    voice: str = "Jane__default"  # Voice name from REF_SPEAKERS_MAP
+    voice: str | None = None  # Voice name from REF_SPEAKERS_MAP
     params: F5TTSParameters | ZipvoiceParameters | None = None
 
 
+def prepare_inputs(inp: InputDTO, pack: Pack):
+    text = inp.text
+    voice = inp.voice
+    model_apps = pack.model_apps
+
+    # normalize text
+    text = pack.normalizer.normalize([text], norm_puncs=False)[0]
+
+    # Get params from input
+    params = inp.params.model_dump() if inp.params is not None else {}
+
+    # Check if prompt_text and prompt_audio_path are already provided in params
+    prompt_text = params.get("prompt_text")
+    prompt_audio_path = params.get("prompt_audio_path")
+
+    # If not provided, use voice lookup from REF_SPEAKERS_MAP
+    if not prompt_text or not prompt_audio_path:
+        if not voice:
+            raise HTTPException(
+                status_code=400, detail="Either provide 'voice' OR both 'prompt_text' and 'prompt_audio_path' in params"
+            )
+
+        if voice not in REF_SPEAKERS_MAP:
+            raise HTTPException(
+                status_code=400, detail=f"Unknown voice: {voice}. Available voices: {list(REF_SPEAKERS_MAP.keys())}"
+            )
+
+        ref_speaker = REF_SPEAKERS_MAP[voice]
+        prompt_audio_path = ref_speaker.audio_path
+        prompt_text = ref_speaker.text
+
+        print(f"Using preset voice: {voice}")
+
+    print(f"  Prompt text: {prompt_text}")
+    print(f"  Prompt audio: {prompt_audio_path}")
+
+    # Update params with prompt info
+    params.update(
+        {
+            "prompt_text": prompt_text,
+            "prompt_audio_path": prompt_audio_path,
+        }
+    )
+
+    model_app = model_apps.get(inp.model)
+    if model_app is None:
+        raise HTTPException(500, detail=f"Model {inp.model} is not loaded yet")
+
+    return model_app, text, params
+
+
 @app.post("/api/synthesize")
-async def synthesize(inp: InputDTO, model_apps: dict[str, BaseApp] = Depends(get_model_apps)):
+async def synthesize(inp: InputDTO, pack: Pack = Depends(get_pack)):
     """
     Generate audio from text using specified TTS model.
 
@@ -405,44 +475,14 @@ async def synthesize(inp: InputDTO, model_apps: dict[str, BaseApp] = Depends(get
     Returns:
         WAV audio as streaming response
     """
-    text = inp.text
-    voice = inp.voice
     audio_fmt = "wav"
-
-    # Handle dummy models
-    if inp.model.lower().startswith("dummy"):
-        with open("temp/result.wav", "rb") as f:
-            wav_bytes = f.read()
-        return StreamingResponse(io.BytesIO(wav_bytes), media_type=f"audio/{audio_fmt}")
-
-    # Get voice reference
-    if voice not in REF_SPEAKERS_MAP:
-        raise HTTPException(status_code=400, detail=f"Unknown voice: {voice}. Available voices: {list(REF_SPEAKERS_MAP.keys())}")
-
-    ref_speaker = REF_SPEAKERS_MAP[voice]
-    prompt_audio_path = ref_speaker.audio_path
-    prompt_text = ref_speaker.text
-
-    print(f"Using voice: {voice}")
-    print(f"  Prompt text: {prompt_text}")
-    print(f"  Prompt audio: {prompt_audio_path}")
-
-    # Route to actual models
-    params = inp.params.model_dump() if inp.params is not None else {}
-    params.update(
-        {
-            "prompt_text": prompt_text,
-            "prompt_audio_path": prompt_audio_path,
-        }
-    )
-
-    model_app = model_apps.get(inp.model)
-    if model_app is None:
-        raise HTTPException(500, detail=f"Model {inp.model} is not loaded yet")
+    with Timer("Prepare inputs"):
+        model_app, text, params = prepare_inputs(inp, pack)
 
     # Generate speech
     print(f"Generating audio with {inp.model} for text: {text[:50]}...")
-    audio_list, sr = model_app.generate_speech(text, **params)
+    with Timer("Synthesize speech"):
+        audio_list, sr = model_app.generate_speech(text, **params)
 
     wav_bytes = convert_audio_to_bytes(audio_list[0], sample_rate=sr, format=audio_fmt)
 
@@ -450,46 +490,16 @@ async def synthesize(inp: InputDTO, model_apps: dict[str, BaseApp] = Depends(get
 
 
 @app.post("/api/synthesize_prod")
-async def synthesize_prod(inp: InputDTO, model_apps: dict[str, BaseApp] = Depends(get_model_apps)):
-    text = inp.text
-    voice = inp.voice
+async def synthesize_prod(inp: InputDTO, pack: Pack = Depends(get_pack)):
     audio_fmt = "wav"
-
-    # Handle dummy models
-    if inp.model.lower().startswith("dummy"):
-        with open("temp/result.wav", "rb") as f:
-            wav_bytes = f.read()
-        return StreamingResponse(io.BytesIO(wav_bytes), media_type=f"audio/{audio_fmt}")
-
-    # Get voice reference
-    if voice not in REF_SPEAKERS_MAP:
-        raise HTTPException(status_code=400, detail=f"Unknown voice: {voice}. Available voices: {list(REF_SPEAKERS_MAP.keys())}")
-
-    ref_speaker = REF_SPEAKERS_MAP[voice]
-    prompt_audio_path = ref_speaker.audio_path
-    prompt_text = ref_speaker.text
-
-    print(f"Using voice: {voice}")
-    print(f"  Prompt text: {prompt_text}")
-    print(f"  Prompt audio: {prompt_audio_path}")
-
-    # Route to actual models
-    params = inp.params.model_dump() if inp.params is not None else {}
-    params.update(
-        {
-            "prompt_text": prompt_text,
-            "prompt_audio_path": prompt_audio_path,
-        }
-    )
-
-    model_app = model_apps.get(inp.model)
-    if model_app is None:
-        raise HTTPException(500, detail=f"Model {inp.model} is not loaded yet")
+    with Timer("Prepare inputs"):
+        model_app, text, params = prepare_inputs(inp, pack)
+    texts = [text, "đây là văn bản số hai. " + text, "đây là văn bản dài hơn của văn bản gốc, văn bản số 3. " + text]
 
     # Generate speech
     print(f"Generating audio with {inp.model} for text: {text[:50]}...")
-    texts = [text, "đây là văn bản số hai. " + text, "đây là văn bản dài hơn của văn bản gốc, văn bản số 3. " + text]
-    audio_list, sr = model_app.generate_speech(texts, **params)
+    with Timer("Synthesize speech"):
+        audio_list, sr = model_app.generate_speech(texts, **params)
 
     wav_bytes = convert_audio_to_bytes(audio_list[0], sample_rate=sr, format=audio_fmt)
 

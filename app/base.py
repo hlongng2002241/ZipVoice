@@ -3,6 +3,8 @@ import json
 import uuid
 import time
 import tempfile
+import subprocess
+import hashlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +16,98 @@ import streamlit as st
 import numpy as np
 
 from data.ref_audio.metadata import REF_SPEAKERS_MAP, RefSpeaker
+
+
+def convert_audio_to_wav(input_path: str, output_path: str, sample_rate: int = 24000) -> bool:
+    """
+    Convert audio file to WAV format using ffmpeg.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        cmd = [
+            "ffmpeg", "-i", input_path,
+            "-ar", str(sample_rate),
+            "-ac", "1",  # mono
+            "-y",  # overwrite
+            output_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"Audio conversion failed: {e}")
+        return False
+
+
+def save_additional_audio(audio_path: str, transcript: str, audio_dir: str = "data/ref_audio/additional/audio") -> tuple[str, str]:
+    """
+    Save audio file to additional audio directory with metadata.
+
+    Args:
+        audio_path: Path to the temporary audio file
+        transcript: Transcription of the audio
+        audio_dir: Directory to save audio files
+
+    Returns:
+        Tuple of (permanent_audio_path, voice_name)
+    """
+    # Create directory if it doesn't exist
+    audio_dir_path = Path(audio_dir)
+    audio_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Calculate hash digest of audio file
+    hash_md5 = hashlib.md5()
+    with open(audio_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    file_hash = hash_md5.hexdigest()
+
+    # Generate filename based on hash
+    voice_name = f"custom_{file_hash}"
+    audio_filename = f"{file_hash}.wav"
+    permanent_path = audio_dir_path / audio_filename
+
+    # Copy audio file to permanent location (skip if already exists)
+    if not permanent_path.exists():
+        import shutil
+        shutil.copy(audio_path, permanent_path)
+
+    return str(permanent_path), voice_name
+
+
+def append_audio_metadata(audio_path: str, transcript: str, metadata_file: str = "data/ref_audio/additional/metadata.jsonl"):
+    """
+    Append audio metadata to JSONL file.
+
+    Args:
+        audio_path: Path to the audio file
+        transcript: Transcription of the audio
+        metadata_file: Path to metadata JSONL file
+    """
+    metadata = {
+        "audio_path": audio_path,
+        "text": transcript
+    }
+
+    # Create parent directory if it doesn't exist
+    metadata_path = Path(metadata_file)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Check if this audio path already exists in metadata
+    existing_paths = set()
+    if metadata_path.exists():
+        with open(metadata_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        entry = json.loads(line)
+                        existing_paths.add(entry.get("audio_path"))
+                    except json.JSONDecodeError:
+                        continue
+
+    # Only append if this audio path doesn't already exist
+    if audio_path not in existing_paths:
+        with open(metadata_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(metadata, ensure_ascii=False) + "\n")
 
 
 @dataclass
@@ -165,7 +259,12 @@ class BaseApp(ABC):
         audio_path = history_dir / audio_filename
         audio_path = str(audio_path)
 
-        torchaudio.save(audio_path, torch.from_numpy(audio_array).unsqueeze(0), self.config.audio_sample_rate)
+        # Ensure audio is in the right shape for saving
+        audio_tensor = torch.from_numpy(audio_array)
+        if audio_tensor.dim() == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+
+        torchaudio.save(audio_path, audio_tensor, self.config.audio_sample_rate)
 
         # Create history entry
         history_entry = HistoryEntry(
@@ -238,6 +337,10 @@ class BaseApp(ABC):
 
     def render_history(self):
         """Render synthesis history section."""
+        # Initialize history if not exists
+        if "synthesis_history" not in st.session_state:
+            st.session_state.synthesis_history = []
+
         if st.session_state.synthesis_history:
             st.markdown("---")
 
@@ -261,9 +364,20 @@ class BaseApp(ABC):
                         st.write(f"**Text:** {entry.text}")
 
                         if os.path.exists(entry.audio_path):
-                            st.audio(entry.audio_path)
+                            try:
+                                # Load audio using torchaudio (same as saved)
+                                audio_tensor, sample_rate = torchaudio.load(entry.audio_path)
+
+                                # Convert to numpy and squeeze to 1D
+                                audio_numpy = audio_tensor.squeeze().numpy()
+
+                                # Use the same method as render_audio_output
+                                st.audio(audio_numpy, sample_rate=sample_rate)
+
+                            except Exception as e:
+                                st.error(f"Error loading audio: {str(e)}")
                         else:
-                            st.error("Audio file not found")
+                            st.error(f"Audio file not found: {entry.audio_path}")
 
                     with col2:
                         # Compact controls
@@ -272,7 +386,7 @@ class BaseApp(ABC):
                                 st.download_button(
                                     label="Download",
                                     data=f.read(),
-                                    file_name=entry.audio_path,
+                                    file_name=os.path.basename(entry.audio_path),
                                     mime="audio/wav",
                                     key=f"download_{entry.id}",
                                     use_container_width=True,
@@ -384,7 +498,9 @@ class VoiceCloneApp(BaseApp):
             st.subheader("🎤 Voice Selection")
 
             voice_source = st.radio(
-                "Voice Source", options=["Preset Voices", "Custom Upload"], help="Choose a preset voice or upload your own"
+                "Voice Source",
+                options=["Preset Voices", "Custom Upload", "Record Audio"],
+                help="Choose a preset voice, upload your own, or record directly"
             )
 
             prompt_audio_path = None
@@ -409,9 +525,9 @@ class VoiceCloneApp(BaseApp):
                     if os.path.exists(prompt_audio_path):
                         st.audio(prompt_audio_path, format="audio/wav")
 
-            else:  # Custom Upload
+            elif voice_source == "Custom Upload":
                 uploaded_file = st.file_uploader(
-                    "Upload Reference Audio", type=["wav", "mp3"], help="Upload a reference audio file for voice cloning"
+                    "Upload Reference Audio", type=["wav", "mp3", "m4a"], help="Upload a reference audio file for voice cloning"
                 )
 
                 prompt_text = st.text_area(
@@ -421,11 +537,59 @@ class VoiceCloneApp(BaseApp):
                 )
 
                 if uploaded_file and prompt_text:
-                    # Save uploaded file temporarily
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+                    # Save uploaded file temporarily with original extension
+                    file_extension = Path(uploaded_file.name).suffix.lower()
+
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_file:
                         tmp_file.write(uploaded_file.read())
-                        prompt_audio_path = tmp_file.name
-                        st.audio(uploaded_file, format="audio/wav")
+                        temp_path = tmp_file.name
+
+                    # Convert m4a to wav if needed (torchaudio doesn't support m4a by default)
+                    if file_extension == ".m4a":
+                        wav_path = temp_path.replace(".m4a", ".wav")
+                        if convert_audio_to_wav(temp_path, wav_path, self.config.audio_sample_rate):
+                            converted_path = wav_path
+                            os.remove(temp_path)  # Remove original m4a file
+                            st.success("✅ M4A file converted to WAV successfully!")
+                        else:
+                            st.error("❌ Failed to convert M4A file. Please ensure ffmpeg is installed.")
+                            converted_path = None
+                    else:
+                        converted_path = temp_path
+
+                    if converted_path:
+                        # Save to permanent location and append metadata
+                        prompt_audio_path, selected_voice = save_additional_audio(converted_path, prompt_text)
+                        append_audio_metadata(prompt_audio_path, prompt_text)
+                        # Extract just the hash from voice_name for display
+                        file_hash = selected_voice.replace("custom_", "")
+                        st.success(f"✅ Audio saved with hash: `{file_hash[:16]}...`")
+                        st.audio(uploaded_file)
+
+            else:  # Record Audio
+                st.info("🎙️ Click the microphone button below to start recording")
+
+                recorded_audio = st.audio_input("Record your voice")
+
+                prompt_text = st.text_area(
+                    "Reference Text",
+                    placeholder="Enter the transcription of what you just recorded...",
+                    help="Provide accurate transcription of your recorded audio",
+                )
+
+                if recorded_audio and prompt_text:
+                    # Save recorded audio to temporary file
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+                        tmp_file.write(recorded_audio.read())
+                        temp_path = tmp_file.name
+
+                    # Save to permanent location and append metadata
+                    prompt_audio_path, selected_voice = save_additional_audio(temp_path, prompt_text)
+                    append_audio_metadata(prompt_audio_path, prompt_text)
+                    # Extract just the hash from voice_name for display
+                    file_hash = selected_voice.replace("custom_", "")
+                    st.success(f"✅ Recording saved with hash: `{file_hash[:16]}...`")
+                    st.audio(recorded_audio)
 
             return selected_voice, dict(prompt_audio_path=prompt_audio_path, prompt_text=prompt_text)
 

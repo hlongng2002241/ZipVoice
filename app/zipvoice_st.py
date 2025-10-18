@@ -38,7 +38,7 @@ class ZipVoiceConfig(VoiceCloneConfig):
 
     model_dir: str
     model_file: str
-    default_tokenizer: str
+    tokenizer_type: str
 
     def __post_init__(self):
         self.model_type = "zipvoice"
@@ -50,7 +50,7 @@ class ZipVoiceApp(VoiceCloneApp):
     def __init__(self, config: ZipVoiceConfig):
         self.model_dir = config.model_dir
         self.model_file = config.model_file
-        self.default_tokenizer = config.default_tokenizer
+        self.tokenizer_type = config.tokenizer_type
         self.feature_extractor = None
         self.tokenizer = None
 
@@ -114,14 +114,12 @@ class ZipVoiceApp(VoiceCloneApp):
 
             # Find index for default tokenizer
             tokenizer_options = ["emilia", "libritts", "espeak", "simple"]
-            default_tokenizer_index = (
-                tokenizer_options.index(self.default_tokenizer) if self.default_tokenizer in tokenizer_options else 0
-            )
+            tokenizer_type_index = tokenizer_options.index(self.tokenizer_type) if self.tokenizer_type in tokenizer_options else 0
 
             tokenizer_type = st.selectbox(
                 "Tokenizer",
                 options=tokenizer_options,
-                index=default_tokenizer_index,
+                index=tokenizer_type_index,
                 help="Select the tokenizer type for text processing",
             )
 
@@ -370,26 +368,10 @@ class ZipVoiceApiApp(VoiceCloneApp):
 
     def generate_speech(self, text: str, **params) -> np.ndarray:
         """Generate speech by calling the API."""
-        # Extract voice info
-        prompt_audio_path = params.pop("prompt_audio_path")
-        prompt_text = params.pop("prompt_text")
-
-        # Determine voice name from audio path
-        # Extract voice name from path like "data/ref_audio/Minh_Chau.wav"
-        voice = "Minh_Châu"  # default fallback
-        if prompt_audio_path:
-            import os
-
-            voice_filename = os.path.basename(prompt_audio_path)
-            voice = os.path.splitext(voice_filename)[0]
-            # Handle underscore to unicode conversion for Vietnamese names
-            voice = voice.replace("_", " ") if "_" in voice else voice
-
-        # Prepare request payload
+        # Prepare request payload - send prompt_audio_path and prompt_text directly in params
         payload = {
             "model": self.model_name,
             "text": text,
-            "voice": voice,
             "params": params,
         }
 
@@ -399,7 +381,7 @@ class ZipVoiceApiApp(VoiceCloneApp):
                 f"{self.api_base_url}{self.api_path}",
                 json=payload,
                 headers={"Content-Type": "application/json"},
-                timeout=60,  # 2 minutes timeout for generation
+                timeout=60,  # 1 minute timeout for generation
             )
             response.raise_for_status()
 

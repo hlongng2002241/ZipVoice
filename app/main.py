@@ -68,15 +68,15 @@ st.markdown(
 
 # Predefined model configurations
 MODEL_CONFIGS: list[BaseConfig] = [
-    ZipVoiceConfig(
-        app_name="ZipVoice Vi",
-        model_type="zipvoice",
-        audio_sample_rate=24000,
-        language="vi",
-        model_dir="exp/version_0/",
-        model_file="best-valid-loss.pt",
-        default_tokenizer="espeak",
-    ),
+    # ZipVoiceConfig(
+    #     app_name="ZipVoice Vi",
+    #     model_type="zipvoice",
+    #     audio_sample_rate=24000,
+    #     language="vi",
+    #     model_dir="exp/version_0/",
+    #     model_file="best-valid-loss.pt",
+    #     tokenizer_type="espeak",
+    # ),
     # # ZipVoice Models
     # ZipVoiceConfig(
     #     app_name="ZipVoice Origin",
@@ -85,7 +85,7 @@ MODEL_CONFIGS: list[BaseConfig] = [
     #     language="en-us",
     #     model_dir="checkpoints/zipvoice",
     #     model_file="model.pt",
-    #     default_tokenizer="emilia",
+    #     tokenizer_type="emilia",
     # ),
     # # F5-TTS Models
     # F5TTSConfig(
@@ -96,37 +96,55 @@ MODEL_CONFIGS: list[BaseConfig] = [
     #     f5_model_name="F5TTS_Base",
     #     ckpt_file="/data2/longnh/projects/mine/F5-TTS/ckpts/original/model_1200000.pt",
     #     vocab_file="/data2/longnh/projects/mine/F5-TTS/ckpts/original/vocab.txt",
-    #     default_tokenizer="f5tts",
+    #     tokenizer_type="f5tts",
     # ),
-    F5TTSConfig(
-        app_name="F5-TTS Origin",
-        model_type="f5tts",
-        audio_sample_rate=24000,
-        language="en-us",
-        f5_model_name="F5TTS_Base",
-        ckpt_file="/data2/longnh/projects/mine/F5-TTS/ckpts/original/model_1200000.pt",
-        vocab_file="/data2/longnh/projects/mine/F5-TTS/ckpts/original/vocab.txt",
-        default_tokenizer="f5tts",
-    ),
+    # F5TTSConfig(
+    #     app_name="F5-TTS Vi",
+    #     model_type="f5tts",
+    #     audio_sample_rate=24000,
+    #     language="en-us",
+    #     f5_model_name="F5TTS_Base",
+    #     ckpt_file="../F5-TTS/ckpts/f5_tts_vi/model_last.pt",
+    #     vocab_file="../F5-TTS/ckpts/f5_tts_vi/vocab.txt",
+    #     tokenizer_type="f5tts",
+    # ),
     # API-based models (call FastAPI server)
-    # F5TTSApiConfig(
-    #     app_name="F5-TTS Vi API",
-    #     model_type="f5tts_api",
-    #     audio_sample_rate=24000,
-    #     language="vi",
-    #     api_base_url="http://127.0.0.1:5555",
-    #     api_path="/api/synthesize",
-    #     model_name="F5TTS_vi",
-    # ),
-    # ZipVoiceApiConfig(
-    #     app_name="ZipVoice Vi API",
-    #     model_type="zipvoice_api",
-    #     audio_sample_rate=24000,
-    #     language="vi",
-    #     api_base_url="http://127.0.0.1:5555",
-    #     api_path="/api/synthesize",
-    #     model_name="Zipvoice_vi",
-    # ),
+    F5TTSApiConfig(
+        app_name="F5-TTS Vi API",
+        model_type="f5tts_api",
+        audio_sample_rate=24000,
+        language="vi",
+        api_base_url="http://127.0.0.1:5555",
+        api_path="/api/synthesize",
+        model_name="F5TTS_vi",
+    ),
+    ZipVoiceApiConfig(
+        app_name="ZipVoice Vi API",
+        model_type="zipvoice_api",
+        audio_sample_rate=24000,
+        language="vi",
+        api_base_url="http://127.0.0.1:5555",
+        api_path="/api/synthesize",
+        model_name="Zipvoice_vi",
+    ),
+    F5TTSApiConfig(
+        app_name="F5-TTS Vi API (prod)",
+        model_type="f5tts_api",
+        audio_sample_rate=24000,
+        language="vi",
+        api_base_url="http://127.0.0.1:5555",
+        api_path="/api/synthesize_prod",
+        model_name="F5TTS_vi",
+    ),
+    ZipVoiceApiConfig(
+        app_name="ZipVoice Vi API (prod)",
+        model_type="zipvoice_api",
+        audio_sample_rate=24000,
+        language="vi",
+        api_base_url="http://127.0.0.1:5555",
+        api_path="/api/synthesize_prod",
+        model_name="Zipvoice_vi",
+    ),
 ]
 
 MODEL_CONFIGS_DICT = {c.app_name: c for c in MODEL_CONFIGS}

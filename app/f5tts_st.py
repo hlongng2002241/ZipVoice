@@ -33,7 +33,7 @@ class F5TTSConfig(VoiceCloneConfig):
     f5_model_name: str
     ckpt_file: str
     vocab_file: str
-    default_tokenizer: str
+    tokenizer_type: str
 
     def __post_init__(self):
         self.model_type = "f5tts"
@@ -49,7 +49,7 @@ class F5TTSApp(VoiceCloneApp):
 
         super().__init__(config)
 
-        self.config: F5TTSConfig # type: ignore
+        self.config: F5TTSConfig  # type: ignore
 
     def load_model(self):
         """Load F5-TTS model and Vocos vocoder."""
@@ -251,23 +251,10 @@ class F5TTSApiApp(VoiceCloneApp):
 
     def generate_speech(self, text: str, **params) -> np.ndarray:
         """Generate speech by calling the API."""
-        # Extract voice info
-        prompt_audio_path = params.pop("prompt_audio_path")
-        prompt_text = params.pop("prompt_text")
-
-        # Determine voice name from audio path
-        # Extract voice name from path like "data/ref_audio/Jane__default.wav"
-        voice = "Jane__default"  # default fallback
-        if prompt_audio_path:
-            import os
-            voice_filename = os.path.basename(prompt_audio_path)
-            voice = os.path.splitext(voice_filename)[0]
-
-        # Prepare request payload
+        # Prepare request payload - send prompt_audio_path and prompt_text directly in params
         payload = {
             "model": self.model_name,
             "text": text,
-            "voice": voice,
             "params": params,
         }
 
