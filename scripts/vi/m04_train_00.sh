@@ -12,12 +12,12 @@ CUDA_VISIBLE_DEVICES=1 python -m zipvoice.bin.train_zipvoice \
     \
     --seed 8686 \
     --exp-dir exp/zipvoice_tls_train_v3 \
-    --save-every-n 50000000000 \
+    --save-every-n 20000 \
     --valid-by-epoch True \
     --keep-last-k 0 \
     --num-epochs 100 \
     \
-    --warmup-batches 2000 \
+    --warmup-batches 5000 \
     --base-lr 0.0001 \
     --lr-epochs 100 \
     --lr-batches 7500 \

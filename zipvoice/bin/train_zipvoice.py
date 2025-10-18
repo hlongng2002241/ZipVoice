@@ -96,10 +96,9 @@ LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, LRScheduler]
 
 # torch.autograd.set_detect_anomaly(True)
 
+
 def get_parser():
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     parser.add_argument(
         "--world-size",
@@ -147,6 +146,12 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--resume-from-checkpoint",
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
         "--checkpoint",
         type=str,
         default=None,
@@ -165,9 +170,7 @@ def get_parser():
     )
 
     parser.add_argument("--warmup-batches", type=int, default=500)
-    parser.add_argument(
-        "--base-lr", type=float, default=0.02, help="The base learning rate."
-    )
+    parser.add_argument("--base-lr", type=float, default=0.02, help="The base learning rate.")
 
     parser.add_argument(
         "--lr-batches",
@@ -207,8 +210,7 @@ def get_parser():
         "--finetune",
         type=str2bool,
         default=False,
-        help="Whether to use the fine-tuning mode, will used a fixed learning rate "
-        "schedule and skip the large dropout phase.",
+        help="Whether to use the fine-tuning mode, will used a fixed learning rate " "schedule and skip the large dropout phase.",
     )
 
     parser.add_argument(
@@ -462,11 +464,7 @@ def compute_fbank_loss(
     if is_training:
         t = torch.rand(batch_size, 1, 1, device=device)
     else:
-        t = (
-            (torch.arange(batch_size, device=device) / batch_size)
-            .unsqueeze(1)
-            .unsqueeze(2)
-        )
+        t = (torch.arange(batch_size, device=device) / batch_size).unsqueeze(1).unsqueeze(2)
     with torch.set_grad_enabled(is_training):
 
         loss = model(
@@ -557,12 +555,8 @@ def train_one_epoch(
             else:
                 set_batch_count(model, get_adjusted_batch_count(params))
 
-        if (
-            params.valid_by_epoch and batch_idx == 0 and not params.print_diagnostics
-        ) or (
-            not params.valid_by_epoch
-            and params.batch_idx_train % params.valid_interval == 0
-            and not params.print_diagnostics
+        if (params.valid_by_epoch and batch_idx == 0 and not params.print_diagnostics) or (
+            not params.valid_by_epoch and params.batch_idx_train % params.valid_interval == 0 and not params.print_diagnostics
         ):
             logging.info("Computing validation loss")
             valid_info = compute_validation_loss(
@@ -572,18 +566,10 @@ def train_one_epoch(
                 world_size=world_size,
             )
             model.train()
-            logging.info(
-                f"Epoch {params.cur_epoch}, global_batch_idx: {params.batch_idx_train},"
-                f" validation: {valid_info}"
-            )
-            logging.info(
-                f"Maximum memory allocated so far is "
-                f"{torch.cuda.max_memory_allocated() // 1000000}MB"
-            )
+            logging.info(f"Epoch {params.cur_epoch}, global_batch_idx: {params.batch_idx_train}," f" validation: {valid_info}")
+            logging.info(f"Maximum memory allocated so far is " f"{torch.cuda.max_memory_allocated() // 1000000}MB")
             if tb_writer is not None:
-                valid_info.write_summary(
-                    tb_writer, "train/valid_", params.batch_idx_train
-                )
+                valid_info.write_summary(tb_writer, "train/valid_", params.batch_idx_train)
 
         params.batch_idx_train += 1
 
@@ -615,12 +601,7 @@ def train_one_epoch(
             scheduler.step_batch(params.batch_idx_train)
             # Use the number of hours of speech to adjust the learning rate
             if params.lr_hours > 0:
-                scheduler.step_epoch(
-                    params.batch_idx_train
-                    * params.max_duration
-                    * params.world_size
-                    / 3600
-                )
+                scheduler.step_epoch(params.batch_idx_train * params.max_duration * params.world_size / 3600)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -632,21 +613,14 @@ def train_one_epoch(
         if params.print_diagnostics and batch_idx == 5:
             return
 
-        if (
-            rank == 0
-            and params.batch_idx_train > 0
-            and params.batch_idx_train % params.average_period == 0
-        ):
+        if rank == 0 and params.batch_idx_train > 0 and params.batch_idx_train % params.average_period == 0:
             update_averaged_model(
                 params=params,
                 model_cur=model,
                 model_avg=model_avg,
             )
 
-        if (
-            params.batch_idx_train > 0
-            and params.batch_idx_train % params.save_every_n == 0
-        ):
+        if params.batch_idx_train > 0 and params.batch_idx_train % params.save_every_n == 0:
             save_checkpoint_with_global_batch_idx(
                 out_dir=params.exp_dir,
                 global_batch_idx=params.batch_idx_train,
@@ -672,9 +646,7 @@ def train_one_epoch(
             # different behavior depending on the current grad scale.
             cur_grad_scale = scaler._scale.item()
 
-            if cur_grad_scale < 1024.0 or (
-                cur_grad_scale < 4096.0 and params.batch_idx_train % 400 == 0
-            ):
+            if cur_grad_scale < 1024.0 or (cur_grad_scale < 4096.0 and params.batch_idx_train % 400 == 0):
                 scaler.update(cur_grad_scale * 2.0)
             if cur_grad_scale < 0.01:
                 if not saved_bad_model:
@@ -683,9 +655,7 @@ def train_one_epoch(
                 logging.warning(f"Grad scale is small: {cur_grad_scale}")
             if cur_grad_scale < 1.0e-05:
                 save_bad_model()
-                raise RuntimeError(
-                    f"grad_scale is too small, exiting: {cur_grad_scale}"
-                )
+                raise RuntimeError(f"grad_scale is too small, exiting: {cur_grad_scale}")
 
         if params.batch_idx_train % params.log_interval == 0:
             cur_lr = max(scheduler.get_last_lr())
@@ -696,17 +666,12 @@ def train_one_epoch(
                 f"global_batch_idx: {params.batch_idx_train}, "
                 f"batch size: {batch_size}, "
                 f"loss[{loss_info}], tot_loss[{tot_loss}], "
-                f"cur_lr: {cur_lr:.2e}, "
-                + (f"grad_scale: {scaler._scale.item()}" if params.use_fp16 else "")
+                f"cur_lr: {cur_lr:.2e}, " + (f"grad_scale: {scaler._scale.item()}" if params.use_fp16 else "")
             )
 
             if tb_writer is not None:
-                tb_writer.add_scalar(
-                    "train/learning_rate", cur_lr, params.batch_idx_train
-                )
-                loss_info.write_summary(
-                    tb_writer, "train/current_", params.batch_idx_train
-                )
+                tb_writer.add_scalar("train/learning_rate", cur_lr, params.batch_idx_train)
+                loss_info.write_summary(tb_writer, "train/current_", params.batch_idx_train)
                 tot_loss.write_summary(tb_writer, "train/tot_", params.batch_idx_train)
                 if params.use_fp16:
                     tb_writer.add_scalar(
@@ -804,9 +769,7 @@ def scan_pessimistic_batches_for_oom(
 ):
     from lhotse.dataset import find_pessimistic_batches
 
-    logging.info(
-        "Sanity check -- see if any of the batches in epoch 1 would cause OOM."
-    )
+    logging.info("Sanity check -- see if any of the batches in epoch 1 would cause OOM.")
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
 
     batches, crit_values = find_pessimistic_batches(train_dl.sampler)
@@ -843,10 +806,7 @@ def scan_pessimistic_batches_for_oom(
                 )
             display_and_save_batch(batch, params=params)
             raise
-        logging.info(
-            f"Maximum memory allocated so far is "
-            f"{torch.cuda.max_memory_allocated() // 1000000}MB"
-        )
+        logging.info(f"Maximum memory allocated so far is " f"{torch.cuda.max_memory_allocated() // 1000000}MB")
 
 
 def tokenize_text(c: Cut, tokenizer):
@@ -936,7 +896,10 @@ def run(rank, world_size, args):
 
     assert params.start_epoch > 0, params.start_epoch
     if params.start_epoch > 1:
-        checkpoints = resume_checkpoint(params=params, model=model, model_avg=model_avg)
+        if params.resume_from_checkpoint is not None:
+            checkpoints = resume_checkpoint(params=params, model=model, model_avg=model_avg, resume_from_checkpoint=params.resume_from_checkpoint)
+        else:
+            checkpoints = resume_checkpoint(params=params, model=model, model_avg=model_avg)
 
     model = model.to(params.device)
     if world_size > 1:
@@ -980,9 +943,7 @@ def run(rank, world_size, args):
             scaler.load_state_dict(checkpoints["grad_scaler"])
 
     if params.print_diagnostics:
-        opts = diagnostics.TensorDiagnosticOptions(
-            512
-        )  # allow 4 megabytes per sub-module
+        opts = diagnostics.TensorDiagnosticOptions(512)  # allow 4 megabytes per sub-module
         diagnostic = diagnostics.attach_diagnostics(model, opts)
 
     if params.inf_check:
@@ -993,9 +954,7 @@ def run(rank, world_size, args):
             return False
         return True
 
-    _remove_short_and_long_utt = partial(
-        remove_short_and_long_utt, min_len=params.min_len, max_len=params.max_len
-    )
+    _remove_short_and_long_utt = partial(remove_short_and_long_utt, min_len=params.min_len, max_len=params.max_len)
 
     datamodule = TtsDataModule(args)
     if params.dataset == "emilia":
@@ -1023,9 +982,7 @@ def run(rank, world_size, args):
         dev_cuts = dev_cuts.filter(_remove_short_and_long_utt)
 
     if params.tokenizer in ["emilia", "espeak", "dialog"]:
-        if not hasattr(train_cuts[0].supervisions[0], "tokens") or not hasattr(
-            dev_cuts[0].supervisions[0], "tokens"
-        ):
+        if not hasattr(train_cuts[0].supervisions[0], "tokens") or not hasattr(dev_cuts[0].supervisions[0], "tokens"):
             logging.warning(
                 f"Using {params.tokenizer} tokenizer but tokens are not prepared,"
                 f"will tokenize on-the-fly, which can slow down training significantly."

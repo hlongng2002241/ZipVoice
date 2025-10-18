@@ -488,11 +488,7 @@ async def synthesize_prod(inp: InputDTO, model_apps: dict[str, BaseApp] = Depend
 
     # Generate speech
     print(f"Generating audio with {inp.model} for text: {text[:50]}...")
-    texts = [
-        text, 
-        "đây là văn bản số hai. " + text, 
-        "đây là văn bản dài hơn của văn bản gốc, văn bản số 3. " + text
-    ]
+    texts = [text, "đây là văn bản số hai. " + text, "đây là văn bản dài hơn của văn bản gốc, văn bản số 3. " + text]
     audio_list, sr = model_app.generate_speech(texts, **params)
 
     wav_bytes = convert_audio_to_bytes(audio_list[0], sample_rate=sr, format=audio_fmt)

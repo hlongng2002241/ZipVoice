@@ -4,8 +4,10 @@ ZipVoice Streamlit App
 Inherits from BaseApp and implements ZipVoice-specific functionality
 """
 
+import io
 import json
 import string
+import requests
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
@@ -15,6 +17,7 @@ import safetensors.torch
 import streamlit as st
 import torch
 import torchaudio
+import soundfile as sf
 
 from app.base import VoiceCloneApp, VoiceCloneConfig
 from zipvoice.models.zipvoice import ZipVoice
@@ -53,7 +56,7 @@ class ZipVoiceApp(VoiceCloneApp):
 
         super().__init__(config)
 
-        self.config: ZipVoiceConfig
+        self.config: ZipVoiceConfig  # type: ignore
 
     def load_model(self):
         """Load ZipVoice model and Vocos vocoder."""
@@ -162,7 +165,12 @@ class ZipVoiceApp(VoiceCloneApp):
             )
 
             num_step = st.slider(
-                "Number of Steps", min_value=4, max_value=100, value=32, step=1, help="Number of diffusion steps for generation (default 16 for zipvoice, 8 for zipvoice_distill)"
+                "Number of Steps",
+                min_value=4,
+                max_value=100,
+                value=32,
+                step=1,
+                help="Number of diffusion steps for generation (default 16 for zipvoice, 8 for zipvoice_distill)",
             )
 
             feat_scale = st.slider(
@@ -277,3 +285,133 @@ class ZipVoiceApp(VoiceCloneApp):
             torch.cuda.empty_cache()
 
         return wav_numpy
+
+
+@dataclass
+class ZipVoiceApiConfig(VoiceCloneConfig):
+    """Configuration for ZipVoice API app."""
+
+    api_base_url: str = "http://127.0.0.1:5555"
+    api_path: str = "/api/synthesize"
+    model_name: str = "Zipvoice_vi"
+
+    def __post_init__(self):
+        self.model_type = "zipvoice_api"
+
+
+class ZipVoiceApiApp(VoiceCloneApp):
+    """ZipVoice API implementation - calls FastAPI server."""
+
+    def __init__(self, config: ZipVoiceApiConfig):
+        self.api_base_url = config.api_base_url
+        self.api_path = config.api_path
+        self.model_name = config.model_name
+
+        super().__init__(config)
+        self.config: ZipVoiceApiConfig  # type: ignore
+
+    def load_model(self):
+        """No model loading needed - using API."""
+        # Just verify the server is accessible
+        try:
+            response = requests.get(f"{self.api_base_url}/docs", timeout=2)
+            if response.status_code == 200:
+                print(f"✓ Connected to API server at {self.api_base_url}")
+        except requests.exceptions.RequestException as e:
+            print(f"⚠ Warning: Could not connect to API server at {self.api_base_url}: {e}")
+            print("  Make sure the server is running before generating speech")
+
+    def render_parameters(self) -> Dict[str, Any]:
+        with st.sidebar:
+            st.subheader("🎛️ Generation Parameters")
+
+            speed = st.slider(
+                "Speed", min_value=0.1, max_value=2.0, value=1.0, step=0.05, help="Speech generation speed multiplier"
+            )
+
+            num_step = st.slider(
+                "Number of Steps",
+                min_value=4,
+                max_value=100,
+                value=32,
+                step=1,
+                help="Number of diffusion steps for generation (default 16 for zipvoice, 8 for zipvoice_distill)",
+            )
+
+            feat_scale = st.slider(
+                "Feature Scale", min_value=0.01, max_value=0.5, value=0.1, step=0.01, help="Scale factor for audio features"
+            )
+
+            guidance_scale = st.slider(
+                "Guidance Scale",
+                min_value=1.0,
+                max_value=5.0,
+                value=1.0,
+                step=0.1,
+                help="Controls the strength of guidance during generation (default 1.0 for zipvoice, 3.0 for zipvoice_distill)",
+            )
+
+            t_shift = st.slider(
+                "Time Shift", min_value=0.0, max_value=1.0, value=0.5, step=0.05, help="Time shift parameter for generation"
+            )
+
+            target_rms = st.slider(
+                "Target RMS", min_value=0.01, max_value=0.5, value=0.1, step=0.05, help="Target RMS level for audio normalization"
+            )
+
+            return {
+                "guidance_scale": guidance_scale,
+                "num_step": num_step,
+                "feat_scale": feat_scale,
+                "speed": speed,
+                "t_shift": t_shift,
+                "target_rms": target_rms,
+            }
+
+    def generate_speech(self, text: str, **params) -> np.ndarray:
+        """Generate speech by calling the API."""
+        # Extract voice info
+        prompt_audio_path = params.pop("prompt_audio_path")
+        prompt_text = params.pop("prompt_text")
+
+        # Determine voice name from audio path
+        # Extract voice name from path like "data/ref_audio/Minh_Chau.wav"
+        voice = "Minh_Châu"  # default fallback
+        if prompt_audio_path:
+            import os
+
+            voice_filename = os.path.basename(prompt_audio_path)
+            voice = os.path.splitext(voice_filename)[0]
+            # Handle underscore to unicode conversion for Vietnamese names
+            voice = voice.replace("_", " ") if "_" in voice else voice
+
+        # Prepare request payload
+        payload = {
+            "model": self.model_name,
+            "text": text,
+            "voice": voice,
+            "params": params,
+        }
+
+        # Make API request
+        try:
+            response = requests.post(
+                f"{self.api_base_url}{self.api_path}",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=60,  # 2 minutes timeout for generation
+            )
+            response.raise_for_status()
+
+            # Parse audio from response
+            audio_bytes = response.content
+            audio_data, sample_rate = sf.read(io.BytesIO(audio_bytes))
+
+            # Ensure mono audio
+            if len(audio_data.shape) > 1:
+                audio_data = audio_data[:, 0]
+
+            return audio_data
+
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"API request failed: {e}")

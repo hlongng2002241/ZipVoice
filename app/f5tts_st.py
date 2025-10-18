@@ -3,10 +3,13 @@
 F5-TTS Streamlit App
 Inherits from BaseApp and implements F5-TTS-specific functionality
 """
+import io
 from dataclasses import dataclass
 from typing import Any, Dict
 
 import numpy as np
+import requests
+import soundfile as sf
 import streamlit as st
 
 from app.base import VoiceCloneApp, VoiceCloneConfig
@@ -46,7 +49,7 @@ class F5TTSApp(VoiceCloneApp):
 
         super().__init__(config)
 
-        self.config: F5TTSConfig
+        self.config: F5TTSConfig # type: ignore
 
     def load_model(self):
         """Load F5-TTS model and Vocos vocoder."""
@@ -163,3 +166,130 @@ class F5TTSApp(VoiceCloneApp):
                 torch.cuda.empty_cache()
 
             return wav
+
+
+@dataclass
+class F5TTSApiConfig(VoiceCloneConfig):
+    """Configuration for F5-TTS API app."""
+
+    api_base_url: str = "http://127.0.0.1:5555"
+    api_path: str = "/api/synthesize"
+    model_name: str = "F5TTS_vi"
+
+    def __post_init__(self):
+        self.model_type = "f5tts_api"
+
+
+class F5TTSApiApp(VoiceCloneApp):
+    """F5-TTS API implementation - calls FastAPI server."""
+
+    def __init__(self, config: F5TTSApiConfig):
+        self.api_base_url = config.api_base_url
+        self.api_path = config.api_path
+        self.model_name = config.model_name
+
+        super().__init__(config)
+        self.config: F5TTSApiConfig  # type: ignore
+
+    def load_model(self):
+        """No model loading needed - using API."""
+        # Just verify the server is accessible
+        try:
+            response = requests.get(f"{self.api_base_url}/docs", timeout=2)
+            if response.status_code == 200:
+                print(f"✓ Connected to API server at {self.api_base_url}")
+        except requests.exceptions.RequestException as e:
+            print(f"⚠ Warning: Could not connect to API server at {self.api_base_url}: {e}")
+            print("  Make sure the server is running before generating speech")
+
+    def render_parameters(self) -> Dict[str, Any]:
+        with st.sidebar:
+            st.subheader("🎛️ Generation Parameters")
+
+            speed = st.slider(
+                "Speed", min_value=0.1, max_value=2.0, value=1.0, step=0.05, help="Speech generation speed multiplier"
+            )
+
+            nfe_step = st.slider(
+                "NFE Steps", min_value=4, max_value=64, value=32, step=1, help="Number of function evaluations for generation"
+            )
+
+            target_rms = st.slider(
+                "Target RMS", min_value=0.01, max_value=0.5, value=0.1, step=0.01, help="Target RMS level for audio normalization"
+            )
+
+            cross_fade_duration = st.slider(
+                "Cross Fade Duration",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.15,
+                step=0.01,
+                help="Duration for cross-fading between audio segments",
+            )
+
+            cfg_strength = st.slider(
+                "CFG Strength", min_value=0.5, max_value=5.0, value=2.0, step=0.1, help="Classifier-free guidance strength"
+            )
+
+            sway_sampling_coef = st.slider(
+                "Sway Sampling Coefficient",
+                min_value=-2.0,
+                max_value=2.0,
+                value=-1.0,
+                step=0.01,
+                help="Sway sampling coefficient for generation",
+            )
+
+            return {
+                "target_rms": target_rms,
+                "cross_fade_duration": cross_fade_duration,
+                "nfe_step": nfe_step,
+                "cfg_strength": cfg_strength,
+                "sway_sampling_coef": sway_sampling_coef,
+                "speed": speed,
+            }
+
+    def generate_speech(self, text: str, **params) -> np.ndarray:
+        """Generate speech by calling the API."""
+        # Extract voice info
+        prompt_audio_path = params.pop("prompt_audio_path")
+        prompt_text = params.pop("prompt_text")
+
+        # Determine voice name from audio path
+        # Extract voice name from path like "data/ref_audio/Jane__default.wav"
+        voice = "Jane__default"  # default fallback
+        if prompt_audio_path:
+            import os
+            voice_filename = os.path.basename(prompt_audio_path)
+            voice = os.path.splitext(voice_filename)[0]
+
+        # Prepare request payload
+        payload = {
+            "model": self.model_name,
+            "text": text,
+            "voice": voice,
+            "params": params,
+        }
+
+        # Make API request
+        try:
+            response = requests.post(
+                f"{self.api_base_url}{self.api_path}",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=60,  # 1 minute timeout for generation
+            )
+            response.raise_for_status()
+
+            # Parse audio from response
+            audio_bytes = response.content
+            audio_data, sample_rate = sf.read(io.BytesIO(audio_bytes))
+
+            # Ensure mono audio
+            if len(audio_data.shape) > 1:
+                audio_data = audio_data[:, 0]
+
+            return audio_data
+
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"API request failed: {e}")

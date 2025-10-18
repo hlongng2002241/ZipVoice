@@ -10,8 +10,8 @@ from typing import Dict, Any
 
 import streamlit as st
 
-from app.zipvoice_st import ZipVoiceApp, ZipVoiceConfig
-from app.f5tts_st import F5TTSApp, F5TTSConfig
+from app.zipvoice_st import ZipVoiceApp, ZipVoiceConfig, ZipVoiceApiApp, ZipVoiceApiConfig
+from app.f5tts_st import F5TTSApp, F5TTSConfig, F5TTSApiApp, F5TTSApiConfig
 from app.base import BaseConfig
 
 
@@ -73,21 +73,31 @@ MODEL_CONFIGS: list[BaseConfig] = [
         model_type="zipvoice",
         audio_sample_rate=24000,
         language="vi",
-        model_dir="checkpoints/zipvoice_vi",
-        model_file="model.pt",
+        model_dir="exp/version_0/",
+        model_file="best-valid-loss.pt",
         default_tokenizer="espeak",
     ),
-    # ZipVoice Models
-    ZipVoiceConfig(
-        app_name="ZipVoice Origin",
-        model_type="zipvoice",
-        audio_sample_rate=24000,
-        language="en-us",
-        model_dir="checkpoints/zipvoice",
-        model_file="model.pt",
-        default_tokenizer="emilia",
-    ),
-    # F5-TTS Models
+    # # ZipVoice Models
+    # ZipVoiceConfig(
+    #     app_name="ZipVoice Origin",
+    #     model_type="zipvoice",
+    #     audio_sample_rate=24000,
+    #     language="en-us",
+    #     model_dir="checkpoints/zipvoice",
+    #     model_file="model.pt",
+    #     default_tokenizer="emilia",
+    # ),
+    # # F5-TTS Models
+    # F5TTSConfig(
+    #     app_name="F5-TTS Origin",
+    #     model_type="f5tts",
+    #     audio_sample_rate=24000,
+    #     language="en-us",
+    #     f5_model_name="F5TTS_Base",
+    #     ckpt_file="/data2/longnh/projects/mine/F5-TTS/ckpts/original/model_1200000.pt",
+    #     vocab_file="/data2/longnh/projects/mine/F5-TTS/ckpts/original/vocab.txt",
+    #     default_tokenizer="f5tts",
+    # ),
     F5TTSConfig(
         app_name="F5-TTS Origin",
         model_type="f5tts",
@@ -98,20 +108,24 @@ MODEL_CONFIGS: list[BaseConfig] = [
         vocab_file="/data2/longnh/projects/mine/F5-TTS/ckpts/original/vocab.txt",
         default_tokenizer="f5tts",
     ),
-    # Additional ZipVoice models (commented out for now)
-    # "ZipVoice Telesale V3 (100 Epochs)": ZipVoiceConfig(
-    #     model_name="ZipVoice Telesale V3 (100 Epochs)",
-    #     model_dir="exp/zipvoice_tls_train_v3",
-    #     model_file="epoch-100.pt",
-    #     default_tokenizer="espeak",
-    #     default_lang="vi",
+    # API-based models (call FastAPI server)
+    # F5TTSApiConfig(
+    #     app_name="F5-TTS Vi API",
+    #     model_type="f5tts_api",
+    #     audio_sample_rate=24000,
+    #     language="vi",
+    #     api_base_url="http://127.0.0.1:5555",
+    #     api_path="/api/synthesize",
+    #     model_name="F5TTS_vi",
     # ),
-    # "ZipVoice Telesale V3 (Best valid loss)": ZipVoiceConfig(
-    #     model_name="ZipVoice Telesale V3 (Best valid loss)",
-    #     model_dir="exp/zipvoice_tls_train_v3",
-    #     model_file="best-valid-loss.pt",
-    #     default_tokenizer="espeak",
-    #     default_lang="vi",
+    # ZipVoiceApiConfig(
+    #     app_name="ZipVoice Vi API",
+    #     model_type="zipvoice_api",
+    #     audio_sample_rate=24000,
+    #     language="vi",
+    #     api_base_url="http://127.0.0.1:5555",
+    #     api_path="/api/synthesize",
+    #     model_name="Zipvoice_vi",
     # ),
 ]
 
@@ -150,6 +164,10 @@ def create_app_instance(model_name: str) -> Any:
         return ZipVoiceApp(config)
     elif config.model_type == "f5tts":
         return F5TTSApp(config)
+    elif config.model_type == "zipvoice_api":
+        return ZipVoiceApiApp(config)
+    elif config.model_type == "f5tts_api":
+        return F5TTSApiApp(config)
     else:
         raise ValueError(f"Unknown model type: {config.model_type}")
 

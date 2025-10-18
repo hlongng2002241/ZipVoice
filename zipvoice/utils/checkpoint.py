@@ -144,9 +144,7 @@ def load_checkpoint(
     return checkpoint
 
 
-def load_checkpoint_extend_vocab_size(
-    filename: Path, extend_size: int, model: nn.Module, strict: bool = True
-) -> Dict[str, Any]:
+def load_checkpoint_extend_vocab_size(filename: Path, extend_size: int, model: nn.Module, strict: bool = True) -> Dict[str, Any]:
     logging.info(f"Loading checkpoint from {filename}")
     checkpoint = torch.load(filename, map_location="cpu", weights_only=False)
 
@@ -215,15 +213,11 @@ def load_checkpoint_copy_proj_three_channel_alter(
             if out_proj_key in key:
                 if "weight" in key:
                     weight = dst_state_dict.pop(key)
-                    dst_state_dict[key.replace("weight", "0.weight")] = torch.cat(
-                        [weight, weight], dim=0
-                    )
+                    dst_state_dict[key.replace("weight", "0.weight")] = torch.cat([weight, weight], dim=0)
                     dst_state_dict[key.replace("weight", "1.weight")] = weight
                 elif "bias" in key:
                     bias = dst_state_dict.pop(key)
-                    dst_state_dict[key.replace("bias", "0.bias")] = torch.cat(
-                        [bias, bias], dim=0
-                    )
+                    dst_state_dict[key.replace("bias", "0.bias")] = torch.cat([bias, bias], dim=0)
                     dst_state_dict[key.replace("bias", "1.bias")] = bias
 
         model.load_state_dict(dst_state_dict, strict=True)
@@ -328,9 +322,7 @@ def average_checkpoints_with_averaged_model(
       device:
         Move checkpoints to this device before averaging.
     """
-    state_dict_start = torch.load(
-        filename_start, map_location=device, weights_only=False
-    )
+    state_dict_start = torch.load(filename_start, map_location=device, weights_only=False)
     state_dict_end = torch.load(filename_end, map_location=device, weights_only=False)
 
     average_period = state_dict_start["average_period"]
@@ -403,6 +395,7 @@ def resume_checkpoint(
     model: nn.Module,
     model_avg: nn.Module,
     model_ema: Optional[nn.Module] = None,
+    resume_from_checkpoint: str = None,
 ) -> Optional[Dict[str, Any]]:
     """Load checkpoint from file.
 
@@ -421,7 +414,10 @@ def resume_checkpoint(
     Returns:
       Return a dict containing previously saved training info.
     """
-    filename = params.exp_dir / f"epoch-{params.start_epoch - 1}.pt"
+    if resume_from_checkpoint is None:
+        filename = params.exp_dir / f"epoch-{params.start_epoch - 1}.pt"
+    else:
+        filename = Path(resume_from_checkpoint)
 
     assert filename.is_file(), f"{filename} does not exist!"
 
