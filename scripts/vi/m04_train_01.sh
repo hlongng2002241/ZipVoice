@@ -6,14 +6,14 @@ CUDA_VISIBLE_DEVICES=1 taskset -c 16-31 python -m zipvoice.bin.train_zipvoice \
     \
     --finetune False \
     \
-    --checkpoint exp/version_0/checkpoint-290000.pt \
+    --checkpoint exp/version_0/bad-model-0.pt \
     --model-config checkpoints/zipvoice_vi/model.json \
     --token-file checkpoints/zipvoice_vi/tokens.txt \
     --tokenizer espeak \
     --lang vi \
     \
-    --start-epoch 15 \
-    --resume-from-checkpoint exp/version_0/checkpoint-290000.pt \
+    --start-epoch 22 \
+    --resume-from-checkpoint exp/version_0/bad-model-0.pt \
     --seed 8686 \
     --exp-dir exp/version_0 \
     --save-every-n 10000 \
@@ -36,4 +36,4 @@ CUDA_VISIBLE_DEVICES=1 taskset -c 16-31 python -m zipvoice.bin.train_zipvoice \
     --dataset custom \
     --train-manifest data/vi/manifest/custom_cuts_train_with_tokens.jsonl.gz \
     --dev-manifest data/vi/manifest/custom_cuts_test_with_tokens.jsonl.gz \
-    --max-duration 218
+    --max-duration 210

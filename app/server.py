@@ -22,7 +22,7 @@ from hydra.utils import get_class
 from omegaconf import OmegaConf
 from vocos import Vocos
 
-from f5_tts.infer.utils_infer import load_model, infer_batch
+from f5_tts.infer.utils_infer import load_model, infer_batch_synthesized_on_left
 from zipvoice.models.zipvoice import ZipVoice
 from zipvoice.tokenizer.tokenizer import (
     EmiliaTokenizer,
@@ -117,7 +117,7 @@ class F5TTSApp(BaseApp):
         with torch.no_grad():
 
             # Use F5-TTS inference with infer_batch
-            audio_list, sr = infer_batch(
+            audio_list, sr = infer_batch_synthesized_on_left(
                 ref_audio,
                 ref_text,
                 texts,

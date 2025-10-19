@@ -17,7 +17,7 @@ from app.base import VoiceCloneApp, VoiceCloneConfig
 # F5-TTS imports
 from f5_tts.infer.utils_infer import (
     load_model,
-    infer_batch,
+    infer_batch_synthesized_on_left,
     preprocess_ref_audio_text,
 )
 from hydra.utils import get_class
@@ -141,8 +141,8 @@ class F5TTSApp(VoiceCloneApp):
         with torch.no_grad():
             ref_audio, ref_text = preprocess_ref_audio_text(prompt_audio_path, prompt_text)
 
-            # Use F5-TTS inference with infer_batch
-            audio_segments, _ = infer_batch(
+            # Use F5-TTS inference with infer_batch_synthesized_on_left
+            audio_segments, _ = infer_batch_synthesized_on_left(
                 ref_audio,
                 ref_text,
                 text,
