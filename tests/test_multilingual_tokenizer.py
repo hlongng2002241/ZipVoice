@@ -1,13 +1,31 @@
 import random
 from collections import Counter
 
-from zipvoice.tokenizer.multilingual_tokenizer import MultilingualTokenizer, sample_lang_tag
+from zipvoice.tokenizer.multilingual_tokenizer import (
+    MultilingualTokenizer,
+    normalize_language_name,
+    sample_lang_tag,
+)
 
 
 def _make_tokenizer():
     return MultilingualTokenizer(
         pretrained_model_name="google-bert/bert-base-multilingual-cased"
     )
+
+
+def test_normalize_language_name_handles_real_corpus_spellings():
+    assert normalize_language_name("Vietnamese") == "vi"
+    assert normalize_language_name("vi") == "vi"
+    assert normalize_language_name("ENGLISH") == "en"
+    assert normalize_language_name("Chinese") == "zh"
+    assert normalize_language_name("Mandarin") == "zh"
+
+
+def test_normalize_language_name_none_for_missing_or_unrecognized():
+    assert normalize_language_name(None) is None
+    assert normalize_language_name("") is None
+    assert normalize_language_name("Klingon") is None
 
 
 def test_default_pretrained_model_is_qwen25():

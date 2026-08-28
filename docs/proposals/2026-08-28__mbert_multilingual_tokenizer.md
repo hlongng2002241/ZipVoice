@@ -169,10 +169,17 @@ to "distribute a known total duration across uneven tokens."
 3. **Embedding — (a) load pretrained, final choice**:
    - **(a) Load from the pretrained checkpoint (final choice)**: initialize
      ZipVoice's `nn.Embedding(vocab_size, text_embed_dim)`
-     (`zipvoice/models/zipvoice.py:132`) from Qwen2.5-0.5B's
-     `get_input_embeddings().weight` (`151669 × 896`), followed by a
-     `Linear(896, 192)` projection down to ZipVoice's `text_embed_dim=192`,
-     then fine-tune end-to-end. Codex had questioned whether pretrained
+     (`zipvoice/models/zipvoice.py`) from Qwen2.5-0.5B's
+     `get_input_embeddings().weight` (`151669 × 896`), used **at its native
+     896-dim, not projected down to 192**. `text_embed_dim` is overridden to
+     896 in this mode: `text_encoder` (a `TTSZipformer`) already applies its
+     own `in_proj = nn.Linear(in_dim, encoder_dim)` as the first step of its
+     forward pass, so setting `text_encoder`'s `in_dim` to 896 reuses that
+     existing projection down to `text_encoder_dim` (192) instead of adding a
+     second, redundant `nn.Linear` — caught after an initial implementation
+     that did add a separate projection layer, once the user pointed out
+     `TTSZipformer` already had one. Both the embedding and `text_encoder`
+     fine-tune end-to-end. Codex had questioned whether pretrained
      loading offers any real benefit over (b) for a base model whose input
      embeddings were trained jointly with its transformer layers. Sprint 003's
      embedding-structure check
@@ -395,10 +402,14 @@ numbers alone.
   choice).** The original draft claimed this "keeps the size/latency
   footprint close to today's model." That's wrong, and more so now than with
   mBERT: ZipVoice's existing `fm_decoder` + `text_encoder` is 122.8M params
-  (measured directly); adding Qwen2.5-0.5B's 136.1M embedding table plus a
-  small projection layer brings the total to **roughly 259M — more than
-  double**, not "close" (mBERT would have been ~215M, about 75% larger — still
-  not close, but less so than Qwen2.5-0.5B's actual cost). Inference-time cost
+  (measured directly, at `text_embed_dim=192`); adding Qwen2.5-0.5B's 136.1M
+  embedding table brings the total to **roughly 259M — more than double**,
+  not "close" (mBERT would have been ~215M, about 75% larger — still not
+  close, but less so than Qwen2.5-0.5B's actual cost). No separate projection
+  layer is added: `text_encoder`'s own existing `in_proj` (present regardless
+  of `embed_source`) does the 896→192 step for free once `text_embed_dim` is
+  set to the pretrained model's native 896, adding only a negligible ~135K
+  params over its scratch-mode size (896×192 vs. 192×192). Inference-time cost
   is still cheap (an embedding lookup is O(1) per token, no transformer forward
   pass), but the parameter count and optimizer-state memory during training are
   materially larger. This size increase was accepted explicitly in

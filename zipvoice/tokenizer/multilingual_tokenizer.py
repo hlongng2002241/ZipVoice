@@ -33,6 +33,24 @@ from zipvoice.tokenizer.base import Tokenizer
 
 LANGUAGES = ("en", "vi", "zh")
 
+# Free-form language names/codes (as found in real corpus metadata, e.g. the
+# "language": "Vietnamese" field in the user's YouTube-corpus schema) mapped
+# to LANGUAGES. Lowercase-matched; extend as new corpora surface new spellings.
+_LANGUAGE_ALIASES = {
+    "en": "en", "eng": "en", "english": "en",
+    "vi": "vi", "vie": "vi", "vietnamese": "vi",
+    "zh": "zh", "chi": "zh", "chinese": "zh", "mandarin": "zh", "cmn": "zh",
+}
+
+
+def normalize_language_name(name: Optional[str]) -> Optional[str]:
+    """Map a free-form language name/code to one of LANGUAGES, or None if
+    `name` is missing/unrecognized. Case-insensitive.
+    """
+    if not name:
+        return None
+    return _LANGUAGE_ALIASES.get(name.strip().lower())
+
 
 def sample_lang_tag(
     true_lang: str,
