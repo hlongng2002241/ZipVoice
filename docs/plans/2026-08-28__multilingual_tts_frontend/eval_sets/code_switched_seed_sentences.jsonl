@@ -1,0 +1,52 @@
+{"id": "seed_001", "bucket": "en", "text": "The quick brown fox jumps over the lazy dog."}
+{"id": "seed_002", "bucket": "en", "text": "Please remember to bring your identification card tomorrow morning."}
+{"id": "seed_003", "bucket": "en", "text": "She works as a software engineer at a technology company downtown."}
+{"id": "seed_004", "bucket": "en", "text": "Colonel Wright drove through the borough this Wednesday evening."}
+{"id": "seed_005", "bucket": "en", "text": "He read the newspaper twice before deciding to read it again later."}
+{"id": "seed_006", "bucket": "en", "text": "The wind was so strong it made the sailors wind the rope tighter."}
+{"id": "seed_007", "bucket": "en", "text": "I live near the river, but I don't like to live far from the city."}
+{"id": "seed_008", "bucket": "en", "text": "A dove flew over the house right after the pilot dove into the lake."}
+{"id": "seed_009", "bucket": "vi", "text": "Tôi yêu tiếng Việt và muốn nói chuyện thật tự nhiên."}
+{"id": "seed_010", "bucket": "vi", "text": "Hôm nay trời đẹp, chúng ta nên đi dạo công viên buổi chiều."}
+{"id": "seed_011", "bucket": "vi", "text": "Bạn có thể giúp tôi tìm đường đến trung tâm thành phố không?"}
+{"id": "seed_012", "bucket": "vi", "text": "Cô giáo dạy tiếng Anh rất tận tâm và luôn kiên nhẫn với học sinh."}
+{"id": "seed_013", "bucket": "vi", "text": "Chúng tôi sẽ tổ chức một buổi tiệc nhỏ vào cuối tuần này."}
+{"id": "seed_014", "bucket": "vi", "text": "Anh ấy làm việc chăm chỉ để nuôi sống gia đình của mình."}
+{"id": "seed_015", "bucket": "vi", "text": "Xin chào các bạn, rất vui được gặp mọi người hôm nay."}
+{"id": "seed_016", "bucket": "vi", "text": "Món phở này ngon quá, tôi muốn ăn thêm một tô nữa."}
+{"id": "seed_017", "bucket": "zh", "text": "我们是小米人，是吗？霍霍霍啦啦啦超过百分之九十的人。"}
+{"id": "seed_018", "bucket": "zh", "text": "今天天气很好，我们应该去公园散步。"}
+{"id": "seed_019", "bucket": "zh", "text": "你能帮我找到去市中心的路吗？"}
+{"id": "seed_020", "bucket": "zh", "text": "这家餐厅的菜很好吃，我想再点一份。"}
+{"id": "seed_021", "bucket": "zh", "text": "他每天都努力工作来养活自己的家庭。"}
+{"id": "seed_022", "bucket": "zh", "text": "欢迎大家，很高兴今天能见到大家。"}
+{"id": "seed_023", "bucket": "zh", "text": "小明和小红一起去图书馆看书。"}
+{"id": "seed_024", "bucket": "zh", "text": "这个周末我们打算举办一个小型聚会。"}
+{"id": "seed_025", "bucket": "en+vi", "text": "Hello, xin chào! Nice to meet you, rất vui được gặp bạn."}
+{"id": "seed_026", "bucket": "en+vi", "text": "Mr King, 5 years, from 2019 to 2024, xin chào rất vui gặp bạn."}
+{"id": "seed_027", "bucket": "en+vi", "text": "Can you help me tìm đường đến trung tâm thành phố?"}
+{"id": "seed_028", "bucket": "en+vi", "text": "I really love ăn phở, it's my favorite Vietnamese dish."}
+{"id": "seed_029", "bucket": "en+vi", "text": "She said cảm ơn rất nhiều for helping her yesterday."}
+{"id": "seed_030", "bucket": "en+vi", "text": "The meeting hôm nay is scheduled for 3 PM, đừng quên nhé."}
+{"id": "seed_031", "bucket": "en+vi", "text": "Let's go to quán cà phê near the office this afternoon."}
+{"id": "seed_032", "bucket": "en+vi", "text": "Anh ấy is a software engineer làm việc ở Hà Nội."}
+{"id": "seed_033", "bucket": "en+zh", "text": "Yes I think so! 我们是小米人，是吗？"}
+{"id": "seed_034", "bucket": "en+zh", "text": "Mr King, 5 years, from 2019 to 2024, 你好，很高兴见到你。"}
+{"id": "seed_035", "bucket": "en+zh", "text": "Can you help me 找到 the way downtown?"}
+{"id": "seed_036", "bucket": "en+zh", "text": "I really love 吃火锅, it's my favorite Chinese dish."}
+{"id": "seed_037", "bucket": "en+zh", "text": "She said 谢谢你 for helping her yesterday."}
+{"id": "seed_038", "bucket": "en+zh", "text": "The meeting 今天 is scheduled for 3 PM, 别忘了哦。"}
+{"id": "seed_039", "bucket": "en+zh", "text": "Let's go to 那家咖啡馆 near the office this afternoon."}
+{"id": "seed_040", "bucket": "en+zh", "text": "He is a software engineer working 在北京。"}
+{"id": "seed_041", "bucket": "vi+zh", "text": "Xin chào các bạn, hôm nay chúng ta nói về 人工智能 và công nghệ."}
+{"id": "seed_042", "bucket": "vi+zh", "text": "Món 火锅 này rất ngon, tôi muốn ăn thêm một chút."}
+{"id": "seed_043", "bucket": "vi+zh", "text": "Cô ấy đang học tiếng 中文 tại một trung tâm ngoại ngữ."}
+{"id": "seed_044", "bucket": "vi+zh", "text": "Chúng tôi sẽ đi 北京 vào tuần tới để du lịch."}
+{"id": "seed_045", "bucket": "vi+zh", "text": "Anh ấy làm việc ở 上海, một thành phố rất hiện đại."}
+{"id": "seed_046", "bucket": "vi+zh", "text": "Bạn có thích ăn 饺子 không? Tôi thấy nó rất ngon."}
+{"id": "seed_047", "bucket": "en+vi+zh", "text": "Mr King, 5 years, from 2019 to 2024, xin chào 你好 rất vui gặp bạn 我们."}
+{"id": "seed_048", "bucket": "en+vi+zh", "text": "Let's meet at quán cà phê near 北京路 this Friday afternoon."}
+{"id": "seed_049", "bucket": "en+vi+zh", "text": "She said cảm ơn and 谢谢 for helping her with the project yesterday."}
+{"id": "seed_050", "bucket": "en+vi+zh", "text": "The software engineer làm việc ở 上海 loves ăn phở on weekends."}
+{"id": "seed_051", "bucket": "en+vi+zh", "text": "Please remember mang theo 护照 và tài liệu khi đi công tác."}
+{"id": "seed_052", "bucket": "en+vi+zh", "text": "Hello, 你好, xin chào — welcome to our multilingual meeting today."}

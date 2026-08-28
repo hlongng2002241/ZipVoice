@@ -18,7 +18,6 @@
 
 import logging
 import re
-from abc import ABC, abstractmethod
 from functools import reduce
 from typing import Dict, List, Optional
 
@@ -27,6 +26,7 @@ from lhotse import CutSet
 from pypinyin import Style, lazy_pinyin
 from pypinyin.contrib.tone_convert import to_finals_tone3, to_initials
 
+from zipvoice.tokenizer.base import Tokenizer
 from zipvoice.tokenizer.normalizer import ChineseTextNormalizer, EnglishTextNormalizer
 
 try:
@@ -39,25 +39,6 @@ except Exception as ex:
     )
 
 jieba.default_logger.setLevel(logging.INFO)
-
-
-class Tokenizer(ABC):
-    """Abstract base class for tokenizers, defining common interface."""
-
-    @abstractmethod
-    def texts_to_token_ids(self, texts: List[str]) -> List[List[int]]:
-        """Convert list of texts to list of token id sequences."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def texts_to_tokens(self, texts: List[str]) -> List[List[str]]:
-        """Convert list of texts to list of token sequences."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def tokens_to_token_ids(self, tokens: List[List[str]]) -> List[List[int]]:
-        """Convert list of token sequences to list of token id sequences."""
-        raise NotImplementedError
 
 
 class SimpleTokenizer(Tokenizer):

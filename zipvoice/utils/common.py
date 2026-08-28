@@ -11,7 +11,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from packaging import version
@@ -249,12 +249,47 @@ def prepare_input(
     return return_list
 
 
-def prepare_avg_tokens_durations(features_lens, tokens_lens):
+def prepare_avg_tokens_durations(
+    features_lens,
+    tokens_lens,
+    zero_duration_mask: Optional[List[List[bool]]] = None,
+):
+    """
+    Args:
+      features_lens: the length of each acoustic feature sequence, shape
+        (batch,).
+      tokens_lens: the number of tokens in each utterance, shape (batch,).
+      zero_duration_mask: for each utterance, a list of booleans (one per
+        token) marking control/special tokens (e.g. ``[LANG:xx]`` tags, see
+        MultilingualTokenizer.zero_duration_mask) that carry no acoustic
+        content and must receive zero frames. ``None`` (the default)
+        preserves the original behaviour: every token gets an equal share.
+
+    Returns:
+      A list of per-utterance per-token durations. Non-zero-duration tokens
+      within an utterance always get an equal share of that utterance's
+      total duration; zero-duration tokens get 0.
+    """
     tokens_durations = []
     for i in range(len(features_lens)):
         utt_duration = features_lens[i]
-        avg_token_duration = utt_duration // tokens_lens[i]
-        tokens_durations.append([avg_token_duration] * tokens_lens[i])
+        n_tokens = tokens_lens[i]
+        if zero_duration_mask is None:
+            mask = [False] * n_tokens
+        else:
+            mask = zero_duration_mask[i]
+            assert len(mask) == n_tokens, (len(mask), n_tokens)
+
+        n_acoustic_tokens = n_tokens - sum(mask)
+        assert n_acoustic_tokens > 0, (
+            "An utterance cannot consist entirely of zero-duration tokens",
+            n_tokens,
+            sum(mask),
+        )
+        avg_token_duration = utt_duration // n_acoustic_tokens
+        tokens_durations.append(
+            [0 if is_zero else avg_token_duration for is_zero in mask]
+        )
     return tokens_durations
 
 
