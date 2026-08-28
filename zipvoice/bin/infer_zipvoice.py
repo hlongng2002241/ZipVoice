@@ -78,6 +78,11 @@ from vocos import Vocos
 
 from zipvoice.models.zipvoice import ZipVoice
 from zipvoice.models.zipvoice_distill import ZipVoiceDistill
+from zipvoice.tokenizer.multilingual_tokenizer import (
+    LANGUAGES,
+    MultilingualTokenizer,
+    normalize_language_name,
+)
 from zipvoice.tokenizer.tokenizer import (
     EmiliaTokenizer,
     EspeakTokenizer,
@@ -146,8 +151,10 @@ def get_parser():
         "--tokenizer",
         type=str,
         default="emilia",
-        choices=["emilia", "libritts", "espeak", "simple"],
-        help="Tokenizer type.",
+        choices=["emilia", "libritts", "espeak", "simple", "multilingual"],
+        help="Tokenizer type. 'multilingual' wraps a pretrained HuggingFace "
+        "tokenizer (see --pretrained-tokenizer-name and --primary-lang) "
+        "instead of phonemizing text.",
     )
 
     parser.add_argument(
@@ -156,6 +163,31 @@ def get_parser():
         default="en-us",
         help="Language identifier, used when tokenizer type is espeak. see"
         "https://github.com/rhasspy/espeak-ng/blob/master/docs/languages.md",
+    )
+
+    parser.add_argument(
+        "--pretrained-tokenizer-name",
+        type=str,
+        default=None,
+        help="HuggingFace model id whose tokenizer to wrap, when "
+        "--tokenizer=multilingual and --model-dir has no saved 'tokenizer' "
+        "directory. Defaults to MultilingualTokenizer's own default "
+        "(Qwen2.5-0.5B) if not given. Ignored when --model-dir/tokenizer "
+        "exists -- that saved tokenizer is loaded instead, to guarantee the "
+        "vocabulary matches the checkpoint.",
+    )
+
+    parser.add_argument(
+        "--primary-lang",
+        type=str,
+        default=None,
+        help="When --tokenizer=multilingual, the primary language of the "
+        "text to synthesize (e.g. 'en', 'vi', 'zh'), prepended as a "
+        "'[LANG:xx]' tag -- mirrors the ground-truth tag used during "
+        "training. If not given, '[LANG:auto]' is used instead, matching "
+        "how the model was trained to fall back when no hint is given. "
+        "Ignored for other tokenizer types. See "
+        "docs/proposals/2026-08-28__primary_language_conditioning.md.",
     )
 
     parser.add_argument(
@@ -298,6 +330,32 @@ def get_parser():
     return parser
 
 
+def apply_primary_lang_tag(
+    text: str,
+    tokenizer,
+    primary_lang: Optional[str] = None,
+) -> str:
+    """Prepend a '[LANG:xx]' tag to `text`, when `tokenizer` is a
+    MultilingualTokenizer. `primary_lang=None` uses '[LANG:auto]' (matching
+    how the model was trained to fall back when no hint is given); otherwise
+    the given language is validated and used as-is. No-op for other
+    tokenizer types, which have no such tokens in their vocabulary.
+    """
+    if not isinstance(tokenizer, MultilingualTokenizer):
+        return text
+    if primary_lang is None:
+        tag = "[LANG:auto]"
+    else:
+        normalized = normalize_language_name(primary_lang)
+        if normalized is None:
+            raise ValueError(
+                f"--primary-lang {primary_lang!r} is not a recognized "
+                f"language (expected one of {LANGUAGES} or a common alias)."
+            )
+        tag = f"[LANG:{normalized}]"
+    return f"{tag} {text}"
+
+
 def get_vocoder(vocos_local_path: Optional[str] = None):
     if vocos_local_path:
         vocoder = Vocos.from_hparams(f"{vocos_local_path}/config.yaml")
@@ -329,6 +387,7 @@ def generate_sentence_raw_evaluation(
     target_rms: float = 0.1,
     feat_scale: float = 0.1,
     sampling_rate: int = 24000,
+    primary_lang: Optional[str] = None,
 ):
     """
     Generate waveform of a text based on a given prompt waveform and its transcription,
@@ -377,6 +436,8 @@ def generate_sentence_raw_evaluation(
     prompt_features_lens = torch.tensor([prompt_features.size(1)], device=device)
 
     # Convert text to tokens
+    text = apply_primary_lang_tag(text, tokenizer, primary_lang)
+    prompt_text = apply_primary_lang_tag(prompt_text, tokenizer, primary_lang)
     tokens = tokenizer.texts_to_token_ids([text])
     prompt_tokens = tokenizer.texts_to_token_ids([prompt_text])
 
@@ -453,6 +514,7 @@ def generate_sentence(
     sampling_rate: int = 24000,
     max_duration: float = 100,
     remove_long_sil: bool = False,
+    primary_lang: Optional[str] = None,
 ):
     """
     Generate waveform of a text based on a given prompt waveform and its transcription,
@@ -527,6 +589,11 @@ def generate_sentence(
     # Add punctuation in the end if there is not
     text = add_punctuation(text)
     prompt_text = add_punctuation(prompt_text)
+
+    # Prepend the '[LANG:xx]' tag (before chunking, so it appears once at
+    # the very start of the tokenized text, same as a training utterance).
+    text = apply_primary_lang_tag(text, tokenizer, primary_lang)
+    prompt_text = apply_primary_lang_tag(prompt_text, tokenizer, primary_lang)
 
     # Tokenize text (str tokens), punctuations will be preserved.
     tokens_str = tokenizer.texts_to_tokens([text])[0]
@@ -659,6 +726,7 @@ def generate_list(
     raw_evaluation: bool = False,
     max_duration: float = 100,
     remove_long_sil: bool = False,
+    primary_lang: Optional[str] = None,
 ):
     total_t = []
     total_t_no_vocoder = []
@@ -689,6 +757,7 @@ def generate_list(
             "target_rms": target_rms,
             "feat_scale": feat_scale,
             "sampling_rate": sampling_rate,
+            "primary_lang": primary_lang,
         }
 
         if raw_evaluation:
@@ -754,16 +823,30 @@ def main():
         " or '--prompt-wav, --prompt-text and --text'."
     )
 
+    is_multilingual = params.tokenizer == "multilingual"
+    multilingual_tokenizer_dir = None
+
     if params.model_dir is not None:
         params.model_dir = Path(params.model_dir)
         if not params.model_dir.is_dir():
             raise FileNotFoundError(f"{params.model_dir} does not exist")
-        for filename in [params.checkpoint_name, "model.json", "tokens.txt"]:
+        required_files = [params.checkpoint_name, "model.json"]
+        if is_multilingual:
+            multilingual_tokenizer_dir = params.model_dir / "tokenizer"
+            if not multilingual_tokenizer_dir.is_dir():
+                raise FileNotFoundError(
+                    f"{multilingual_tokenizer_dir} does not exist (expected a "
+                    "saved HuggingFace tokenizer directory for "
+                    "--tokenizer=multilingual)"
+                )
+        else:
+            required_files.append("tokens.txt")
+        for filename in required_files:
             if not (params.model_dir / filename).is_file():
                 raise FileNotFoundError(f"{params.model_dir / filename} does not exist")
         model_ckpt = params.model_dir / params.checkpoint_name
         model_config = params.model_dir / "model.json"
-        token_file = params.model_dir / "tokens.txt"
+        token_file = None if is_multilingual else params.model_dir / "tokens.txt"
         logging.info(
             f"Using {params.model_name} in local model dir {params.model_dir}, "
             f"checkpoint {params.checkpoint_name}"
@@ -777,9 +860,11 @@ def main():
             HUGGINGFACE_REPO, filename=f"{MODEL_DIR[params.model_name]}/model.json"
         )
 
-        token_file = hf_hub_download(
-            HUGGINGFACE_REPO, filename=f"{MODEL_DIR[params.model_name]}/tokens.txt"
-        )
+        token_file = None
+        if not is_multilingual:
+            token_file = hf_hub_download(
+                HUGGINGFACE_REPO, filename=f"{MODEL_DIR[params.model_name]}/tokens.txt"
+            )
 
     if params.tokenizer == "emilia":
         tokenizer = EmiliaTokenizer(token_file=token_file)
@@ -787,6 +872,20 @@ def main():
         tokenizer = LibriTTSTokenizer(token_file=token_file)
     elif params.tokenizer == "espeak":
         tokenizer = EspeakTokenizer(token_file=token_file, lang=params.lang)
+    elif params.tokenizer == "multilingual":
+        if multilingual_tokenizer_dir is not None:
+            # Load the exact tokenizer the checkpoint was trained with
+            # (including any [LANG:xx] tokens added on top of the base
+            # vocabulary), rather than reconstructing one from scratch.
+            tokenizer = MultilingualTokenizer(
+                pretrained_model_name=str(multilingual_tokenizer_dir)
+            )
+        elif params.pretrained_tokenizer_name is not None:
+            tokenizer = MultilingualTokenizer(
+                pretrained_model_name=params.pretrained_tokenizer_name
+            )
+        else:
+            tokenizer = MultilingualTokenizer()
     else:
         assert params.tokenizer == "simple"
         tokenizer = SimpleTokenizer(token_file=token_file)
@@ -863,6 +962,7 @@ def main():
             raw_evaluation=params.raw_evaluation,
             max_duration=params.max_duration,
             remove_long_sil=params.remove_long_sil,
+            primary_lang=params.primary_lang,
         )
     else:
         assert (
@@ -887,6 +987,7 @@ def main():
             sampling_rate=params.sampling_rate,
             max_duration=params.max_duration,
             remove_long_sil=params.remove_long_sil,
+            primary_lang=params.primary_lang,
         )
         logging.info(f"Saved to: {params.res_wav_path}")
     logging.info("Done")

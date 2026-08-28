@@ -200,8 +200,17 @@ to "distribute a known total duration across uneven tokens."
      shows the pretrained embedding space isn't noise for either candidate,
      but it doesn't replace an actual trained-model WER/quality comparison,
      which needs a full training run this proposal doesn't cover. The new
-     `[LANG:xx]` tokens from point 2 have no pretrained counterpart in either
-     case and are always randomly initialized.
+     `[LANG:xx]` tokens from point 2 have no pretrained counterpart, and in
+     the pretrained-embedding case are **not** separately randomly
+     initialized as originally planned here: `ZipVoice._make_pretrained_embedding`
+     (`zipvoice/models/zipvoice.py`) instead slices them into Qwen2.5-0.5B's
+     embedding table's unused padding rows (its table has 151,936 rows but
+     the real tokenizer vocab is only 151,665, leaving room for the 4 new
+     tags). Those padding rows were never trained on by Qwen either, so
+     they're not meaningfully different from a fresh random init for our
+     purposes — but they're free (no separate init step needed). Trained
+     from scratch (`embed_source="scratch"`), the new tag rows *are* part of
+     the single random `nn.Embedding` init, matching the original plan.
 4. **No transformer blocks loaded** — ZipVoice's existing `text_encoder` (the small
    transformer already sitting right after the embedding lookup) is left
    unchanged and does the contextualizing work over the initialized vectors.
@@ -210,13 +219,18 @@ to "distribute a known total duration across uneven tokens."
    review:
    - **Special tokens (`[LANG:xx]`, `[S1]`/`[S2]`) get zero duration** — they carry
      no acoustic content and must be explicitly excluded from the per-token frame
-     allocation, not given a share of frames like a real subword would. The
-     current `prepare_avg_tokens_durations`/`get_tokens_index`
-     (`zipvoice/utils/common.py`) path does not have this concept and needs it
-     added.
+     allocation, not given a share of frames like a real subword would.
+     **Implemented**: `MultilingualTokenizer.zero_duration_mask()` plus
+     `prepare_avg_tokens_durations`/`get_tokens_index`
+     (`zipvoice/utils/common.py`) now zero out those positions and redistribute
+     their frames across the remaining real tokens.
+   - The per-character, **script-weighted** split itself (as opposed to zero-ing
+     out special tokens) is **not implemented** — real tokens still get an equal
+     share of the remaining frames. Per Sprint 003, uniform-vs-weighted duration
+     for real tokens remains an open training ablation, not a settled decision.
    - The per-character weight lookup must have defined behavior for WordPiece
      continuation pieces (`##foo`), `[UNK]`, and punctuation — left unspecified in
-     the original draft.
+     the original draft. Moot for now since the weighted split isn't implemented.
 
 ## Model selection analysis
 

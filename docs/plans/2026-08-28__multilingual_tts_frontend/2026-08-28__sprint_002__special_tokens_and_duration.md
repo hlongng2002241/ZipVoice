@@ -2,8 +2,14 @@
 
 - **Date:** 2026-08-28
 - **Author:** LongNH (with Claude Code assistance)
-- **Status:** In Progress — code + tests done; the influence probe is blocked
-  on a trained checkpoint (see Progress)
+- **Status:** In Progress — helper-level code + tests done
+  (`prepare_avg_tokens_durations`'s `zero_duration_mask` param,
+  `MultilingualTokenizer.zero_duration_mask()`, `tests/test_common.py`,
+  `tests/test_multilingual_tokenizer.py`). The end-to-end wiring
+  (tokenizer → dataset → `prepare_input` → `ZipVoice.forward` →
+  `prepare_avg_tokens_durations`) is implemented and verified with ad-hoc
+  scripts, but not yet covered by a committed test. The influence probe is
+  blocked on a trained checkpoint (see Progress).
 
 ## Goal
 

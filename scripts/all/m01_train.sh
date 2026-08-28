@@ -9,6 +9,14 @@
 # upstream recipe (--num-epochs 11), scaled down from --world-size 8 to 1 GPU.
 set -euo pipefail
 
+# Bounds cuDNN v8's shape-keyed execution-plan cache. Without this, the
+# highly variable batch/time shapes from DynamicBucketingSampler bucketing
+# make this native (non-Python) cache grow roughly linearly in the main
+# process's RSS, which OOM-killed two prior runs after ~1hr. See Codex's
+# analysis in this session -- confirm the RSS plateaus with a short run
+# before removing this comment.
+export TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT=128
+
 CUDA_VISIBLE_DEVICES=0 python -m zipvoice.bin.train_zipvoice \
     --tokenizer multilingual \
     --lang-auto-prob 0.05 \
@@ -20,7 +28,7 @@ CUDA_VISIBLE_DEVICES=0 python -m zipvoice.bin.train_zipvoice \
     --world-size 1 \
     \
     --warmup-batches 5000 \
-    --base-lr 0.001 \
+    --base-lr 0.0001 \
     --lr-epochs 3 \
     --lr-batches 7500 \
     \
@@ -28,9 +36,9 @@ CUDA_VISIBLE_DEVICES=0 python -m zipvoice.bin.train_zipvoice \
     --min-len 1.0 \
     --max-len 120.0 \
     --num-buckets 30 \
-    --num-workers 4 \
+    --num-workers 8 \
     --on-the-fly-feats True \
-    --save-every-n 10000 \
+    --save-every-n 4000 \
     \
     --dataset custom \
     --train-manifest data/all/manifests/train.jsonl.gz \

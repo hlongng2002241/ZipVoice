@@ -305,6 +305,7 @@ class ZipVoice(nn.Module):
         embed: torch.Tensor,
         tokens_lens: torch.Tensor,
         features_lens: torch.Tensor,
+        zero_duration_mask: Optional[List[List[bool]]] = None,
     ):
         """
         Get the text condition with the same length of the acoustic feature.
@@ -324,7 +325,9 @@ class ZipVoice(nn.Module):
 
         padding_mask = make_pad_mask(features_lens, max_len=num_frames)  # (B, T)
 
-        tokens_durations = prepare_avg_tokens_durations(features_lens, tokens_lens)
+        tokens_durations = prepare_avg_tokens_durations(
+            features_lens, tokens_lens, zero_duration_mask=zero_duration_mask
+        )
 
         tokens_index = get_tokens_index(tokens_durations, num_frames).to(
             embed.device
@@ -343,13 +346,14 @@ class ZipVoice(nn.Module):
         self,
         tokens: List[List[int]],
         features_lens: torch.Tensor,
+        zero_duration_mask: Optional[List[List[bool]]] = None,
     ):
         """
         Process text for training, given text tokens and real feature lengths.
         """
         embed, tokens_lens = self.forward_text_embed(tokens)
         text_condition, padding_mask = self.forward_text_condition(
-            embed, tokens_lens, features_lens
+            embed, tokens_lens, features_lens, zero_duration_mask=zero_duration_mask
         )
         return (
             text_condition,
@@ -426,6 +430,7 @@ class ZipVoice(nn.Module):
         noise: torch.Tensor,
         t: torch.Tensor,
         condition_drop_ratio: float = 0.0,
+        zero_duration_mask: Optional[List[List[bool]]] = None,
     ) -> torch.Tensor:
         """Forward pass of the model for training.
         Args:
@@ -435,6 +440,11 @@ class ZipVoice(nn.Module):
             noise: the intitial noise, with the shape (batch, seq_len, feat_dim).
             t: the time step, with the shape (batch, 1, 1).
             condition_drop_ratio: the ratio of dropped text condition.
+            zero_duration_mask: per-utterance, per-token booleans marking
+                control tokens (e.g. MultilingualTokenizer's [LANG:xx] tags)
+                that must receive zero acoustic duration. None (default)
+                preserves the original behaviour of giving every token an
+                equal share of the utterance's duration.
         Returns:
             fm_loss: the flow-matching loss.
         """
@@ -442,6 +452,7 @@ class ZipVoice(nn.Module):
         (text_condition, padding_mask,) = self.forward_text_train(
             tokens=tokens,
             features_lens=features_lens,
+            zero_duration_mask=zero_duration_mask,
         )
 
         speech_condition_mask = condition_time_mask(

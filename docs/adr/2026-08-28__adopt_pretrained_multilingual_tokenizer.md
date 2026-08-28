@@ -59,10 +59,13 @@ unaffected by which specific model won.
   for irregular English spelling if training data is limited, tracked as an open
   risk in the linked proposal.
 - Harder: token-to-frame duration allocation can no longer assume roughly uniform
-  per-token duration (true for phonemes, false for variable-length subwords) and
-  needs the script-weighted duration scheme described in the linked proposal,
-  including zero-duration handling for the special tokens introduced by
-  [2026-08-28__language_hint_as_special_tokens.md](2026-08-28__language_hint_as_special_tokens.md).
+  per-token duration (true for phonemes, false for variable-length subwords).
+  Zero-duration handling for the special tokens introduced by
+  [2026-08-28__language_hint_as_special_tokens.md](2026-08-28__language_hint_as_special_tokens.md)
+  is **implemented**. The script-weighted duration scheme for *real* subword
+  tokens described in the linked proposal is **not implemented** — real tokens
+  still split the remaining frames evenly, per Sprint 003's framing of
+  uniform-vs-weighted as an open training ablation rather than a requirement.
 - Neutral: the exact tokenizer and embedding-initialization strategy (pretrained
   vs. from-scratch) remain open, to be settled by the bakeoff in the implementation
   plan, not by this ADR.

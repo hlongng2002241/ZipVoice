@@ -42,10 +42,16 @@ This sprint runs the actual bakeoff. Uses sprint 001's eval sets and sprint
     (`zipvoice/tokenizer/normalizer.py`) operate on raw text *before* any
     tokenizer sees it (number/abbreviation expansion via regex + `inflect`/
     `cn2an`), so they're reusable as-is regardless of which subword tokenizer
-    wins this bakeoff — there's nothing to compare across candidates here. The
-    real gap is that **no Vietnamese normalizer exists yet** (a shared
-    prerequisite for any candidate, not a differentiator between them) —
-    tracked as a sprint 004 blocker, not a sprint 003 bakeoff axis.
+    wins this bakeoff — there's nothing to compare across candidates here.
+  - **Decided (2026-08-29), supersedes the above "Vietnamese normalizer
+    blocker"**: `MultilingualTokenizer` does not call any text normalizer
+    (`EnglishTextNormalizer`, `ChineseTextNormalizer`, or a Vietnamese
+    equivalent) at all, by design. The author's decision: all normalization
+    (number/date/abbreviation expansion, etc.) must already be done upstream,
+    before a corpus reaches `train_zipvoice.py` — it is a data-preparation
+    concern, not a tokenizer concern, for this multilingual path. There is no
+    "missing Vietnamese normalizer" gap to fill here; it is out of scope for
+    this sprint and for `MultilingualTokenizer` generally.
   - Latency/memory measurement per candidate's embedding-table size.
 - **Out of scope:** the full-scale training run (sprint 004); anything specific
   to FlowTTS-GRPO RL.

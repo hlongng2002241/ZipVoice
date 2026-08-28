@@ -159,17 +159,17 @@ ones — a meaningful starting point instead of random noise**, which is the
 correct mitigation for this risk, not chasing an artificially uniform
 frequency distribution.
 
-## Recommendation status: reopened (2026-08-28)
+## Recommendation status: settled — Qwen2.5-0.5B (was reopened 2026-08-28)
 
-The mBERT recommendation from earlier in Sprint 003 is **no longer settled**.
-The systematic check above shows the `[UNK]` issue is a structural gap (36/68
-uppercase Vietnamese diacritic vowels), not the narrow 27-word issue first
-reported — and the embedding-structure comparison shows mBERT and
-Qwen2.5-0.5B each win on a different axis (Vietnamese-specific pretrained
-structure vs. structural UNK-immunity + smaller English-structure edge). This
-is a genuine multi-dimensional trade-off, not something further
-corpus-text analysis alone resolves — see the "Revised comparison table"
-above and the chat discussion for the decision this needs from the user.
+The mBERT recommendation from earlier in Sprint 003 was reopened here after
+the systematic check above showed the `[UNK]` issue is a structural gap
+(36/68 uppercase Vietnamese diacritic vowels), not the narrow 27-word issue
+first reported — and the embedding-structure comparison showed mBERT and
+Qwen2.5-0.5B each winning on a different axis (Vietnamese-specific pretrained
+structure vs. structural UNK-immunity + smaller English-structure edge). That
+trade-off was resolved by the user in favor of Qwen2.5-0.5B; see
+[../../../adr/2026-08-28__choose_qwen25_tokenizer.md](../../../adr/2026-08-28__choose_qwen25_tokenizer.md)
+for the final decision and rationale.
 
 What's unaffected either way:
 - Real fragmentation (0.368-0.372 tokens/char across all three candidates) is

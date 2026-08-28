@@ -185,6 +185,10 @@ class MultilingualTokenizer(Tokenizer):
         self.has_tokens = True
 
     def texts_to_token_ids(self, texts: List[str]) -> List[List[int]]:
+        # No text normalization here by design -- number/date/abbreviation
+        # expansion etc. is a data-preparation concern and must already be
+        # done upstream before a corpus reaches training. See
+        # docs/plans/2026-08-28__multilingual_tts_frontend/2026-08-28__sprint_003__tokenizer_embedding_bakeoff.md.
         return [
             self.hf_tokenizer.encode(text, add_special_tokens=False)
             for text in texts

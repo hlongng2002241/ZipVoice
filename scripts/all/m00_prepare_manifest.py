@@ -112,9 +112,23 @@ def main():
     all_rows = youtube_rows + toptop_rows
 
     by_lang = {"vi": [], "en": [], "other": []}
+    invalid_rows = []
     for row in all_rows:
         norm = normalize_language_name(row["language"])
+        if norm is None:
+            invalid_rows.append(row)
+            continue
         by_lang.setdefault(norm if norm in ("vi", "en") else "other", []).append(row)
+
+    if invalid_rows:
+        examples = ", ".join(
+            f"{r['id']!r} (language={r['language']!r})" for r in invalid_rows[:10]
+        )
+        raise ValueError(
+            f"{len(invalid_rows)} row(s) have a missing or unrecognized "
+            f"language and cannot be used for training -- every utterance "
+            f"must have a valid language before training. Examples: {examples}"
+        )
 
     for bucket in by_lang.values():
         rng.shuffle(bucket)

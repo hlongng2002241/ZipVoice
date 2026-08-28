@@ -92,9 +92,19 @@ def save_checkpoint(
     }
 
     if model_avg is not None:
-        checkpoint["model_avg"] = model_avg.to(torch.float32).state_dict()
+        # `nn.Module.to()` mutates in place, which would permanently
+        # downgrade the live running-average model (kept in float64 for
+        # numerical stability) to float32. Cast the state-dict tensors
+        # instead, which returns new tensors and leaves model_avg untouched.
+        checkpoint["model_avg"] = {
+            k: v.to(torch.float32) if torch.is_floating_point(v) else v
+            for k, v in model_avg.state_dict().items()
+        }
     if model_ema is not None:
-        checkpoint["model_ema"] = model_ema.to(torch.float32).state_dict()
+        checkpoint["model_ema"] = {
+            k: v.to(torch.float32) if torch.is_floating_point(v) else v
+            for k, v in model_ema.state_dict().items()
+        }
 
     if params:
         for k, v in params.items():

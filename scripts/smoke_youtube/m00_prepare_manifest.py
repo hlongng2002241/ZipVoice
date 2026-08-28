@@ -10,8 +10,13 @@ tokenize_text()) end-to-end, since that reads supervision.language directly.
 
 import json
 import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from lhotse import CutSet, Recording, SupervisionSegment
+
+from zipvoice.tokenizer.multilingual_tokenizer import normalize_language_name
 
 SRC = "/data4/audio/youtube/exp/01/audio.exist.denoise.info.vol.diarize.mos.asr.abs.final.jsonl"
 OUT_DIR = "data/smoke_youtube/manifests"
@@ -53,6 +58,12 @@ def main():
                 continue
             if not path or not os.path.isfile(path):
                 continue
+            if normalize_language_name(obj.get("language")) is None:
+                raise ValueError(
+                    f"row {obj.get('id')!r} has a missing or unrecognized "
+                    f"language ({obj.get('language')!r}) -- every utterance "
+                    f"must have a valid language before training."
+                )
             picked.append(obj)
             if len(picked) >= N_TRAIN + N_DEV:
                 break

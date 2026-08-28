@@ -481,6 +481,7 @@ def compute_fbank_loss(
     features_lens: Tensor,
     tokens: List[List[int]],
     is_training: bool,
+    zero_duration_mask: Optional[List[List[bool]]] = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute loss given the model and its inputs.
@@ -522,6 +523,7 @@ def compute_fbank_loss(
             noise=noise,
             t=t,
             condition_drop_ratio=params.condition_drop_ratio,
+            zero_duration_mask=zero_duration_mask,
         )
 
     assert loss.requires_grad == is_training
@@ -632,7 +634,7 @@ def train_one_epoch(
 
         batch_size = len(batch["text"])
 
-        tokens, features, features_lens = prepare_input(
+        tokens, zero_duration_mask, features, features_lens = prepare_input(
             params=params,
             batch=batch,
             device=device,
@@ -648,6 +650,7 @@ def train_one_epoch(
                     features=features,
                     features_lens=features_lens,
                     tokens=tokens,
+                    zero_duration_mask=zero_duration_mask,
                     is_training=True,
                 )
 
@@ -761,7 +764,7 @@ def compute_validation_loss(
     tot_loss = MetricsTracker()
 
     for batch_idx, batch in enumerate(valid_dl):
-        tokens, features, features_lens = prepare_input(
+        tokens, zero_duration_mask, features, features_lens = prepare_input(
             params=params,
             batch=batch,
             device=device,
@@ -775,6 +778,7 @@ def compute_validation_loss(
             features=features,
             features_lens=features_lens,
             tokens=tokens,
+            zero_duration_mask=zero_duration_mask,
             is_training=False,
         )
         assert loss.requires_grad is False
@@ -834,7 +838,7 @@ def scan_pessimistic_batches_for_oom(
     batches, crit_values = find_pessimistic_batches(train_dl.sampler)
     for criterion, cuts in batches.items():
         batch = train_dl.dataset[cuts]
-        tokens, features, features_lens = prepare_input(
+        tokens, zero_duration_mask, features, features_lens = prepare_input(
             params=params,
             batch=batch,
             device=device,
@@ -850,6 +854,7 @@ def scan_pessimistic_batches_for_oom(
                     features=features,
                     features_lens=features_lens,
                     tokens=tokens,
+                    zero_duration_mask=zero_duration_mask,
                     is_training=True,
                 )
             loss.backward()
@@ -882,25 +887,35 @@ def tokenize_text(
         "language": "Vietnamese" field in the user's YouTube-corpus schema,
         normalized via `normalize_language_name`) and a `[LANG:xx]` tag is
         prepended to the text before tokenizing, sampled via
-        `sample_lang_tag` with the given dropout probabilities. Cuts with no
-        recognized language field get no tag at all. Called fresh on every
-        invocation -- since train/dev cuts are lazy lhotse CutSets, this
-        function runs again each epoch, so the sampled tag differs run to
-        run rather than being fixed once at manifest-prep time.
+        `sample_lang_tag` with the given dropout probabilities. Every cut
+        must have a valid, recognized language -- this is expected to be
+        enforced already during data preparation (see
+        scripts/*/m00_prepare_manifest.py), and is re-checked here as a
+        safety net. Called fresh on every invocation -- since train/dev
+        cuts are lazy lhotse CutSets, this function runs again each epoch,
+        so the sampled tag differs run to run rather than being fixed once
+        at manifest-prep time.
     """
     if hasattr(c.supervisions[0], "tokens"):
         tokens = tokenizer.tokens_to_token_ids([c.supervisions[0].tokens])
     else:
         text = c.supervisions[0].text
         if lang_rng is not None:
-            true_lang = normalize_language_name(
-                getattr(c.supervisions[0], "language", None)
-            )
-            if true_lang is not None:
-                tag = sample_lang_tag(true_lang, lang_auto_prob, lang_wrong_prob, lang_rng)
-                text = f"{tag} {text}"
+            raw_lang = getattr(c.supervisions[0], "language", None)
+            true_lang = normalize_language_name(raw_lang)
+            if true_lang is None:
+                raise ValueError(
+                    f"cut {c.id!r} has a missing or unrecognized language "
+                    f"({raw_lang!r}). Every utterance must have a valid "
+                    f"language; this should have been caught during data "
+                    f"preparation (see scripts/*/m00_prepare_manifest.py)."
+                )
+            tag = sample_lang_tag(true_lang, lang_auto_prob, lang_wrong_prob, lang_rng)
+            text = f"{tag} {text}"
         tokens = tokenizer.texts_to_token_ids([text])
     c.supervisions[0].tokens = tokens[0]
+    if hasattr(tokenizer, "zero_duration_mask"):
+        c.supervisions[0].zero_duration_mask = tokenizer.zero_duration_mask(tokens[0])
     return c
 
 
@@ -1102,18 +1117,27 @@ def run(rank, world_size, args):
         logging.info(
             f"[LANG:xx] tags derived per-utterance from each cut's "
             f"supervision.language field (auto_prob={params.lang_auto_prob}, "
-            f"wrong_prob={params.lang_wrong_prob})"
+            f"wrong_prob={params.lang_wrong_prob}); dev/test cuts always get "
+            f"the ground-truth tag (auto_prob=wrong_prob=0) with their own "
+            f"RNG, so validation never perturbs the training dropout stream."
         )
 
-    _tokenize_text = partial(
+    _tokenize_text_train = partial(
         tokenize_text,
         tokenizer=tokenizer,
         lang_auto_prob=params.lang_auto_prob,
         lang_wrong_prob=params.lang_wrong_prob,
         lang_rng=lang_rng,
     )
-    train_cuts = train_cuts.map(_tokenize_text)
-    dev_cuts = dev_cuts.map(_tokenize_text)
+    _tokenize_text_dev = partial(
+        tokenize_text,
+        tokenizer=tokenizer,
+        lang_auto_prob=0.0,
+        lang_wrong_prob=0.0,
+        lang_rng=random.Random(params.seed) if lang_rng is not None else None,
+    )
+    train_cuts = train_cuts.map(_tokenize_text_train)
+    dev_cuts = dev_cuts.map(_tokenize_text_dev)
 
     train_dl = datamodule.train_dataloaders(train_cuts)
 

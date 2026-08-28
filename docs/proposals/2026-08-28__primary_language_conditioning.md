@@ -1,6 +1,21 @@
 # Optional primary-language conditioning tag (explicit language hint, auto by default)
 
-- **Status**: Proposed, not yet implemented
+- **Status**: Implemented. Training-time mechanics (vocabulary, per-utterance
+  ground-truth tag, dynamic label dropout, zero-duration masking, dev/test
+  tags kept deterministic) are done in `zipvoice/bin/train_zipvoice.py` /
+  `zipvoice/models/zipvoice.py` / `zipvoice/tokenizer/multilingual_tokenizer.py`.
+  The inference-time hint (point 6 below) is also done, as `--primary-lang`
+  in `zipvoice/bin/infer_zipvoice.py` (named `primary_lang`, not `lang`, per
+  the "API naming" open question below) — `None` (default) uses
+  `[LANG:auto]`, otherwise the given language is validated (same
+  `normalize_language_name` used in training) and used as-is. Applies to
+  both `--text` and `--prompt-text`, prepended once before chunking. Also
+  added: `--tokenizer multilingual` and `--pretrained-tokenizer-name` on the
+  inference CLI (`MultilingualTokenizer` wasn't previously wired into
+  `infer_zipvoice.py` at all); when `--model-dir` is given, the exact
+  tokenizer saved during training (`<model-dir>/tokenizer/`) is loaded
+  instead of reconstructing one from `--pretrained-tokenizer-name`, to
+  guarantee the vocabulary matches the checkpoint.
 - **Author**: LongNH (with Claude Code assistance)
 - **Date**: 2026-08-28
 - **Related**: [2026-08-28__mbert_multilingual_tokenizer.md](2026-08-28__mbert_multilingual_tokenizer.md)
@@ -125,9 +140,12 @@ per-character auto segmentation and has no "auto" behavior of its own.
    this needs an explicit probe (e.g. compare outputs for the same text with
    different `[LANG:xx]` tags and confirm they differ) before relying on it,
    rather than assuming bidirectional attention makes it work.
-6. **Inference API**: expose a `lang: Optional[str] = None` argument on the
-   inference entry points (`zipvoice/bin/infer_zipvoice.py` and friends),
-   analogous to OmniVoice's `generate(text, language=...)`.
+6. **Inference API — implemented**: exposed as `--primary-lang` (CLI) /
+   `primary_lang: Optional[str] = None` on `generate_sentence`,
+   `generate_sentence_raw_evaluation`, and `generate_list` in
+   `zipvoice/bin/infer_zipvoice.py`, analogous to OmniVoice's
+   `generate(text, language=...)`. `apply_primary_lang_tag()` in that file
+   does the `None` → `[LANG:auto]` fallback / validation-and-tagging.
 
 ## Decided (2026-08-28, was previously an open question)
 
@@ -141,6 +159,27 @@ per-character auto segmentation and has no "auto" behavior of its own.
   the model actually uses the tag or ignores it and infers from content
   regardless — if performance is indistinguishable between correct and
   incorrect tags, the tag isn't doing anything).
+
+## Decided (2026-08-29): missing/invalid corpus language is a data error, not a "no hint" case
+
+`[LANG:auto]` (above) is for a caller genuinely not specifying a language at
+inference time, or for training-time label dropout — it is **not** a
+fallback for bad source data. Every training utterance is required to carry
+a valid, recognized language before training starts. Data preparation
+scripts (`scripts/*/m00_prepare_manifest.py`) validate this up front and
+**raise an error**, listing the offending rows, if any utterance's language
+is missing or unrecognized — they do not silently default it to
+`[LANG:auto]` or drop the tag. `tokenize_text()` in `train_zipvoice.py`
+re-raises the same error as a safety net if it ever sees an invalid
+language at training time, in case a manifest bypassed that check.
+
+Separately, dev/test cuts are tokenized with `lang_auto_prob=0` and
+`lang_wrong_prob=0` (and their own RNG, independent of the training dropout
+stream), so validation loss always reflects the deterministic true-tag
+condition rather than a randomly perturbed one. This keeps validation
+comparable run-to-run; it is not the same as the full true/auto/wrong
+three-condition comparison eval described above, which still needs a
+dedicated eval script and remains open.
 
 ## Open questions
 - **Dropout rate**: OmniVoice's exact dropout probability isn't visible from the
@@ -162,10 +201,12 @@ per-character auto segmentation and has no "auto" behavior of its own.
   sees it, `[LANG:vi]` cannot recover content that was never correctly tokenized
   in the first place. This tag is a pronunciation/disambiguation hint on top of
   correct tokenization, not a substitute for it.
-- **API naming**: use `primary_lang` rather than reusing `lang`, since ZipVoice
-  already has a `--lang` flag for `EspeakTokenizer`'s language selection
-  (`infer_zipvoice.py:154`) — a different, whole-utterance-phonemizer-language
-  concept that this proposal shouldn't be confused with.
+- **API naming — settled, implemented**: used `--primary-lang` rather than
+  reusing `--lang`, since ZipVoice already has a `--lang` flag for
+  `EspeakTokenizer`'s language selection (`infer_zipvoice.py`) — a different,
+  whole-utterance-phonemizer-language concept this proposal shouldn't be
+  confused with. Both flags coexist; `--primary-lang` only has an effect
+  when `--tokenizer=multilingual`.
 
 ## Next steps
 

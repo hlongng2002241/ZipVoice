@@ -87,6 +87,10 @@ class SpeechSynthesisDataset(torch.utils.data.Dataset):
         if self.return_tokens:
             tokens = [cut.supervisions[0].tokens for cut in cuts]
             batch["tokens"] = tokens
+            batch["zero_duration_mask"] = [
+                getattr(cut.supervisions[0], "zero_duration_mask", None)
+                for cut in cuts
+            ]
 
         if self.return_spk_ids:
             batch["speakers"] = [cut.supervisions[0].speaker for cut in cuts]
