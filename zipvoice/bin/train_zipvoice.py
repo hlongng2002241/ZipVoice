@@ -40,6 +40,7 @@ import copy
 import json
 import logging
 import os
+import random
 from functools import partial
 from pathlib import Path
 from shutil import copyfile
@@ -54,10 +55,16 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 import zipvoice.utils.diagnostics as diagnostics
 from zipvoice.dataset.datamodule import TtsDataModule
 from zipvoice.models.zipvoice import ZipVoice
+from zipvoice.tokenizer.multilingual_tokenizer import (
+    MultilingualTokenizer,
+    normalize_language_name,
+    sample_lang_tag,
+)
 from zipvoice.tokenizer.tokenizer import (
     EmiliaTokenizer,
     EspeakTokenizer,
@@ -353,8 +360,19 @@ def get_parser():
         "--tokenizer",
         type=str,
         default="emilia",
-        choices=["emilia", "libritts", "espeak", "simple"],
-        help="Tokenizer type.",
+        choices=["emilia", "libritts", "espeak", "simple", "multilingual"],
+        help="Tokenizer type. 'multilingual' wraps an existing pretrained "
+        "HuggingFace tokenizer (see --pretrained-tokenizer-name) instead of "
+        "phonemizing text -- see docs/adr/2026-08-28__choose_qwen25_tokenizer.md.",
+    )
+
+    parser.add_argument(
+        "--pretrained-tokenizer-name",
+        type=str,
+        default=None,
+        help="HuggingFace model id whose tokenizer to wrap, when "
+        "--tokenizer=multilingual. Defaults to MultilingualTokenizer's own "
+        "default (Qwen2.5-0.5B) if not given.",
     )
 
     parser.add_argument(
@@ -363,6 +381,36 @@ def get_parser():
         default="en-us",
         help="Language identifier, used when tokenizer type is espeak. see"
         "https://github.com/rhasspy/espeak-ng/blob/master/docs/languages.md",
+    )
+
+    parser.add_argument(
+        "--lang-auto-prob",
+        type=float,
+        default=0.05,
+        help="When --tokenizer=multilingual, probability of replacing an "
+        "utterance's ground-truth [LANG:xx] tag with [LANG:auto], so the "
+        "model still works when a caller doesn't specify a language at "
+        "inference. The ground-truth language is read per-utterance from "
+        "each cut's own supervision.language field (e.g. the "
+        "'language': 'Vietnamese' field in the user's YouTube-corpus schema) "
+        "-- NOT a single flag for the whole dataset, since a training run "
+        "may mix corpora in different languages. Utterances with no "
+        "recognized language field get no [LANG:xx] tag at all. Applied "
+        "fresh per epoch (lhotse cuts are lazy), matching OmniVoice's "
+        "label-dropout approach. See "
+        "docs/proposals/2026-08-28__primary_language_conditioning.md.",
+    )
+
+    parser.add_argument(
+        "--lang-wrong-prob",
+        type=float,
+        default=0.0,
+        help="When --tokenizer=multilingual, probability of using a "
+        "deliberately incorrect [LANG:xx] tag for a given utterance -- for "
+        "the true/auto/wrong probe described in "
+        "docs/proposals/2026-08-28__primary_language_conditioning.md. "
+        "Defaults to 0 (off); --lang-auto-prob + --lang-wrong-prob must be "
+        "<= 1.",
     )
 
     parser.add_argument(
@@ -433,6 +481,7 @@ def compute_fbank_loss(
     features_lens: Tensor,
     tokens: List[List[int]],
     is_training: bool,
+    zero_duration_mask: Optional[List[List[bool]]] = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute loss given the model and its inputs.
@@ -474,6 +523,7 @@ def compute_fbank_loss(
             noise=noise,
             t=t,
             condition_drop_ratio=params.condition_drop_ratio,
+            zero_duration_mask=zero_duration_mask,
         )
 
     assert loss.requires_grad == is_training
@@ -548,7 +598,13 @@ def train_one_epoch(
             rank=0,
         )
 
-    for batch_idx, batch in enumerate(train_dl):
+    train_pbar = tqdm(
+        train_dl,
+        desc=f"Epoch {params.cur_epoch}",
+        disable=(rank != 0),
+        dynamic_ncols=True,
+    )
+    for batch_idx, batch in enumerate(train_pbar):
         if batch_idx % 10 == 0:
             if params.finetune:
                 set_batch_count(model, get_adjusted_batch_count(params) + 100000)
@@ -556,7 +612,10 @@ def train_one_epoch(
                 set_batch_count(model, get_adjusted_batch_count(params))
 
         if (params.valid_by_epoch and batch_idx == 0 and not params.print_diagnostics) or (
-            not params.valid_by_epoch and params.batch_idx_train % params.valid_interval == 0 and not params.print_diagnostics
+            not params.valid_by_epoch
+            and params.batch_idx_train > 0
+            and params.batch_idx_train % params.valid_interval == 0
+            and not params.print_diagnostics
         ):
             logging.info("Computing validation loss")
             valid_info = compute_validation_loss(
@@ -575,7 +634,7 @@ def train_one_epoch(
 
         batch_size = len(batch["text"])
 
-        tokens, features, features_lens = prepare_input(
+        tokens, zero_duration_mask, features, features_lens = prepare_input(
             params=params,
             batch=batch,
             device=device,
@@ -591,6 +650,7 @@ def train_one_epoch(
                     features=features,
                     features_lens=features_lens,
                     tokens=tokens,
+                    zero_duration_mask=zero_duration_mask,
                     is_training=True,
                 )
 
@@ -661,6 +721,8 @@ def train_one_epoch(
             cur_lr = max(scheduler.get_last_lr())
             cur_grad_scale = scaler._scale.item() if params.use_fp16 else 1.0
 
+            train_pbar.set_postfix(loss=f"{tot_loss['loss'] / tot_loss['frames']:.4f}", lr=f"{cur_lr:.2e}")
+
             logging.info(
                 f"Epoch {params.cur_epoch}, batch {batch_idx}, "
                 f"global_batch_idx: {params.batch_idx_train}, "
@@ -702,7 +764,7 @@ def compute_validation_loss(
     tot_loss = MetricsTracker()
 
     for batch_idx, batch in enumerate(valid_dl):
-        tokens, features, features_lens = prepare_input(
+        tokens, zero_duration_mask, features, features_lens = prepare_input(
             params=params,
             batch=batch,
             device=device,
@@ -716,6 +778,7 @@ def compute_validation_loss(
             features=features,
             features_lens=features_lens,
             tokens=tokens,
+            zero_duration_mask=zero_duration_mask,
             is_training=False,
         )
         assert loss.requires_grad is False
@@ -775,7 +838,7 @@ def scan_pessimistic_batches_for_oom(
     batches, crit_values = find_pessimistic_batches(train_dl.sampler)
     for criterion, cuts in batches.items():
         batch = train_dl.dataset[cuts]
-        tokens, features, features_lens = prepare_input(
+        tokens, zero_duration_mask, features, features_lens = prepare_input(
             params=params,
             batch=batch,
             device=device,
@@ -791,6 +854,7 @@ def scan_pessimistic_batches_for_oom(
                     features=features,
                     features_lens=features_lens,
                     tokens=tokens,
+                    zero_duration_mask=zero_duration_mask,
                     is_training=True,
                 )
             loss.backward()
@@ -809,12 +873,49 @@ def scan_pessimistic_batches_for_oom(
         logging.info(f"Maximum memory allocated so far is " f"{torch.cuda.max_memory_allocated() // 1000000}MB")
 
 
-def tokenize_text(c: Cut, tokenizer):
+def tokenize_text(
+    c: Cut,
+    tokenizer,
+    lang_auto_prob: float = 0.0,
+    lang_wrong_prob: float = 0.0,
+    lang_rng: Optional[random.Random] = None,
+):
+    """
+    Args:
+      lang_rng: if given (only for MultilingualTokenizer), the ground-truth
+        language is read per-cut from `c.supervisions[0].language` (e.g. the
+        "language": "Vietnamese" field in the user's YouTube-corpus schema,
+        normalized via `normalize_language_name`) and a `[LANG:xx]` tag is
+        prepended to the text before tokenizing, sampled via
+        `sample_lang_tag` with the given dropout probabilities. Every cut
+        must have a valid, recognized language -- this is expected to be
+        enforced already during data preparation (see
+        scripts/*/m00_prepare_manifest.py), and is re-checked here as a
+        safety net. Called fresh on every invocation -- since train/dev
+        cuts are lazy lhotse CutSets, this function runs again each epoch,
+        so the sampled tag differs run to run rather than being fixed once
+        at manifest-prep time.
+    """
     if hasattr(c.supervisions[0], "tokens"):
         tokens = tokenizer.tokens_to_token_ids([c.supervisions[0].tokens])
     else:
-        tokens = tokenizer.texts_to_token_ids([c.supervisions[0].text])
+        text = c.supervisions[0].text
+        if lang_rng is not None:
+            raw_lang = getattr(c.supervisions[0], "language", None)
+            true_lang = normalize_language_name(raw_lang)
+            if true_lang is None:
+                raise ValueError(
+                    f"cut {c.id!r} has a missing or unrecognized language "
+                    f"({raw_lang!r}). Every utterance must have a valid "
+                    f"language; this should have been caught during data "
+                    f"preparation (see scripts/*/m00_prepare_manifest.py)."
+                )
+            tag = sample_lang_tag(true_lang, lang_auto_prob, lang_wrong_prob, lang_rng)
+            text = f"{tag} {text}"
+        tokens = tokenizer.texts_to_token_ids([text])
     c.supervisions[0].tokens = tokens[0]
+    if hasattr(tokenizer, "zero_duration_mask"):
+        c.supervisions[0].zero_duration_mask = tokenizer.zero_duration_mask(tokens[0])
     return c
 
 
@@ -847,7 +948,11 @@ def run(rank, world_size, args):
 
     os.makedirs(f"{params.exp_dir}", exist_ok=True)
     copyfile(src=params.model_config, dst=f"{params.exp_dir}/model.json")
-    copyfile(src=params.token_file, dst=f"{params.exp_dir}/tokens.txt")
+    if params.tokenizer != "multilingual":
+        # MultilingualTokenizer has no local tokens.txt -- its vocabulary
+        # (including the [LANG:xx] tokens added on top of the pretrained
+        # base) is saved separately below, once it's actually constructed.
+        copyfile(src=params.token_file, dst=f"{params.exp_dir}/tokens.txt")
     setup_logger(f"{params.exp_dir}/log/log-train")
 
     if args.tensorboard and rank == 0:
@@ -867,6 +972,15 @@ def run(rank, world_size, args):
         tokenizer = LibriTTSTokenizer(token_file=params.token_file)
     elif params.tokenizer == "espeak":
         tokenizer = EspeakTokenizer(token_file=params.token_file, lang=params.lang)
+    elif params.tokenizer == "multilingual":
+        multilingual_kwargs = {}
+        if params.pretrained_tokenizer_name is not None:
+            multilingual_kwargs["pretrained_model_name"] = params.pretrained_tokenizer_name
+        tokenizer = MultilingualTokenizer(**multilingual_kwargs)
+        # Save the exact tokenizer (incl. the [LANG:xx] tokens added on top
+        # of the pretrained base) so inference can reload the same vocabulary
+        # -- there is no local tokens.txt to copy for this tokenizer type.
+        tokenizer.hf_tokenizer.save_pretrained(f"{params.exp_dir}/tokenizer")
     else:
         assert params.tokenizer == "simple"
         tokenizer = SimpleTokenizer(token_file=params.token_file)
@@ -987,9 +1101,43 @@ def run(rank, world_size, args):
                 f"Using {params.tokenizer} tokenizer but tokens are not prepared,"
                 f"will tokenize on-the-fly, which can slow down training significantly."
             )
-    _tokenize_text = partial(tokenize_text, tokenizer=tokenizer)
-    train_cuts = train_cuts.map(_tokenize_text)
-    dev_cuts = dev_cuts.map(_tokenize_text)
+    lang_rng = None
+    if params.tokenizer == "multilingual":
+        assert 0.0 <= params.lang_auto_prob <= 1.0, params.lang_auto_prob
+        assert 0.0 <= params.lang_wrong_prob <= 1.0, params.lang_wrong_prob
+        assert params.lang_auto_prob + params.lang_wrong_prob <= 1.0, (
+            params.lang_auto_prob,
+            params.lang_wrong_prob,
+        )
+        # A single persistent Random instance, not re-seeded per call, so
+        # repeated epochs (train/dev cuts are lazy and re-tokenized each
+        # time they're iterated) keep advancing rather than repeating the
+        # same dropout pattern every epoch.
+        lang_rng = random.Random(params.seed)
+        logging.info(
+            f"[LANG:xx] tags derived per-utterance from each cut's "
+            f"supervision.language field (auto_prob={params.lang_auto_prob}, "
+            f"wrong_prob={params.lang_wrong_prob}); dev/test cuts always get "
+            f"the ground-truth tag (auto_prob=wrong_prob=0) with their own "
+            f"RNG, so validation never perturbs the training dropout stream."
+        )
+
+    _tokenize_text_train = partial(
+        tokenize_text,
+        tokenizer=tokenizer,
+        lang_auto_prob=params.lang_auto_prob,
+        lang_wrong_prob=params.lang_wrong_prob,
+        lang_rng=lang_rng,
+    )
+    _tokenize_text_dev = partial(
+        tokenize_text,
+        tokenizer=tokenizer,
+        lang_auto_prob=0.0,
+        lang_wrong_prob=0.0,
+        lang_rng=random.Random(params.seed) if lang_rng is not None else None,
+    )
+    train_cuts = train_cuts.map(_tokenize_text_train)
+    dev_cuts = dev_cuts.map(_tokenize_text_dev)
 
     train_dl = datamodule.train_dataloaders(train_cuts)
 

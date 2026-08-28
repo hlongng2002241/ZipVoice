@@ -50,8 +50,11 @@ We explicitly considered and rejected Codex's dedicated-embedding alternative.
   [2026-08-28__adopt_pretrained_multilingual_tokenizer.md](2026-08-28__adopt_pretrained_multilingual_tokenizer.md).
 - Harder: because it's a token in the sequence rather than a separate
   conditioning signal, it must be explicitly excluded from the per-token
-  duration allocation (it carries no acoustic content) — the current duration
-  code has no such concept yet and needs it added.
+  duration allocation (it carries no acoustic content). **Implemented**:
+  `MultilingualTokenizer.zero_duration_mask()` marks `[LANG:xx]` token
+  positions, and `prepare_avg_tokens_durations()` /
+  `ZipVoice.forward_text_condition()` give them zero duration, redistributing
+  the utterance's frames across the remaining (real) tokens.
 - Risk accepted, to be validated in the implementation plan rather than assumed:
   a single prepended tag token's influence on the full sequence's text condition
   depends on the bidirectional `text_encoder`'s attention actually propagating
@@ -68,3 +71,11 @@ We explicitly considered and rejected Codex's dedicated-embedding alternative.
   then deleted once the author confirmed their dataset already provides
   reliable per-pair labels, making that inference step unnecessary. See
   [../plans/2026-08-28__multilingual_tts_frontend/eval_sets/primary_language_definition.md](../plans/2026-08-28__multilingual_tts_frontend/eval_sets/primary_language_definition.md).
+- **Decided (2026-08-29, amendment)**: `[LANG:auto]` is for a caller omitting
+  the language at inference time, or for training-time label dropout — it is
+  **not** a fallback for missing/invalid corpus metadata. Every training
+  utterance must carry a valid, recognized language; data-preparation scripts
+  raise an error (listing offending rows) rather than defaulting such rows to
+  `[LANG:auto]` or dropping the tag. See
+  [../proposals/2026-08-28__primary_language_conditioning.md](../proposals/2026-08-28__primary_language_conditioning.md)'s
+  "missing/invalid corpus language is a data error" section.

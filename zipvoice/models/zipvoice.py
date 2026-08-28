@@ -32,6 +32,62 @@ from zipvoice.utils.common import (
 )
 
 
+def _make_pretrained_embedding(
+    pretrained_embed_model: str,
+    vocab_size: int,
+):
+    """Build the `nn.Embedding` for `embed_source="pretrained"`.
+
+    Loads `pretrained_embed_model`'s input embedding table and uses it to
+    initialize a `vocab_size`-row `nn.Embedding`, fine-tuned end-to-end
+    afterward (not frozen). Two cases, both real (found via an actual
+    training smoke test, not assumed):
+
+    - `vocab_size <= source_vocab_size`: the source checkpoint's embedding
+      table already has enough rows. This is the common case in practice --
+      e.g. Qwen2.5-0.5B's real tokenizer vocab is 151,665, but its embedding
+      table has 151,936 rows (padded for hardware alignment / future vocab
+      growth); `[LANG:xx]` tokens added by MultilingualTokenizer land
+      contiguously at 151665-151668, still inside that padding, giving
+      `vocab_size=151669 < source_vocab_size=151936`. Just slice the first
+      `vocab_size` rows -- every row used is a real pretrained one (the
+      unused padding rows were never trained on by the source model either,
+      so they're not meaningfully different from a random init for our new
+      tokens, but they're free -- no separate random init needed).
+    - `vocab_size > source_vocab_size`: our vocabulary is bigger than what
+      the source model provides. Copy what exists into the first
+      `source_vocab_size` rows and leave the remainder at `nn.Embedding`'s
+      default random initialization.
+
+    No projection layer is added here: ``TTSZipformer`` (used for
+    ``text_encoder``) already applies ``self.in_proj = nn.Linear(in_dim,
+    encoder_dim)`` as the first step of its forward pass, so constructing
+    ``text_encoder`` with ``in_dim`` set to this embedding's actual
+    dimension (the source model's hidden size, e.g. 896 for Qwen2.5-0.5B)
+    reuses that existing projection instead of adding a redundant one.
+
+    Returns:
+      (embedding, source_dim) -- the caller uses source_dim as
+      text_encoder's in_dim.
+    """
+    try:
+        from transformers import AutoModel
+    except Exception as ex:
+        raise RuntimeError(f"{ex}\nPlease run\npip install transformers")
+
+    source_model = AutoModel.from_pretrained(pretrained_embed_model)
+    source_weight = source_model.get_input_embeddings().weight.detach()
+    source_vocab_size, source_dim = source_weight.shape
+
+    embed = nn.Embedding(vocab_size, source_dim)
+    with torch.no_grad():
+        if vocab_size <= source_vocab_size:
+            embed.weight[:] = source_weight[:vocab_size]
+        else:
+            embed.weight[:source_vocab_size] = source_weight
+    return embed, source_dim
+
+
 class ZipVoice(nn.Module):
     """The ZipVoice model."""
 
@@ -57,6 +113,8 @@ class ZipVoice(nn.Module):
         feat_dim: int = 100,
         vocab_size: int = 26,
         pad_id: int = 0,
+        embed_source: str = "scratch",
+        pretrained_embed_model: Optional[str] = None,
     ):
         """
         Initialize the model with specified configuration parameters.
@@ -89,6 +147,26 @@ class ZipVoice(nn.Module):
             feat_dim: Dimension of the acoustic features.
             vocab_size: Size of the vocabulary.
             pad_id: ID used for padding tokens.
+            embed_source: "scratch" (default) trains a randomly-initialized
+                `nn.Embedding(vocab_size, text_embed_dim)` jointly with the
+                rest of the model. "pretrained" loads the input embedding
+                table of `pretrained_embed_model` (a HuggingFace model id)
+                as-is, at its native hidden size -- **`text_embed_dim` is
+                then ignored**; the effective dimension is the pretrained
+                model's hidden size (e.g. 896 for Qwen2.5-0.5B), and
+                `text_encoder`'s existing `in_proj` layer (see
+                `TTSZipformer`) handles projecting down to
+                `text_encoder_dim`, so no separate projection is added here.
+                Both the embedding and `text_encoder` are fine-tuned
+                end-to-end. See docs/adr/2026-08-28__choose_qwen25_tokenizer.md
+                and docs/plans/2026-08-28__multilingual_tts_frontend/
+                eval_sets/embedding_structure_check.md for why pretrained
+                loading was found to carry real relational structure worth
+                starting from.
+            pretrained_embed_model: HuggingFace model id to load the
+                embedding table from when `embed_source="pretrained"` (e.g.
+                "Qwen/Qwen2.5-0.5B", matching MultilingualTokenizer's
+                default). Required, and unused, when `embed_source="scratch"`.
         """
         super().__init__()
 
@@ -108,6 +186,18 @@ class ZipVoice(nn.Module):
             use_time_embed=True,
             time_embed_dim=time_embed_dim,
         )
+
+        assert embed_source in ("scratch", "pretrained"), embed_source
+        if embed_source == "pretrained":
+            assert pretrained_embed_model is not None, (
+                "pretrained_embed_model is required when embed_source='pretrained'"
+            )
+            self.embed, text_embed_dim = _make_pretrained_embedding(
+                pretrained_embed_model=pretrained_embed_model,
+                vocab_size=vocab_size,
+            )
+        else:
+            self.embed = nn.Embedding(vocab_size, text_embed_dim)
 
         self.text_encoder = TTSZipformer(
             in_dim=text_embed_dim,
@@ -129,7 +219,6 @@ class ZipVoice(nn.Module):
         self.text_embed_dim = text_embed_dim
         self.pad_id = pad_id
 
-        self.embed = nn.Embedding(vocab_size, text_embed_dim)
         self.solver = EulerSolver(self, func_name="forward_fm_decoder")
 
     def forward_fm_decoder(
@@ -216,6 +305,7 @@ class ZipVoice(nn.Module):
         embed: torch.Tensor,
         tokens_lens: torch.Tensor,
         features_lens: torch.Tensor,
+        zero_duration_mask: Optional[List[List[bool]]] = None,
     ):
         """
         Get the text condition with the same length of the acoustic feature.
@@ -235,7 +325,9 @@ class ZipVoice(nn.Module):
 
         padding_mask = make_pad_mask(features_lens, max_len=num_frames)  # (B, T)
 
-        tokens_durations = prepare_avg_tokens_durations(features_lens, tokens_lens)
+        tokens_durations = prepare_avg_tokens_durations(
+            features_lens, tokens_lens, zero_duration_mask=zero_duration_mask
+        )
 
         tokens_index = get_tokens_index(tokens_durations, num_frames).to(
             embed.device
@@ -254,13 +346,14 @@ class ZipVoice(nn.Module):
         self,
         tokens: List[List[int]],
         features_lens: torch.Tensor,
+        zero_duration_mask: Optional[List[List[bool]]] = None,
     ):
         """
         Process text for training, given text tokens and real feature lengths.
         """
         embed, tokens_lens = self.forward_text_embed(tokens)
         text_condition, padding_mask = self.forward_text_condition(
-            embed, tokens_lens, features_lens
+            embed, tokens_lens, features_lens, zero_duration_mask=zero_duration_mask
         )
         return (
             text_condition,
@@ -337,6 +430,7 @@ class ZipVoice(nn.Module):
         noise: torch.Tensor,
         t: torch.Tensor,
         condition_drop_ratio: float = 0.0,
+        zero_duration_mask: Optional[List[List[bool]]] = None,
     ) -> torch.Tensor:
         """Forward pass of the model for training.
         Args:
@@ -346,6 +440,11 @@ class ZipVoice(nn.Module):
             noise: the intitial noise, with the shape (batch, seq_len, feat_dim).
             t: the time step, with the shape (batch, 1, 1).
             condition_drop_ratio: the ratio of dropped text condition.
+            zero_duration_mask: per-utterance, per-token booleans marking
+                control tokens (e.g. MultilingualTokenizer's [LANG:xx] tags)
+                that must receive zero acoustic duration. None (default)
+                preserves the original behaviour of giving every token an
+                equal share of the utterance's duration.
         Returns:
             fm_loss: the flow-matching loss.
         """
@@ -353,6 +452,7 @@ class ZipVoice(nn.Module):
         (text_condition, padding_mask,) = self.forward_text_train(
             tokens=tokens,
             features_lens=features_lens,
+            zero_duration_mask=zero_duration_mask,
         )
 
         speech_condition_mask = condition_time_mask(

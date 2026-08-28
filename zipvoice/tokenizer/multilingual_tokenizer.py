@@ -33,6 +33,24 @@ from zipvoice.tokenizer.base import Tokenizer
 
 LANGUAGES = ("en", "vi", "zh")
 
+# Free-form language names/codes (as found in real corpus metadata, e.g. the
+# "language": "Vietnamese" field in the user's YouTube-corpus schema) mapped
+# to LANGUAGES. Lowercase-matched; extend as new corpora surface new spellings.
+_LANGUAGE_ALIASES = {
+    "en": "en", "eng": "en", "english": "en",
+    "vi": "vi", "vie": "vi", "vietnamese": "vi",
+    "zh": "zh", "chi": "zh", "chinese": "zh", "mandarin": "zh", "cmn": "zh",
+}
+
+
+def normalize_language_name(name: Optional[str]) -> Optional[str]:
+    """Map a free-form language name/code to one of LANGUAGES, or None if
+    `name` is missing/unrecognized. Case-insensitive.
+    """
+    if not name:
+        return None
+    return _LANGUAGE_ALIASES.get(name.strip().lower())
+
 
 def sample_lang_tag(
     true_lang: str,
@@ -167,6 +185,10 @@ class MultilingualTokenizer(Tokenizer):
         self.has_tokens = True
 
     def texts_to_token_ids(self, texts: List[str]) -> List[List[int]]:
+        # No text normalization here by design -- number/date/abbreviation
+        # expansion etc. is a data-preparation concern and must already be
+        # done upstream before a corpus reaches training. See
+        # docs/plans/2026-08-28__multilingual_tts_frontend/2026-08-28__sprint_003__tokenizer_embedding_bakeoff.md.
         return [
             self.hf_tokenizer.encode(text, add_special_tokens=False)
             for text in texts

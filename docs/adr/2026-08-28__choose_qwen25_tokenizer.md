@@ -56,8 +56,12 @@ compression findings above and did not change the conclusion.
 We will use **Qwen2.5-0.5B's tokenizer** (byte-level BPE, vocab 151,669,
 hidden dim 896) as `MultilingualTokenizer`'s default base model, replacing
 mBERT. The embedding table to load/fine-tune is now `151669 × 896` (~136.1M
-params) projected via `Linear(896, 192)`, rather than mBERT's
-`119547 × 768` (~91.8M params) via `Linear(768, 192)`.
+params), used at its native 896-dim rather than mBERT's `119547 × 768`
+(~91.8M params). No separate projection layer is added in either case:
+`text_encoder`'s existing `in_proj` (`zipvoice/models/modules/zipformer.py`)
+already projects down to `text_encoder_dim` (192) as the first step of its
+forward pass, so `text_embed_dim` is simply set to the pretrained model's
+hidden size (896) instead of adding a redundant `nn.Linear`.
 
 ## Alternatives Considered
 

@@ -236,7 +236,22 @@ def prepare_input(
     return_list = []
 
     if return_tokens:
-        return_list += [batch["tokens"]]
+        tokens = batch["tokens"]
+        zero_duration_mask = batch.get("zero_duration_mask")
+        if zero_duration_mask is not None:
+            if all(m is None for m in zero_duration_mask):
+                zero_duration_mask = None
+            else:
+                # A mix of tagged and untagged utterances in one batch (e.g.
+                # only some cuts matched a recognized language): untagged
+                # ones get an all-False mask instead of None, since
+                # prepare_avg_tokens_durations expects either no mask at
+                # all or one entry per utterance, not a mix of both.
+                zero_duration_mask = [
+                    m if m is not None else [False] * len(tokens[i])
+                    for i, m in enumerate(zero_duration_mask)
+                ]
+        return_list += [tokens, zero_duration_mask]
 
     if return_feature:
         features = batch["features"].to(device)
