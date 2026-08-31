@@ -66,7 +66,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import safetensors.torch
@@ -356,6 +356,18 @@ def apply_primary_lang_tag(
     return f"{tag} {text}"
 
 
+def compute_zero_duration_mask(tokenizer, token_ids_batch: List[List[int]]):
+    """Per-utterance zero_duration_mask for a batch of already-tokenized
+    sequences (see MultilingualTokenizer.zero_duration_mask), matching how
+    training excludes [LANG:xx] control tokens from acoustic duration. None
+    for tokenizers with no such concept (i.e. every type but
+    MultilingualTokenizer), preserving the original no-mask behavior.
+    """
+    if not hasattr(tokenizer, "zero_duration_mask"):
+        return None
+    return [tokenizer.zero_duration_mask(ids) for ids in token_ids_batch]
+
+
 def get_vocoder(vocos_local_path: Optional[str] = None):
     if vocos_local_path:
         vocoder = Vocos.from_hparams(f"{vocos_local_path}/config.yaml")
@@ -435,11 +447,14 @@ def generate_sentence_raw_evaluation(
     prompt_features = prompt_features.unsqueeze(0) * feat_scale
     prompt_features_lens = torch.tensor([prompt_features.size(1)], device=device)
 
-    # Convert text to tokens
-    text = apply_primary_lang_tag(text, tokenizer, primary_lang)
+    # Convert text to tokens. Only the prompt gets a [LANG:xx] tag, not the
+    # target text: model.sample() concatenates prompt_tokens+tokens into one
+    # sequence, so tagging both would put two control tokens in what training
+    # only ever saw as a single utterance with one leading tag.
     prompt_text = apply_primary_lang_tag(prompt_text, tokenizer, primary_lang)
     tokens = tokenizer.texts_to_token_ids([text])
     prompt_tokens = tokenizer.texts_to_token_ids([prompt_text])
+    prompt_zero_duration_mask = compute_zero_duration_mask(tokenizer, prompt_tokens)
 
     # Start timing
     start_t = dt.datetime.now()
@@ -460,6 +475,7 @@ def generate_sentence_raw_evaluation(
         duration="predict",
         num_step=num_step,
         guidance_scale=guidance_scale,
+        prompt_zero_duration_mask=prompt_zero_duration_mask,
     )
 
     # Postprocess predicted features
@@ -590,9 +606,12 @@ def generate_sentence(
     text = add_punctuation(text)
     prompt_text = add_punctuation(prompt_text)
 
-    # Prepend the '[LANG:xx]' tag (before chunking, so it appears once at
-    # the very start of the tokenized text, same as a training utterance).
-    text = apply_primary_lang_tag(text, tokenizer, primary_lang)
+    # Prepend the '[LANG:xx]' tag to the prompt only, not the target text.
+    # model.sample() concatenates prompt_tokens+tokens into one sequence, so
+    # tagging both would put two control tokens (one mid-sequence) in what
+    # training only ever saw as a single utterance with one leading tag --
+    # this also means the tag is naturally preserved across all target
+    # chunks below, since it never depended on the (chunked) target text.
     prompt_text = apply_primary_lang_tag(prompt_text, tokenizer, primary_lang)
 
     # Tokenize text (str tokens), punctuations will be preserved.
@@ -609,6 +628,7 @@ def generate_sentence(
     # Tokenize text (int tokens)
     chunked_tokens = tokenizer.tokens_to_token_ids(chunked_tokens_str)
     prompt_tokens = tokenizer.tokens_to_token_ids([prompt_tokens_str])
+    prompt_zero_duration_mask = compute_zero_duration_mask(tokenizer, prompt_tokens)
 
     # Batchify chunked texts for faster processing
     tokens_batches, chunked_index = batchify_tokens(
@@ -621,6 +641,11 @@ def generate_sentence(
 
     for batch_tokens in tokens_batches:
         batch_prompt_tokens = prompt_tokens * len(batch_tokens)
+        batch_prompt_zero_duration_mask = (
+            prompt_zero_duration_mask * len(batch_tokens)
+            if prompt_zero_duration_mask is not None
+            else None
+        )
 
         batch_prompt_features = prompt_features.repeat(len(batch_tokens), 1, 1)
         batch_prompt_features_lens = torch.full(
@@ -643,6 +668,7 @@ def generate_sentence(
             duration="predict",
             num_step=num_step,
             guidance_scale=guidance_scale,
+            prompt_zero_duration_mask=batch_prompt_zero_duration_mask,
         )
 
         # Postprocess predicted features
