@@ -88,6 +88,29 @@ def _make_pretrained_embedding(
     return embed, source_dim
 
 
+def _concat_zero_duration_masks(
+    prompt_mask: Optional[List[List[bool]]],
+    mask: Optional[List[List[bool]]],
+    prompt_tokens: List[List[int]],
+    tokens: List[List[int]],
+) -> Optional[List[List[bool]]]:
+    """Concatenate per-utterance zero_duration_mask lists in the same order
+    prompt_tokens/tokens themselves get concatenated for inference (prompt
+    first, then the target). Missing prompt or target masks are treated as
+    all-False (no control tokens) so a caller only needs to supply a mask for
+    whichever side actually has one -- e.g. only the prompt is tagged with
+    `[LANG:xx]` at inference (see infer_zipvoice.py), so only
+    `prompt_mask` is normally given.
+    """
+    if prompt_mask is None and mask is None:
+        return None
+    if prompt_mask is None:
+        prompt_mask = [[False] * len(t) for t in prompt_tokens]
+    if mask is None:
+        mask = [[False] * len(t) for t in tokens]
+    return [p + m for p, m in zip(prompt_mask, mask)]
+
+
 class ZipVoice(nn.Module):
     """The ZipVoice model."""
 
@@ -383,17 +406,22 @@ class ZipVoice(nn.Module):
         features_lens: torch.Tensor,
         prompt_tokens: List[List[int]],
         prompt_features_lens: torch.Tensor,
+        zero_duration_mask: Optional[List[List[bool]]] = None,
+        prompt_zero_duration_mask: Optional[List[List[bool]]] = None,
     ):
         """
         Process text for inference, given text tokens, real feature lengths and prompts.
         """
+        cat_zero_duration_mask = _concat_zero_duration_masks(
+            prompt_zero_duration_mask, zero_duration_mask, prompt_tokens, tokens
+        )
         tokens = [
             prompt_token + token for prompt_token, token in zip(prompt_tokens, tokens)
         ]
         features_lens = prompt_features_lens + features_lens
         embed, tokens_lens = self.forward_text_embed(tokens)
         text_condition, padding_mask = self.forward_text_condition(
-            embed, tokens_lens, features_lens
+            embed, tokens_lens, features_lens, zero_duration_mask=cat_zero_duration_mask
         )
         return text_condition, padding_mask
 
@@ -403,6 +431,8 @@ class ZipVoice(nn.Module):
         prompt_tokens: List[List[int]],
         prompt_features_lens: torch.Tensor,
         speed: float,
+        zero_duration_mask: Optional[List[List[bool]]] = None,
+        prompt_zero_duration_mask: Optional[List[List[bool]]] = None,
     ):
         """
         Process text for inference, given text tokens and prompts,
@@ -412,6 +442,9 @@ class ZipVoice(nn.Module):
             self.device if isinstance(self, DDP) else next(self.parameters()).device
         )
 
+        cat_zero_duration_mask = _concat_zero_duration_masks(
+            prompt_zero_duration_mask, zero_duration_mask, prompt_tokens, tokens
+        )
         cat_tokens = [
             prompt_token + token for prompt_token, token in zip(prompt_tokens, tokens)
         ]
@@ -435,7 +468,7 @@ class ZipVoice(nn.Module):
         ).to(dtype=torch.int64)
 
         text_condition, padding_mask = self.forward_text_condition(
-            cat_embed, cat_tokens_lens, features_lens
+            cat_embed, cat_tokens_lens, features_lens, zero_duration_mask=cat_zero_duration_mask
         )
         return text_condition, padding_mask
 
@@ -514,6 +547,8 @@ class ZipVoice(nn.Module):
         duration: str = "predict",
         num_step: int = 5,
         guidance_scale: float = 0.5,
+        zero_duration_mask: Optional[List[List[bool]]] = None,
+        prompt_zero_duration_mask: Optional[List[List[bool]]] = None,
     ) -> torch.Tensor:
         """
         Generate acoustic features, given text tokens, prompts feature
@@ -531,6 +566,11 @@ class ZipVoice(nn.Module):
                 feature length is given by features_lens.
             num_step: the number of steps to use in the ODE solver.
             guidance_scale: the guidance scale for classifier-free guidance.
+            zero_duration_mask: per-utterance, per-token booleans marking
+                control tokens (e.g. [LANG:xx] tags) in `tokens` that must
+                receive zero acoustic duration, matching training. None
+                (default) means `tokens` has no control tokens.
+            prompt_zero_duration_mask: same, for `prompt_tokens`.
         """
 
         assert duration in ["real", "predict"]
@@ -544,6 +584,8 @@ class ZipVoice(nn.Module):
                 prompt_tokens=prompt_tokens,
                 prompt_features_lens=prompt_features_lens,
                 speed=speed,
+                zero_duration_mask=zero_duration_mask,
+                prompt_zero_duration_mask=prompt_zero_duration_mask,
             )
         else:
             assert features_lens is not None
@@ -552,6 +594,8 @@ class ZipVoice(nn.Module):
                 features_lens=features_lens,
                 prompt_tokens=prompt_tokens,
                 prompt_features_lens=prompt_features_lens,
+                zero_duration_mask=zero_duration_mask,
+                prompt_zero_duration_mask=prompt_zero_duration_mask,
             )
         batch_size, num_frames, _ = text_condition.shape
 
