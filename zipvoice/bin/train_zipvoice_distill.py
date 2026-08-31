@@ -618,7 +618,7 @@ def train_one_epoch(
 
         batch_size = len(batch["text"])
 
-        tokens, _zero_duration_mask, features, features_lens = prepare_input(
+        tokens, features, features_lens = prepare_input(
             params=params,
             batch=batch,
             device=device,
@@ -762,7 +762,7 @@ def compute_validation_loss(
     tot_loss = MetricsTracker()
 
     for batch_idx, batch in enumerate(valid_dl):
-        tokens, _zero_duration_mask, features, features_lens = prepare_input(
+        tokens, features, features_lens = prepare_input(
             params=params,
             batch=batch,
             device=device,
@@ -810,7 +810,7 @@ def scan_pessimistic_batches_for_oom(
     batches, crit_values = find_pessimistic_batches(train_dl.sampler)
     for criterion, cuts in batches.items():
         batch = train_dl.dataset[cuts]
-        tokens, _zero_duration_mask, features, features_lens = prepare_input(
+        tokens, features, features_lens = prepare_input(
             params=params,
             batch=batch,
             device=device,

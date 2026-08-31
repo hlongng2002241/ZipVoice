@@ -96,6 +96,16 @@ def save_checkpoint(
         # downgrade the live running-average model (kept in float64 for
         # numerical stability) to float32. Cast the state-dict tensors
         # instead, which returns new tensors and leaves model_avg untouched.
+        # Accepted compatibility exception vs. master (see
+        # docs/proposals/2026-08-29__master_backward_compatibility.md):
+        # loaded floating-point values and dtypes match master's output
+        # elementwise, but the *serialized file size* differs slightly --
+        # most likely because this builds a plain dict via comprehension
+        # rather than calling `.state_dict()` on the (unmutated) module
+        # directly, which may carry different non-tensor metadata through
+        # `torch.save` (plausible cause, not fully isolated). This does not
+        # affect correctness -- loading the checkpoint back works correctly
+        # either way -- only the raw file bytes are not byte-identical.
         checkpoint["model_avg"] = {
             k: v.to(torch.float32) if torch.is_floating_point(v) else v
             for k, v in model_avg.state_dict().items()
@@ -154,7 +164,9 @@ def load_checkpoint(
     return checkpoint
 
 
-def load_checkpoint_extend_vocab_size(filename: Path, extend_size: int, model: nn.Module, strict: bool = True) -> Dict[str, Any]:
+def load_checkpoint_extend_vocab_size(
+    filename: Path, extend_size: int, model: nn.Module, strict: bool = True
+) -> Dict[str, Any]:
     logging.info(f"Loading checkpoint from {filename}")
     checkpoint = torch.load(filename, map_location="cpu", weights_only=False)
 
@@ -223,11 +235,15 @@ def load_checkpoint_copy_proj_three_channel_alter(
             if out_proj_key in key:
                 if "weight" in key:
                     weight = dst_state_dict.pop(key)
-                    dst_state_dict[key.replace("weight", "0.weight")] = torch.cat([weight, weight], dim=0)
+                    dst_state_dict[key.replace("weight", "0.weight")] = torch.cat(
+                        [weight, weight], dim=0
+                    )
                     dst_state_dict[key.replace("weight", "1.weight")] = weight
                 elif "bias" in key:
                     bias = dst_state_dict.pop(key)
-                    dst_state_dict[key.replace("bias", "0.bias")] = torch.cat([bias, bias], dim=0)
+                    dst_state_dict[key.replace("bias", "0.bias")] = torch.cat(
+                        [bias, bias], dim=0
+                    )
                     dst_state_dict[key.replace("bias", "1.bias")] = bias
 
         model.load_state_dict(dst_state_dict, strict=True)
@@ -332,7 +348,9 @@ def average_checkpoints_with_averaged_model(
       device:
         Move checkpoints to this device before averaging.
     """
-    state_dict_start = torch.load(filename_start, map_location=device, weights_only=False)
+    state_dict_start = torch.load(
+        filename_start, map_location=device, weights_only=False
+    )
     state_dict_end = torch.load(filename_end, map_location=device, weights_only=False)
 
     average_period = state_dict_start["average_period"]
