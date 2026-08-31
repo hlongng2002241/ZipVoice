@@ -16,6 +16,7 @@ set -euo pipefail
 # analysis in this session -- confirm the RSS plateaus with a short run
 # before removing this comment.
 export TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT=128
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 CUDA_VISIBLE_DEVICES=0 python -m zipvoice.bin.train_zipvoice \
     --tokenizer multilingual \
@@ -27,6 +28,8 @@ CUDA_VISIBLE_DEVICES=0 python -m zipvoice.bin.train_zipvoice \
     --num-epochs 15 \
     --world-size 1 \
     \
+    --start-epoch 2 \
+    --resume-from-checkpoint exp/all/checkpoint-5000.pt \
     --warmup-batches 5000 \
     --base-lr 0.0001 \
     --lr-epochs 3 \
@@ -35,7 +38,7 @@ CUDA_VISIBLE_DEVICES=0 python -m zipvoice.bin.train_zipvoice \
     --use-fp16 True \
     --min-len 1.0 \
     --max-len 120.0 \
-    --num-buckets 30 \
+    --num-buckets 100 \
     --num-workers 8 \
     --on-the-fly-feats True \
     --save-every-n 4000 \
@@ -43,4 +46,4 @@ CUDA_VISIBLE_DEVICES=0 python -m zipvoice.bin.train_zipvoice \
     --dataset custom \
     --train-manifest data/all/manifests/train.jsonl.gz \
     --dev-manifest data/all/manifests/test.jsonl.gz \
-    --max-duration 210
+    --max-duration 180

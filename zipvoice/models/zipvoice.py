@@ -188,16 +188,27 @@ class ZipVoice(nn.Module):
         )
 
         assert embed_source in ("scratch", "pretrained"), embed_source
+        # `self.embed`'s construction/assignment is deliberately deferred
+        # until after `self.text_encoder` below, to match master's original
+        # parameter registration order (needed for optimizer-state-dict
+        # compatibility, which is keyed by position, not name) and -- for the
+        # scratch path specifically -- master's original RNG consumption
+        # order (nn.Embedding draws its random init at construction time).
+        # See docs/plans/2026-08-29__master_backward_compatibility.md.
+        pretrained_embed = None
         if embed_source == "pretrained":
             assert pretrained_embed_model is not None, (
                 "pretrained_embed_model is required when embed_source='pretrained'"
             )
-            self.embed, text_embed_dim = _make_pretrained_embedding(
+            # text_embed_dim can't be known without loading the source model
+            # (to read its hidden size), so this must happen before
+            # text_encoder is sized -- unlike the scratch path below, master
+            # has no pretrained path to preserve RNG-order compatibility
+            # with here.
+            pretrained_embed, text_embed_dim = _make_pretrained_embedding(
                 pretrained_embed_model=pretrained_embed_model,
                 vocab_size=vocab_size,
             )
-        else:
-            self.embed = nn.Embedding(vocab_size, text_embed_dim)
 
         self.text_encoder = TTSZipformer(
             in_dim=text_embed_dim,
@@ -213,6 +224,12 @@ class ZipVoice(nn.Module):
             value_head_dim=value_head_dim,
             pos_dim=pos_dim,
             use_time_embed=False,
+        )
+
+        self.embed = (
+            pretrained_embed
+            if pretrained_embed is not None
+            else nn.Embedding(vocab_size, text_embed_dim)
         )
 
         self.feat_dim = feat_dim
@@ -497,7 +514,7 @@ class ZipVoice(nn.Module):
         duration: str = "predict",
         num_step: int = 5,
         guidance_scale: float = 0.5,
-    ):
+    ) -> torch.Tensor:
         """
         Generate acoustic features, given text tokens, prompts feature
             and prompt transcription's text tokens.
@@ -596,7 +613,7 @@ class ZipVoice(nn.Module):
         t_end: float,
         num_step: int = 1,
         guidance_scale: torch.Tensor = None,
-    ):
+    ) -> torch.Tensor:
         """
         Generate acoustic features in intermediate timesteps.
         Args:

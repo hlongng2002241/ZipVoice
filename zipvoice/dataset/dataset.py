@@ -87,10 +87,17 @@ class SpeechSynthesisDataset(torch.utils.data.Dataset):
         if self.return_tokens:
             tokens = [cut.supervisions[0].tokens for cut in cuts]
             batch["tokens"] = tokens
-            batch["zero_duration_mask"] = [
+            masks = [
                 getattr(cut.supervisions[0], "zero_duration_mask", None)
                 for cut in cuts
             ]
+            # Only add the key when at least one cut actually has a mask
+            # (i.e. a multilingual-style tokenizer was used) -- for the
+            # original tokenizer types, the batch dict has no
+            # "zero_duration_mask" key at all, matching master's schema
+            # exactly rather than a present-but-always-None key.
+            if any(m is not None for m in masks):
+                batch["zero_duration_mask"] = masks
 
         if self.return_spk_ids:
             batch["speakers"] = [cut.supervisions[0].speaker for cut in cuts]

@@ -220,6 +220,7 @@ def prepare_input(
     return_tokens: bool = True,
     return_feature: bool = True,
     return_audio: bool = False,
+    return_zero_duration_mask: bool = False,
 ):
     """
     Parse the features and targets of the current batch.
@@ -232,26 +233,40 @@ def prepare_input(
         for the format of the `batch`.
       device:
         The device of Tensor.
+      return_zero_duration_mask:
+        If True, also return the per-utterance zero_duration_mask (see
+        MultilingualTokenizer.zero_duration_mask) as a second item, right
+        after `tokens`. Defaults to False so the default return shape when
+        `return_tokens=True` matches the original (pre-multilingual) contract
+        exactly -- callers that don't ask for the mask don't get an extra,
+        unexpected item in the return list.
     """
+    assert not (return_zero_duration_mask and not return_tokens), (
+        "return_zero_duration_mask requires return_tokens=True"
+    )
     return_list = []
 
     if return_tokens:
         tokens = batch["tokens"]
-        zero_duration_mask = batch.get("zero_duration_mask")
-        if zero_duration_mask is not None:
-            if all(m is None for m in zero_duration_mask):
-                zero_duration_mask = None
-            else:
-                # A mix of tagged and untagged utterances in one batch (e.g.
-                # only some cuts matched a recognized language): untagged
-                # ones get an all-False mask instead of None, since
-                # prepare_avg_tokens_durations expects either no mask at
-                # all or one entry per utterance, not a mix of both.
-                zero_duration_mask = [
-                    m if m is not None else [False] * len(tokens[i])
-                    for i, m in enumerate(zero_duration_mask)
-                ]
-        return_list += [tokens, zero_duration_mask]
+        return_list += [tokens]
+
+        if return_zero_duration_mask:
+            zero_duration_mask = batch.get("zero_duration_mask")
+            if zero_duration_mask is not None:
+                if all(m is None for m in zero_duration_mask):
+                    zero_duration_mask = None
+                else:
+                    # A mix of tagged and untagged utterances in one batch
+                    # (e.g. only some cuts matched a recognized language):
+                    # untagged ones get an all-False mask instead of None,
+                    # since prepare_avg_tokens_durations expects either no
+                    # mask at all or one entry per utterance, not a mix of
+                    # both.
+                    zero_duration_mask = [
+                        m if m is not None else [False] * len(tokens[i])
+                        for i, m in enumerate(zero_duration_mask)
+                    ]
+            return_list += [zero_duration_mask]
 
     if return_feature:
         features = batch["features"].to(device)
