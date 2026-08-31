@@ -200,7 +200,7 @@ silently breaking the "identical" claim elsewhere in this document.
 - `zipvoice/bin/infer_zipvoice.py`: all pre-existing parser defaults are
   unchanged; every new option is gated behind `--tokenizer multilingual`; the
   four original tokenizer types take a verified no-op path through the new
-  `apply_primary_lang_tag()` helper.
+  `apply_lang_tag()` helper.
 - `--warmup-batches 500` (new CLI flag): matches `Eden`'s own pre-existing
   implicit default — not a behavior change, just makes an existing default
   explicit and overridable.
@@ -215,10 +215,10 @@ silently breaking the "identical" claim elsewhere in this document.
 
 ### G. Found along the way, out of scope for this proposal
 
-- **Double `[LANG:xx]` tag at inference with no zero-duration mask.** This
-  session's `--primary-lang` inference support (see
-  [2026-08-28__primary_language_conditioning.md](2026-08-28__primary_language_conditioning.md))
-  tags both `--text` and `--prompt-text`; `forward_text_inference_gt_duration`
+- **Double `[LANG:xx]` tag at inference with no zero-duration mask** (fixed
+  2026-08-31; see [2026-08-28__primary_language_conditioning.md](2026-08-28__primary_language_conditioning.md)).
+  This session's `--lang` inference support (for `--tokenizer=multilingual`)
+  tagged both `--text` and `--prompt-text`; `forward_text_inference_gt_duration`
   / `forward_text_inference_ratio_duration` then concatenate prompt+text
   tokens, producing two `[LANG:xx]` tokens in the sequence — and
   `zero_duration_mask` was only threaded through the *training* path
