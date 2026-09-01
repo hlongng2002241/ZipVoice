@@ -16,6 +16,7 @@ current in-repo model.
 
 import copy
 import importlib.util
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -146,15 +147,30 @@ def test_optimizer_state_resume_from_master(MasterZipVoice):
     first draft of this test called `saved_state = opt_master.state_dict()`
     and then took a second step on `opt_master` *before* loading `saved_state`
     into `opt_mine` -- silently loading step-2 state while mine's own weights
-    were still at step 1, and the resulting "floating-point drift" used to
-    justify a very loose tolerance was actually at least partly this aliasing
-    bug, not genuine independent-load numerical noise. Fixed by deep-copying
-    both the model and optimizer state immediately after step 1, loading those
-    exact (frozen) states into fresh mine objects, and syncing the global
-    Torch RNG state before each side's second forward pass (condition_time_mask
-    in zipvoice/utils/common.py samples torch.rand, so an unsynced second
-    forward would apply a different random mask to each side even with
-    identical model/optimizer state).
+    were still at step 1. Fixed by deep-copying both the model and optimizer
+    state immediately after step 1, loading those exact (frozen) states into
+    fresh mine objects, and syncing the global Torch RNG state before each
+    side's second forward pass (condition_time_mask in zipvoice/utils/common.py
+    samples torch.rand, so an unsynced second forward would apply a different
+    random mask to each side even with identical model/optimizer state).
+
+    Correctness note 2 (2026-09-01): the above RNG sync alone still left the
+    test intermittently flaky (~30-50% failure rate in isolation). Root cause:
+    `limit_param_value()` (zipvoice/models/modules/scaling.py) gates its
+    gradient-clamping via Python's plain `random.random()`, a *separate*
+    stream from torch's RNG that the sync above never touched -- so master's
+    second forward and mine's forward could draw from different, unsynced
+    points in that shared process-global stream and make different clamping
+    decisions. That perturbs one parameter's gradient, which shifts
+    ScaledAdam's global clipping norm (`_get_clipping_scale` in
+    zipvoice/utils/optim.py), which rescales *every* parameter's update --
+    producing the previously-observed nondeterministic, boundary-flavored
+    discrepancies (up to ~0.0054 absolute, landing mostly on `embed.weight`),
+    which the old "floating-point non-associativity" explanation below this
+    docstring was actually misdiagnosing as inherent noise. Fixed by also
+    saving/restoring `random.getstate()`/`random.setstate()` alongside the
+    torch RNG sync; confirmed bit-identical (`torch.equal`) across 8+ repeated
+    runs after the fix, both single- and multi-threaded.
     """
     batch = _synthetic_batch()
 
@@ -168,6 +184,14 @@ def test_optimizer_state_resume_from_master(MasterZipVoice):
     saved_model_state = copy.deepcopy(m_master.state_dict())
     saved_optim_state = copy.deepcopy(opt_master.state_dict())
     rng_state_before_second_forward = torch.get_rng_state()
+    # limit_param_value() (zipvoice/models/modules/scaling.py) gates its
+    # gradient-clamping via Python's plain `random.random()`, a separate
+    # stream from torch's RNG -- must be saved/restored too, or master's
+    # second forward and mine's forward (below) draw from different points
+    # in that shared, unsynced stream and can make different clamping
+    # decisions, which perturbs ScaledAdam's global clipping norm and
+    # produces a nondeterministic, occasionally-large discrepancy.
+    py_random_state_before_second_forward = random.getstate()
 
     # Continue master's own run one more step -- this is the ground truth.
     opt_master.zero_grad()
@@ -184,26 +208,21 @@ def test_optimizer_state_resume_from_master(MasterZipVoice):
     opt_mine.load_state_dict(saved_optim_state)
     opt_mine.zero_grad()
     torch.set_rng_state(rng_state_before_second_forward)
+    random.setstate(py_random_state_before_second_forward)
     loss = m_mine(**batch)
     loss.backward()
     opt_mine.step()
     mine_continued_params = {n: p.detach() for n, p in m_mine.named_parameters()}
 
-    # Before the fix, this raised KeyError('param_rms') -- ScaledAdam's
-    # per-parameter state silently bound to the wrong (shape-incompatible or
-    # differently-ordered) position. That crash is the actual bug being
-    # regression-tested, and it no longer happens. With the aliasing bug
-    # above fixed and RNG synced, the remaining discrepancy is tiny and
-    # uniform (empirically <=0.0028 absolute across every parameter, measured
-    # directly -- residual floating-point non-associativity between two
-    # independently-`importlib`-loaded copies of structurally identical code,
-    # not test artifact noise or misbinding). atol=5e-3 (with rtol=0, to
-    # avoid relative-error blowup on near-zero parameters) comfortably covers
-    # that residual with margin, while remaining far tighter than a real
-    # state-misbinding regression would produce (which would show grossly
-    # wrong values, not a sub-0.003 uniform drift, for the mismatched
-    # parameters -- or simply crash, as it did before the fix).
+    # Before the parameter-registration-order fix, this raised
+    # KeyError('param_rms') -- ScaledAdam's per-parameter state silently
+    # bound to the wrong (shape-incompatible or differently-ordered)
+    # position. With both RNG streams (torch's and Python's `random`, see
+    # "Correctness note 2" above) now fully synced, both sides run the exact
+    # same sequence of floating-point operations on the exact same inputs,
+    # so the results must be bit-identical -- any difference, however small,
+    # indicates a real state-misbinding regression, not noise.
     for name, p_master in master_continued_params.items():
-        assert torch.allclose(p_master, mine_continued_params[name], atol=5e-3, rtol=0), (
+        assert torch.equal(p_master, mine_continued_params[name]), (
             f"optimizer-resume mismatch at {name}"
         )
