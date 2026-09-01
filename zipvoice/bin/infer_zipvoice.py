@@ -153,16 +153,25 @@ def get_parser():
         default="emilia",
         choices=["emilia", "libritts", "espeak", "simple", "multilingual"],
         help="Tokenizer type. 'multilingual' wraps a pretrained HuggingFace "
-        "tokenizer (see --pretrained-tokenizer-name and --primary-lang) "
+        "tokenizer (see --pretrained-tokenizer-name and --lang) "
         "instead of phonemizing text.",
     )
 
     parser.add_argument(
         "--lang",
         type=str,
-        default="en-us",
-        help="Language identifier, used when tokenizer type is espeak. see"
-        "https://github.com/rhasspy/espeak-ng/blob/master/docs/languages.md",
+        default=None,
+        help="Language identifier -- meaning depends on --tokenizer. For "
+        "--tokenizer=espeak, an espeak-ng language code (default 'en-us' if "
+        "not given), see "
+        "https://github.com/rhasspy/espeak-ng/blob/master/docs/languages.md. "
+        "For --tokenizer=multilingual, the primary language of the text to "
+        "synthesize (e.g. 'en', 'vi', 'zh'), prepended as a '[LANG:xx]' tag "
+        "-- mirrors the ground-truth tag used during training; if not "
+        "given, '[LANG:auto]' is used instead, matching how the model was "
+        "trained to fall back when no hint is given. See "
+        "docs/proposals/2026-08-28__primary_language_conditioning.md. "
+        "Ignored for other tokenizer types.",
     )
 
     parser.add_argument(
@@ -175,19 +184,6 @@ def get_parser():
         "(Qwen2.5-0.5B) if not given. Ignored when --model-dir/tokenizer "
         "exists -- that saved tokenizer is loaded instead, to guarantee the "
         "vocabulary matches the checkpoint.",
-    )
-
-    parser.add_argument(
-        "--primary-lang",
-        type=str,
-        default=None,
-        help="When --tokenizer=multilingual, the primary language of the "
-        "text to synthesize (e.g. 'en', 'vi', 'zh'), prepended as a "
-        "'[LANG:xx]' tag -- mirrors the ground-truth tag used during "
-        "training. If not given, '[LANG:auto]' is used instead, matching "
-        "how the model was trained to fall back when no hint is given. "
-        "Ignored for other tokenizer types. See "
-        "docs/proposals/2026-08-28__primary_language_conditioning.md.",
     )
 
     parser.add_argument(
@@ -330,26 +326,26 @@ def get_parser():
     return parser
 
 
-def apply_primary_lang_tag(
+def apply_lang_tag(
     text: str,
     tokenizer,
-    primary_lang: Optional[str] = None,
+    lang: Optional[str] = None,
 ) -> str:
     """Prepend a '[LANG:xx]' tag to `text`, when `tokenizer` is a
-    MultilingualTokenizer. `primary_lang=None` uses '[LANG:auto]' (matching
+    MultilingualTokenizer. `lang=None` uses '[LANG:auto]' (matching
     how the model was trained to fall back when no hint is given); otherwise
     the given language is validated and used as-is. No-op for other
     tokenizer types, which have no such tokens in their vocabulary.
     """
     if not isinstance(tokenizer, MultilingualTokenizer):
         return text
-    if primary_lang is None:
+    if lang is None:
         tag = "[LANG:auto]"
     else:
-        normalized = normalize_language_name(primary_lang)
+        normalized = normalize_language_name(lang)
         if normalized is None:
             raise ValueError(
-                f"--primary-lang {primary_lang!r} is not a recognized "
+                f"--lang {lang!r} is not a recognized "
                 f"language (expected one of {LANGUAGES} or a common alias)."
             )
         tag = f"[LANG:{normalized}]"
@@ -399,7 +395,7 @@ def generate_sentence_raw_evaluation(
     target_rms: float = 0.1,
     feat_scale: float = 0.1,
     sampling_rate: int = 24000,
-    primary_lang: Optional[str] = None,
+    lang: Optional[str] = None,
 ):
     """
     Generate waveform of a text based on a given prompt waveform and its transcription,
@@ -451,7 +447,7 @@ def generate_sentence_raw_evaluation(
     # target text: model.sample() concatenates prompt_tokens+tokens into one
     # sequence, so tagging both would put two control tokens in what training
     # only ever saw as a single utterance with one leading tag.
-    prompt_text = apply_primary_lang_tag(prompt_text, tokenizer, primary_lang)
+    prompt_text = apply_lang_tag(prompt_text, tokenizer, lang)
     tokens = tokenizer.texts_to_token_ids([text])
     prompt_tokens = tokenizer.texts_to_token_ids([prompt_text])
     prompt_zero_duration_mask = compute_zero_duration_mask(tokenizer, prompt_tokens)
@@ -530,7 +526,7 @@ def generate_sentence(
     sampling_rate: int = 24000,
     max_duration: float = 100,
     remove_long_sil: bool = False,
-    primary_lang: Optional[str] = None,
+    lang: Optional[str] = None,
 ):
     """
     Generate waveform of a text based on a given prompt waveform and its transcription,
@@ -612,7 +608,7 @@ def generate_sentence(
     # training only ever saw as a single utterance with one leading tag --
     # this also means the tag is naturally preserved across all target
     # chunks below, since it never depended on the (chunked) target text.
-    prompt_text = apply_primary_lang_tag(prompt_text, tokenizer, primary_lang)
+    prompt_text = apply_lang_tag(prompt_text, tokenizer, lang)
 
     # Tokenize text (str tokens), punctuations will be preserved.
     tokens_str = tokenizer.texts_to_tokens([text])[0]
@@ -752,7 +748,7 @@ def generate_list(
     raw_evaluation: bool = False,
     max_duration: float = 100,
     remove_long_sil: bool = False,
-    primary_lang: Optional[str] = None,
+    lang: Optional[str] = None,
 ):
     total_t = []
     total_t_no_vocoder = []
@@ -783,7 +779,7 @@ def generate_list(
             "target_rms": target_rms,
             "feat_scale": feat_scale,
             "sampling_rate": sampling_rate,
-            "primary_lang": primary_lang,
+            "lang": lang,
         }
 
         if raw_evaluation:
@@ -897,7 +893,7 @@ def main():
     elif params.tokenizer == "libritts":
         tokenizer = LibriTTSTokenizer(token_file=token_file)
     elif params.tokenizer == "espeak":
-        tokenizer = EspeakTokenizer(token_file=token_file, lang=params.lang)
+        tokenizer = EspeakTokenizer(token_file=token_file, lang=params.lang or "en-us")
     elif params.tokenizer == "multilingual":
         if multilingual_tokenizer_dir is not None:
             # Load the exact tokenizer the checkpoint was trained with
@@ -988,7 +984,7 @@ def main():
             raw_evaluation=params.raw_evaluation,
             max_duration=params.max_duration,
             remove_long_sil=params.remove_long_sil,
-            primary_lang=params.primary_lang,
+            lang=params.lang,
         )
     else:
         assert (
@@ -1013,7 +1009,7 @@ def main():
             sampling_rate=params.sampling_rate,
             max_duration=params.max_duration,
             remove_long_sil=params.remove_long_sil,
-            primary_lang=params.primary_lang,
+            lang=params.lang,
         )
         logging.info(f"Saved to: {params.res_wav_path}")
     logging.info("Done")

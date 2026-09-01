@@ -52,16 +52,18 @@ normal LR schedule):
    was **quieter and more silent** than the raw model (RMS 0.0066 vs. 0.011,
    90.8% vs. 86.8% silence) — the opposite of a fix.
 4. **A real but modest train/inference inconsistency was found and
-   confirmed**, not yet fixed: `zero_duration_mask` (which correctly excludes
-   `[LANG:xx]` control tokens from acoustic duration during training) is
-   never threaded through the inference-time duration functions
+   confirmed** (fixed 2026-08-31): `zero_duration_mask` (which correctly
+   excludes `[LANG:xx]` control tokens from acoustic duration during
+   training) was never threaded through the inference-time duration
+   functions
    (`forward_text_inference_gt_duration`/`forward_text_inference_ratio_duration`
-   in `zipvoice/models/zipvoice.py`), and `--primary-lang` tags both the
-   prompt and the target text, producing two control tokens in the
-   concatenated sequence at inference vs. one per utterance in training.
-   Codex's quantitative trace put this at roughly 2% of frames misallocated
-   for a representative sentence — real, but not commensurate with 80%+
-   silence on its own.
+   in `zipvoice/models/zipvoice.py`), and `--lang` (see
+   [2026-08-28__primary_language_conditioning.md](2026-08-28__primary_language_conditioning.md))
+   tagged both the prompt and the target text, producing two control tokens
+   in the concatenated sequence at inference vs. one per utterance in
+   training. Codex's quantitative trace put this at roughly 2% of frames
+   misallocated for a representative sentence — real, but not commensurate
+   with 80%+ silence on its own.
 5. **The decisive finding**: the ZipVoice paper trains its base model for
    **1,000,000 updates on the 100,000-hour Emilia dataset**. Our run was at
    ~64,000-96,000 updates on a **1,380-hour** corpus — roughly 6-10% of the
@@ -115,11 +117,13 @@ converged over the source checkpoint's 525,000 updates) and the rest of
    schedule). Smoke-tested end-to-end on real GPU: loaded the warm-start
    checkpoint (258,626,276 total parameters, matching expectations) and
    completed 5 real training steps without error.
-3. **`scripts/all/m03_infer_cpu_pretrained.py`** (implemented, general
-   purpose): CPU-only inference against any master-architecture HuggingFace
-   checkpoint, given as `--hf-repo`/`--checkpoint-file` CLI arguments, used
-   during this session's diagnosis to establish the working baseline this
-   proposal warm-starts from.
+3. **`scripts/all/m02_infer_cpu.py`** (implemented, general purpose): CPU-only
+   inference, either against our own local checkpoints (default) or, when
+   `--hf-repo` is given, against any master-architecture HuggingFace
+   checkpoint (`--checkpoint-name`/`--config-file`/`--tokens-file`). The
+   HuggingFace mode (originally a separate `m03_infer_cpu_pretrained.py`,
+   merged into this script) was used during this session's diagnosis to
+   establish the working baseline this proposal warm-starts from.
 
 The bet: since `fm_decoder` and most of `text_encoder` already know how to
 turn a text-conditioned latent into good Vietnamese speech, only the new
@@ -157,10 +161,11 @@ fewer than 1M updates.
   unproven bet of this proposal — plausible given `fm_decoder`'s role is
   largely architecture-agnostic (turn a temporally-aligned conditioning
   signal + noise into mel), but not guaranteed.
-- Should the `zero_duration_mask`-at-inference and duplicate-`[LANG:xx]`-tag
-  issues (motivation items 4) be fixed before evaluating warm-start quality,
-  so a still-poor result isn't ambiguous between "warm-start didn't help
-  enough" and "the known bugs are still masking a working model"?
+- ~~Should the `zero_duration_mask`-at-inference and duplicate-`[LANG:xx]`-tag
+  issues (motivation items 4) be fixed before evaluating warm-start quality~~
+  — **resolved 2026-08-31**: both fixed (see motivation item 4 above), so a
+  still-poor warm-start result can no longer be attributed to these known
+  bugs.
 - No formal success criterion is defined yet for "the warm-start worked" —
   this proposal doesn't include a plan/ADR per the user's request; a
   follow-up plan should define concrete checkpoints-to-check and an

@@ -4,9 +4,10 @@
   ground-truth tag, dynamic label dropout, zero-duration masking, dev/test
   tags kept deterministic) are done in `zipvoice/bin/train_zipvoice.py` /
   `zipvoice/models/zipvoice.py` / `zipvoice/tokenizer/multilingual_tokenizer.py`.
-  The inference-time hint (point 6 below) is also done, as `--primary-lang`
-  in `zipvoice/bin/infer_zipvoice.py` (named `primary_lang`, not `lang`, per
-  the "API naming" open question below) — `None` (default) uses
+  The inference-time hint (point 6 below) is also done, as `--lang` in
+  `zipvoice/bin/infer_zipvoice.py` -- the same flag `EspeakTokenizer`
+  already used for its own language selection, routed by `--tokenizer` (see
+  "API naming" below). `None` (default) uses
   `[LANG:auto]`, otherwise the given language is validated (same
   `normalize_language_name` used in training) and used as-is. Applies to
   both `--text` and `--prompt-text`, prepended once before chunking. Also
@@ -140,12 +141,12 @@ per-character auto segmentation and has no "auto" behavior of its own.
    this needs an explicit probe (e.g. compare outputs for the same text with
    different `[LANG:xx]` tags and confirm they differ) before relying on it,
    rather than assuming bidirectional attention makes it work.
-6. **Inference API — implemented**: exposed as `--primary-lang` (CLI) /
-   `primary_lang: Optional[str] = None` on `generate_sentence`,
+6. **Inference API — implemented**: exposed as `--lang` (CLI, see "API
+   naming" below) / `lang: Optional[str] = None` on `generate_sentence`,
    `generate_sentence_raw_evaluation`, and `generate_list` in
    `zipvoice/bin/infer_zipvoice.py`, analogous to OmniVoice's
-   `generate(text, language=...)`. `apply_primary_lang_tag()` in that file
-   does the `None` → `[LANG:auto]` fallback / validation-and-tagging.
+   `generate(text, language=...)`. `apply_lang_tag()` in that file does the
+   `None` → `[LANG:auto]` fallback / validation-and-tagging.
 
 ## Decided (2026-08-28, was previously an open question)
 
@@ -201,12 +202,16 @@ dedicated eval script and remains open.
   sees it, `[LANG:vi]` cannot recover content that was never correctly tokenized
   in the first place. This tag is a pronunciation/disambiguation hint on top of
   correct tokenization, not a substitute for it.
-- **API naming — settled, implemented**: used `--primary-lang` rather than
-  reusing `--lang`, since ZipVoice already has a `--lang` flag for
-  `EspeakTokenizer`'s language selection (`infer_zipvoice.py`) — a different,
-  whole-utterance-phonemizer-language concept this proposal shouldn't be
-  confused with. Both flags coexist; `--primary-lang` only has an effect
-  when `--tokenizer=multilingual`.
+- **API naming — settled, implemented**: reuses the existing `--lang` flag
+  rather than adding a second one, since a caller picking a tokenizer
+  thinks about "language" once, not about which internal mechanism
+  consumes it, and the two uses are mutually exclusive by `--tokenizer`
+  value anyway (never both meaningful in the same run) — no real ambiguity
+  risk from sharing one flag name. `--lang` (default `None`) routes to
+  whichever mechanism `--tokenizer` implies: `EspeakTokenizer`'s language
+  code (falling back to `"en-us"` if unset) for `--tokenizer=espeak`, or
+  the `[LANG:xx]` hint (`[LANG:auto]` if unset) for
+  `--tokenizer=multilingual`.
 
 ## Next steps
 
