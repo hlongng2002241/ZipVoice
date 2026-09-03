@@ -1,5 +1,5 @@
 """
-Analyze token-frequency statistics of a MultilingualTokenizer candidate over
+Analyze token-frequency statistics of a LanguageModelTokenizer candidate over
 a real training-manifest JSONL (one JSON object per line, with a text field).
 
 Sprint 003 deliverable of
@@ -52,7 +52,7 @@ def get_args():
         "--pretrained-model-name",
         type=str,
         default="google-bert/bert-base-multilingual-cased",
-        help="Tokenizer to analyze, passed to MultilingualTokenizer.",
+        help="Tokenizer to analyze, passed to LanguageModelTokenizer.",
     )
     parser.add_argument(
         "--top-k",
@@ -65,9 +65,8 @@ def get_args():
         type=str,
         nargs="*",
         default=None,
-        help="Ordinary vocabulary tokens to add before analysis (e.g. "
-        "MultilingualTokenizer.VI_UNK_GAP_TOKENS), to check whether a "
-        "discovered coverage gap is actually fixed.",
+        help="Ordinary vocabulary tokens to add before analysis, to check "
+        "whether a discovered coverage gap is actually fixed.",
     )
     parser.add_argument(
         "--stats-out",
@@ -104,9 +103,9 @@ def entropy_bits(counts: Counter) -> float:
 
 def main():
     args = get_args()
-    from zipvoice.tokenizer.multilingual_tokenizer import MultilingualTokenizer
+    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
 
-    tok = MultilingualTokenizer(
+    tok = LanguageModelTokenizer(
         pretrained_model_name=args.pretrained_model_name,
         extra_tokens=args.extra_tokens,
     )

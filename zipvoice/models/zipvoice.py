@@ -47,7 +47,7 @@ def _make_pretrained_embedding(
       table already has enough rows. This is the common case in practice --
       e.g. Qwen2.5-0.5B's real tokenizer vocab is 151,665, but its embedding
       table has 151,936 rows (padded for hardware alignment / future vocab
-      growth); `[LANG:xx]` tokens added by MultilingualTokenizer land
+      growth); `[LANG:xx]` tokens added by LanguageModelTokenizer land
       contiguously at 151665-151668, still inside that padding, giving
       `vocab_size=151669 < source_vocab_size=151936`. Just slice the first
       `vocab_size` rows -- every row used is a real pretrained one (the
@@ -188,7 +188,7 @@ class ZipVoice(nn.Module):
                 starting from.
             pretrained_embed_model: HuggingFace model id to load the
                 embedding table from when `embed_source="pretrained"` (e.g.
-                "Qwen/Qwen2.5-0.5B", matching MultilingualTokenizer's
+                "Qwen/Qwen2.5-0.5B", matching LanguageModelTokenizer's
                 default). Required, and unused, when `embed_source="scratch"`.
         """
         super().__init__()
@@ -491,7 +491,7 @@ class ZipVoice(nn.Module):
             t: the time step, with the shape (batch, 1, 1).
             condition_drop_ratio: the ratio of dropped text condition.
             zero_duration_mask: per-utterance, per-token booleans marking
-                control tokens (e.g. MultilingualTokenizer's [LANG:xx] tags)
+                control tokens (e.g. LanguageModelTokenizer's [LANG:xx] tags)
                 that must receive zero acoustic duration. None (default)
                 preserves the original behaviour of giving every token an
                 equal share of the utterance's duration.

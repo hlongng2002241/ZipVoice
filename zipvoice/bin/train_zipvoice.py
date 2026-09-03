@@ -60,8 +60,8 @@ from tqdm import tqdm
 import zipvoice.utils.diagnostics as diagnostics
 from zipvoice.dataset.datamodule import TtsDataModule
 from zipvoice.models.zipvoice import ZipVoice
-from zipvoice.tokenizer.multilingual_tokenizer import (
-    MultilingualTokenizer,
+from zipvoice.tokenizer.lm_tokenizer import (
+    LanguageModelTokenizer,
     normalize_language_name,
     sample_lang_tag,
 )
@@ -374,7 +374,7 @@ def get_parser():
         type=str,
         default=None,
         help="HuggingFace model id whose tokenizer to wrap, when "
-        "--tokenizer=multilingual. Defaults to MultilingualTokenizer's own "
+        "--tokenizer=multilingual. Defaults to LanguageModelTokenizer's own "
         "default (Qwen2.5-0.5B) if not given.",
     )
 
@@ -940,7 +940,7 @@ def tokenize_text(
 ):
     """
     Args:
-      lang_rng: if given (only for MultilingualTokenizer), the ground-truth
+      lang_rng: if given (only for LanguageModelTokenizer), the ground-truth
         language is read per-cut from `c.supervisions[0].language` (e.g. the
         "language": "Vietnamese" field in the user's YouTube-corpus schema,
         normalized via `normalize_language_name`) and a `[LANG:xx]` tag is
@@ -1007,7 +1007,7 @@ def run(rank, world_size, args):
     os.makedirs(f"{params.exp_dir}", exist_ok=True)
     copyfile(src=params.model_config, dst=f"{params.exp_dir}/model.json")
     if params.tokenizer != "multilingual":
-        # MultilingualTokenizer has no local tokens.txt -- its vocabulary
+        # LanguageModelTokenizer has no local tokens.txt -- its vocabulary
         # (including the [LANG:xx] tokens added on top of the pretrained
         # base) is saved separately below, once it's actually constructed.
         copyfile(src=params.token_file, dst=f"{params.exp_dir}/tokens.txt")
@@ -1036,7 +1036,7 @@ def run(rank, world_size, args):
             multilingual_kwargs["pretrained_model_name"] = (
                 params.pretrained_tokenizer_name
             )
-        tokenizer = MultilingualTokenizer(**multilingual_kwargs)
+        tokenizer = LanguageModelTokenizer(**multilingual_kwargs)
         # Save the exact tokenizer (incl. the [LANG:xx] tokens added on top
         # of the pretrained base) so inference can reload the same vocabulary
         # -- there is no local tokens.txt to copy for this tokenizer type.

@@ -1,15 +1,15 @@
 import random
 from collections import Counter
 
-from zipvoice.tokenizer.multilingual_tokenizer import (
-    MultilingualTokenizer,
+from zipvoice.tokenizer.lm_tokenizer import (
+    LanguageModelTokenizer,
     normalize_language_name,
     sample_lang_tag,
 )
 
 
 def _make_tokenizer():
-    return MultilingualTokenizer(
+    return LanguageModelTokenizer(
         pretrained_model_name="google-bert/bert-base-multilingual-cased"
     )
 
@@ -30,7 +30,7 @@ def test_normalize_language_name_none_for_missing_or_unrecognized():
 
 def test_default_pretrained_model_is_qwen25():
     # Final decision per docs/adr/2026-08-28__choose_qwen25_tokenizer.md.
-    tok = MultilingualTokenizer()
+    tok = LanguageModelTokenizer()
     assert tok.hf_tokenizer.name_or_path == "Qwen/Qwen2.5-0.5B"
     # Byte-level BPE: the whole point of the switch was zero [UNK] risk.
     assert tok.hf_tokenizer.unk_token_id is None
@@ -49,7 +49,7 @@ def test_lang_tags_are_single_tokens_not_split():
 def test_lang_tag_ids_are_appended_beyond_base_vocab():
     tok = _make_tokenizer()
     base_vocab_size = tok.hf_tokenizer.vocab_size
-    for tag in MultilingualTokenizer.DEFAULT_LANG_TAGS:
+    for tag in LanguageModelTokenizer.DEFAULT_LANG_TAGS:
         tag_id = tok.hf_tokenizer.convert_tokens_to_ids(tag)
         assert tag_id >= base_vocab_size
         assert tag_id in tok.control_token_ids
@@ -83,21 +83,6 @@ def test_sample_lang_tag_wrong_tag_never_matches_true_lang():
     for _ in range(200):
         tag = sample_lang_tag("en", auto_prob=0.0, wrong_tag_prob=1.0, rng=rng)
         assert tag in ("[LANG:vi]", "[LANG:zh]")
-
-
-def test_extra_tokens_fill_the_discovered_vi_unk_gap():
-    tok_without_fix = _make_tokenizer()
-    unk_id = tok_without_fix.hf_tokenizer.unk_token_id
-    ids_before = tok_without_fix.hf_tokenizer.encode("Ừ", add_special_tokens=False)
-    assert ids_before == [unk_id]
-
-    tok_with_fix = MultilingualTokenizer(
-        pretrained_model_name="google-bert/bert-base-multilingual-cased",
-        extra_tokens=MultilingualTokenizer.VI_UNK_GAP_TOKENS,
-    )
-    ids_after = tok_with_fix.hf_tokenizer.encode("Ừ", add_special_tokens=False)
-    assert unk_id not in ids_after
-    assert tok_with_fix.hf_tokenizer.convert_ids_to_tokens(ids_after) == ["Ừ"]
 
 
 def test_sample_lang_tag_distribution_matches_configured_probabilities():

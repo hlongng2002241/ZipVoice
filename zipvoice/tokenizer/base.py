@@ -18,7 +18,7 @@
 
 """The Tokenizer interface, kept dependency-free (no jieba/piper_phonemize/
 pypinyin) so tokenizers that don't need phonemization -- e.g.
-MultilingualTokenizer -- don't have to pull those in just to be importable.
+LanguageModelTokenizer -- don't have to pull those in just to be importable.
 """
 
 from abc import ABC, abstractmethod

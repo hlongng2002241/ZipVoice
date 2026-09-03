@@ -14,8 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MultilingualTokenizer: reuse an existing pretrained multilingual
+"""LanguageModelTokenizer: reuse an existing pretrained multilingual
 tokenizer's subword vocabulary instead of per-language phonemization.
+
+Named for the "lm_tokens" terminology introduced by
+docs/adr/2026-09-02__qwen_phone_fusion_text_frontend.md's Terminology note --
+this class's output is what that ADR calls `lm_tokens` (Qwen/BPE output),
+distinct from `tokens`/phones. Formerly `MultilingualTokenizer`, renamed to
+match.
 
 Deliberately kept in its own module, importing only `transformers` and the
 dependency-free Tokenizer interface in `zipvoice.tokenizer.base` -- NOT
@@ -94,7 +100,7 @@ def sample_lang_tag(
     return f"[LANG:{true_lang}]"
 
 
-class MultilingualTokenizer(Tokenizer):
+class LanguageModelTokenizer(Tokenizer):
     """Tokenizer that reuses an existing pretrained multilingual tokenizer's
     subword vocabulary instead of per-language phonemization, extended with
     reserved ``[LANG:xx]`` control tokens.
@@ -126,23 +132,6 @@ class MultilingualTokenizer(Tokenizer):
 
     DEFAULT_LANG_TAGS = ["[LANG:en]", "[LANG:vi]", "[LANG:zh]", "[LANG:auto]"]
 
-    # Historical, mBERT-specific: discovered by analyzing real Vietnamese ASR
-    # transcripts (173,461 utterances, see docs/plans/
-    # 2026-08-28__multilingual_tts_frontend/eval_sets/real_corpus_token_stats.md)
-    # that mBERT's cased vocabulary is missing these capitalized Vietnamese
-    # interjections/words as usable WordPiece pieces (their lowercase forms
-    # exist). A follow-up systematic check found the gap was much larger than
-    # this list (36/68 uppercase Vietnamese diacritic vowels missing
-    # entirely), which is part of why mBERT was rejected in favor of
-    # Qwen2.5-0.5B -- kept here only for reference/if reverting to mBERT.
-    # Not applicable to the default Qwen2.5-0.5B tokenizer, which has zero
-    # `[UNK]` by construction and needs no such patch.
-    VI_UNK_GAP_TOKENS = [
-        "Ờ", "Ừ", "Ồ", "Ơ", "Ồn", "Ổn", "Ơi", "Ổng", "Ạ", "Ổ", "Ùa", "Ớt",
-        "Ếch", "Ổi", "Ỷ", "Ầm", "Ụp", "Ửng", "Ới", "VIỆT", "Ừm", "Ế",
-        "KIẾM", "TIỀN", "Ơn", "CẦN", "GIỜ",
-    ]
-
     def __init__(
         self,
         pretrained_model_name: str = "Qwen/Qwen2.5-0.5B",
@@ -158,7 +147,7 @@ class MultilingualTokenizer(Tokenizer):
             ``DEFAULT_LANG_TAGS``.
           extra_tokens: ordinary (non-control) vocabulary words to add via
             ``add_tokens`` -- for filling empirically-discovered coverage
-            gaps like ``VI_UNK_GAP_TOKENS``. Unlike `lang_tags`, these
+            gaps. Unlike `lang_tags`, these
             participate in normal WordPiece matching for any future text,
             not just exact whole-word matches, and are not excluded from
             duration allocation.

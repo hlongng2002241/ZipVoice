@@ -2,7 +2,7 @@
 # Real training run on the combined YouTube+TopTop corpus (171,961 train
 # utterances; 1000 VI + 500 EN held out as test, see m00_prepare_manifest.py
 # and data/all/split_summary.json). Same validated configuration as the
-# smoke test (scripts/smoke_youtube/): MultilingualTokenizer (Qwen2.5-0.5B),
+# smoke test (scripts/smoke_youtube/): LanguageModelTokenizer (Qwen2.5-0.5B),
 # embed_source=pretrained, on-the-fly feature extraction (no compute_fbank
 # step), [LANG:xx] tags derived per-utterance from supervision.language with
 # 5% auto-dropout. --num-epochs/--max-duration follow egs/zipvoice/run_emilia.sh's

@@ -42,7 +42,7 @@ import torch
 from huggingface_hub import hf_hub_download
 
 from zipvoice.models.zipvoice import ZipVoice
-from zipvoice.tokenizer.multilingual_tokenizer import MultilingualTokenizer
+from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
 
 OUR_MODEL_CONFIG = REPO_ROOT / "scripts/all/model.json"
 OUR_TOKENIZER_DIR = REPO_ROOT / "exp/all/tokenizer"
@@ -78,7 +78,7 @@ def main():
     print("Building our model architecture (Qwen2.5-0.5B embedding + multilingual tokenizer)...")
     with open(OUR_MODEL_CONFIG) as f:
         model_config = json.load(f)["model"]
-    tokenizer = MultilingualTokenizer(pretrained_model_name=str(OUR_TOKENIZER_DIR))
+    tokenizer = LanguageModelTokenizer(pretrained_model_name=str(OUR_TOKENIZER_DIR))
     model = ZipVoice(
         **model_config,
         vocab_size=tokenizer.vocab_size,

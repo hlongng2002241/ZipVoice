@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 10-step smoke test: confirms the multilingual-tokenizer + pretrained-embedding
-# integration (MultilingualTokenizer default Qwen2.5-0.5B, embed_source=pretrained
+# integration (LanguageModelTokenizer default Qwen2.5-0.5B, embed_source=pretrained
 # in model.json) runs end-to-end on real data shaped like the user's YouTube
 # corpus, using lhotse on-the-fly feature extraction (no compute_fbank step,
 # per docs/plans/2026-08-28__multilingual_tts_frontend/). The [LANG:xx] tag
