@@ -78,9 +78,9 @@ from vocos import Vocos
 
 from zipvoice.models.zipvoice import ZipVoice
 from zipvoice.models.zipvoice_distill import ZipVoiceDistill
-from zipvoice.tokenizer.multilingual_tokenizer import (
+from zipvoice.tokenizer.lm_tokenizer import (
     LANGUAGES,
-    MultilingualTokenizer,
+    LanguageModelTokenizer,
     normalize_language_name,
 )
 from zipvoice.tokenizer.tokenizer import (
@@ -180,7 +180,7 @@ def get_parser():
         default=None,
         help="HuggingFace model id whose tokenizer to wrap, when "
         "--tokenizer=multilingual and --model-dir has no saved 'tokenizer' "
-        "directory. Defaults to MultilingualTokenizer's own default "
+        "directory. Defaults to LanguageModelTokenizer's own default "
         "(Qwen2.5-0.5B) if not given. Ignored when --model-dir/tokenizer "
         "exists -- that saved tokenizer is loaded instead, to guarantee the "
         "vocabulary matches the checkpoint.",
@@ -332,12 +332,12 @@ def apply_lang_tag(
     lang: Optional[str] = None,
 ) -> str:
     """Prepend a '[LANG:xx]' tag to `text`, when `tokenizer` is a
-    MultilingualTokenizer. `lang=None` uses '[LANG:auto]' (matching
+    LanguageModelTokenizer. `lang=None` uses '[LANG:auto]' (matching
     how the model was trained to fall back when no hint is given); otherwise
     the given language is validated and used as-is. No-op for other
     tokenizer types, which have no such tokens in their vocabulary.
     """
-    if not isinstance(tokenizer, MultilingualTokenizer):
+    if not isinstance(tokenizer, LanguageModelTokenizer):
         return text
     if lang is None:
         tag = "[LANG:auto]"
@@ -354,10 +354,10 @@ def apply_lang_tag(
 
 def compute_zero_duration_mask(tokenizer, token_ids_batch: List[List[int]]):
     """Per-utterance zero_duration_mask for a batch of already-tokenized
-    sequences (see MultilingualTokenizer.zero_duration_mask), matching how
+    sequences (see LanguageModelTokenizer.zero_duration_mask), matching how
     training excludes [LANG:xx] control tokens from acoustic duration. None
     for tokenizers with no such concept (i.e. every type but
-    MultilingualTokenizer), preserving the original no-mask behavior.
+    LanguageModelTokenizer), preserving the original no-mask behavior.
     """
     if not hasattr(tokenizer, "zero_duration_mask"):
         return None
@@ -899,15 +899,15 @@ def main():
             # Load the exact tokenizer the checkpoint was trained with
             # (including any [LANG:xx] tokens added on top of the base
             # vocabulary), rather than reconstructing one from scratch.
-            tokenizer = MultilingualTokenizer(
+            tokenizer = LanguageModelTokenizer(
                 pretrained_model_name=str(multilingual_tokenizer_dir)
             )
         elif params.pretrained_tokenizer_name is not None:
-            tokenizer = MultilingualTokenizer(
+            tokenizer = LanguageModelTokenizer(
                 pretrained_model_name=params.pretrained_tokenizer_name
             )
         else:
-            tokenizer = MultilingualTokenizer()
+            tokenizer = LanguageModelTokenizer()
     else:
         assert params.tokenizer == "simple"
         tokenizer = SimpleTokenizer(token_file=token_file)

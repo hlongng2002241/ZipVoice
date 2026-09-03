@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from lhotse import CutSet, Recording, SupervisionSegment
 from lhotse.audio import AudioSource
 
-from zipvoice.tokenizer.multilingual_tokenizer import normalize_language_name
+from zipvoice.tokenizer.lm_tokenizer import normalize_language_name
 
 YOUTUBE_PATH = "/data4/audio/youtube/exp/01/audio.exist.denoise.info.vol.diarize.mos.asr.abs.final.jsonl"
 TOPTOP_PATH = "/data4/audio/toptop/exp/04/metadata.dur.norm.cut.dur.sv.wer.punc.hard_merge.dur.wer.dur.flac.jsonl"

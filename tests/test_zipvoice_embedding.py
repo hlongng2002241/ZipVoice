@@ -29,7 +29,7 @@ def test_scratch_embedding_uses_requested_hidden_size():
 
 def test_pretrained_embedding_copies_source_weights_no_extra_projection():
     # vocab_size > Qwen2.5-0.5B's base vocab (151936), simulating the
-    # [LANG:xx] tokens MultilingualTokenizer adds on top. text_embed_dim is
+    # [LANG:xx] tokens LanguageModelTokenizer adds on top. text_embed_dim is
     # deliberately set to something else (192) to confirm it's ignored in
     # favor of the pretrained model's actual hidden size (896).
     vocab_size = 151936 + 4
@@ -66,11 +66,11 @@ def test_pretrained_embedding_copies_source_weights_no_extra_projection():
 
 
 def test_pretrained_embedding_vocab_smaller_than_source_slices_pretrained_rows():
-    # The realistic MultilingualTokenizer case, found via an actual training
+    # The realistic LanguageModelTokenizer case, found via an actual training
     # run: Qwen2.5-0.5B's real tokenizer vocab is 151,665, but its checkpoint's
     # embedding table has 151,936 rows (padded for hardware alignment). The 4
     # [LANG:xx] tokens land at 151665-151668, still inside that padding, so
-    # MultilingualTokenizer's vocab_size (151669) ends up *smaller* than the
+    # LanguageModelTokenizer's vocab_size (151669) ends up *smaller* than the
     # source model's embedding table -- every row needed is still a real
     # pretrained one, just a slice of the source table, not extended with any
     # randomly-initialized rows.

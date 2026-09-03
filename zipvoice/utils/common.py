@@ -235,7 +235,7 @@ def prepare_input(
         The device of Tensor.
       return_zero_duration_mask:
         If True, also return the per-utterance zero_duration_mask (see
-        MultilingualTokenizer.zero_duration_mask) as a second item, right
+        LanguageModelTokenizer.zero_duration_mask) as a second item, right
         after `tokens`. Defaults to False so the default return shape when
         `return_tokens=True` matches the original (pre-multilingual) contract
         exactly -- callers that don't ask for the mask don't get an extra,
@@ -291,7 +291,7 @@ def prepare_avg_tokens_durations(
       tokens_lens: the number of tokens in each utterance, shape (batch,).
       zero_duration_mask: for each utterance, a list of booleans (one per
         token) marking control/special tokens (e.g. ``[LANG:xx]`` tags, see
-        MultilingualTokenizer.zero_duration_mask) that carry no acoustic
+        LanguageModelTokenizer.zero_duration_mask) that carry no acoustic
         content and must receive zero frames. ``None`` (the default)
         preserves the original behaviour: every token gets an equal share.
 
