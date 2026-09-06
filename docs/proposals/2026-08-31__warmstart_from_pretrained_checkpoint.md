@@ -150,11 +150,12 @@ fewer than 1M updates.
 ## Open Questions
 
 - What learning rate and epoch count are actually appropriate for this
-  fine-tuning scenario? `m05_train_warmstart.sh` currently reuses the
-  from-scratch run's `--base-lr 0.0001` and `--num-epochs 15` unchanged, with
-  no evidence yet on whether that's right for a mostly-pretrained network —
-  it plausibly needs far fewer epochs to reach usable quality than a
-  from-scratch run would.
+  fine-tuning scenario? `m05_train_warmstart.sh` reuses the from-scratch run's
+  `--base-lr 0.0001` unchanged; `--num-epochs` was since raised from 15 to 50
+  (intentional, not a bug -- a mostly-pretrained network converging faster
+  per-epoch on acoustic quality doesn't mean it needs fewer total epochs if
+  content-correctness turns out to be the slow part), with no evidence yet on
+  whether the LR itself is right for a mostly-pretrained network.
 - Will `fm_decoder`'s statistics, learned from a phoneme-based
   `text_encoder`'s output distribution, transfer well to a BPE/Qwen-embedding-
   based `text_encoder`'s output once the latter adapts? This is the core

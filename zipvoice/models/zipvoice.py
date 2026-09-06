@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from zipvoice.models.modules.fusion import PhoneQwenFusion, build_phone_group_index
 from zipvoice.models.modules.solver import EulerSolver
 from zipvoice.models.modules.zipformer import TTSZipformer
 from zipvoice.utils.common import (
@@ -30,6 +31,13 @@ from zipvoice.utils.common import (
     pad_labels,
     prepare_avg_tokens_durations,
 )
+
+# `text_frontend` values. "embedding" is every pre-fusion behaviour
+# (master's scratch embedding and the Qwen-embedding-table variant),
+# unchanged. "fusion" is the Qwen+phoneme fusion frontend -- see
+# docs/adr/2026-09-02__qwen_phone_fusion_text_frontend.md.
+TEXT_FRONTEND_EMBEDDING = "embedding"
+TEXT_FRONTEND_FUSION = "fusion"
 
 
 def _make_pretrained_embedding(
@@ -138,6 +146,9 @@ class ZipVoice(nn.Module):
         pad_id: int = 0,
         embed_source: str = "scratch",
         pretrained_embed_model: Optional[str] = None,
+        text_frontend: str = TEXT_FRONTEND_EMBEDDING,
+        qwen_hidden_size: int = 896,
+        gate_init_eps: float = 0.01,
     ):
         """
         Initialize the model with specified configuration parameters.
@@ -190,8 +201,31 @@ class ZipVoice(nn.Module):
                 embedding table from when `embed_source="pretrained"` (e.g.
                 "Qwen/Qwen2.5-0.5B", matching LanguageModelTokenizer's
                 default). Required, and unused, when `embed_source="scratch"`.
+            text_frontend: "embedding" (default) keeps every pre-fusion
+                behaviour exactly as-is -- one embedding table looked up per
+                token, `embed_source` deciding where its weights come from.
+                "fusion" builds the Qwen+phoneme fusion frontend instead
+                (`PhoneQwenFusion`: a per-phone phone embedding, a projected
+                per-group Qwen vector, and a learned per-group gate), in
+                which case `vocab_size` is the **phone** vocabulary,
+                `embed_source`/`pretrained_embed_model` are unused (Qwen
+                enters as pooled features computed outside the model, not as
+                an embedding table), and `text_encoder` keeps its native
+                `text_embed_dim` input width so the source checkpoint's
+                `in_proj` stays transplantable. See
+                docs/adr/2026-09-02__qwen_phone_fusion_text_frontend.md.
+            qwen_hidden_size: width of the pooled Qwen vectors the fusion
+                frontend consumes (896 for Qwen2.5-0.5B). Unused unless
+                `text_frontend="fusion"`.
+            gate_init_eps: initial Qwen mixing weight for the fusion gate
+                (near-phone-only start, no floor -- see the ADR's point 4).
+                Unused unless `text_frontend="fusion"`.
         """
         super().__init__()
+        assert text_frontend in (
+            TEXT_FRONTEND_EMBEDDING,
+            TEXT_FRONTEND_FUSION,
+        ), text_frontend
 
         self.fm_decoder = TTSZipformer(
             in_dim=feat_dim * 3,
@@ -218,8 +252,17 @@ class ZipVoice(nn.Module):
         # scratch path specifically -- master's original RNG consumption
         # order (nn.Embedding draws its random init at construction time).
         # See docs/plans/2026-08-29__master_backward_compatibility.md.
+        # The fusion frontend registers `self.fusion` at that same point, for
+        # the same reason, so the "embedding" paths keep byte-identical
+        # ordering.
         pretrained_embed = None
-        if embed_source == "pretrained":
+        if text_frontend == TEXT_FRONTEND_FUSION:
+            assert embed_source == "scratch", (
+                "text_frontend='fusion' owns its own phone embedding; the "
+                "Qwen side enters as pooled features computed outside the "
+                f"model, so embed_source must stay 'scratch' (got {embed_source!r})"
+            )
+        elif embed_source == "pretrained":
             assert pretrained_embed_model is not None, (
                 "pretrained_embed_model is required when embed_source='pretrained'"
             )
@@ -249,12 +292,26 @@ class ZipVoice(nn.Module):
             use_time_embed=False,
         )
 
-        self.embed = (
-            pretrained_embed
-            if pretrained_embed is not None
-            else nn.Embedding(vocab_size, text_embed_dim)
-        )
+        if text_frontend == TEXT_FRONTEND_FUSION:
+            # The phone embedding lives inside the fusion module, so no
+            # separate `self.embed` is built at all -- an unused table would
+            # be dead parameters in every checkpoint.
+            self.embed = None
+            self.fusion = PhoneQwenFusion(
+                phone_vocab_size=vocab_size,
+                embed_dim=text_embed_dim,
+                qwen_hidden_size=qwen_hidden_size,
+                gate_init_eps=gate_init_eps,
+            )
+        else:
+            self.embed = (
+                pretrained_embed
+                if pretrained_embed is not None
+                else nn.Embedding(vocab_size, text_embed_dim)
+            )
+            self.fusion = None
 
+        self.text_frontend = text_frontend
         self.feat_dim = feat_dim
         self.text_embed_dim = text_embed_dim
         self.pad_id = pad_id
@@ -316,11 +373,24 @@ class ZipVoice(nn.Module):
     def forward_text_embed(
         self,
         tokens: List[List[int]],
+        phone_groups: Optional[List[Optional[List[List[int]]]]] = None,
+        qwen_group_features: Optional[torch.Tensor] = None,
+        qwen_group_valid: Optional[torch.Tensor] = None,
     ):
         """
         Get the text embeddings.
         Args:
-            tokens: a list of list of token ids.
+            tokens: a list of list of token ids. Under
+                `text_frontend="fusion"` these are **phone** ids.
+            phone_groups: fusion only -- per utterance,
+                `FusionTokenizerArtifact.phone_groups` (or None for an
+                utterance whose lm_token alignment failed, which falls back
+                to phone-only).
+            qwen_group_features: fusion only -- (B, G, qwen_hidden_size)
+                pooled Qwen vectors from `TruncatedQwenExtractor`. None runs
+                the phone branch alone, which is what an oracle/ablation
+                "phone-only" configuration wants.
+            qwen_group_valid: fusion only -- (B, G) bool marking real groups.
         Returns:
             embed: the text embeddings, shape (batch, seq_len, emb_dim).
             tokens_lens: the length of each token sequence, shape (batch,).
@@ -328,8 +398,30 @@ class ZipVoice(nn.Module):
         device = (
             self.device if isinstance(self, DDP) else next(self.parameters()).device
         )
+        # Note `pad_labels` appends one position beyond every utterance's real
+        # length; `get_tokens_index()` can return an index equal to a token
+        # count (it appends a residual-duration entry), so a vector must exist
+        # there to gather from. Both frontends below preserve that: the
+        # embedding path embeds the extra pad id, and the fusion path leaves
+        # that position (which belongs to no group) as a plain pad embedding.
         tokens_padded = pad_labels(tokens, pad_id=self.pad_id, device=device)  # (B, S)
-        embed = self.embed(tokens_padded)  # (B, S, C)
+        if self.text_frontend == TEXT_FRONTEND_FUSION:
+            assert phone_groups is not None, (
+                "text_frontend='fusion' needs phone_groups (from "
+                "FusionTokenizerArtifact) to know which phones share a group"
+            )
+            group_ids, has_group = build_phone_group_index(
+                phone_groups, padded_len=tokens_padded.shape[1], device=device
+            )
+            embed = self.fusion(
+                tokens_padded,
+                group_ids,
+                has_group,
+                qwen_group_features,
+                qwen_group_valid,
+            )  # (B, S, C)
+        else:
+            embed = self.embed(tokens_padded)  # (B, S, C)
         tokens_lens = torch.tensor(
             [len(token) for token in tokens], dtype=torch.int64, device=device
         )
@@ -382,16 +474,44 @@ class ZipVoice(nn.Module):
         )  # (B, T, F)
         return text_condition, padding_mask
 
+    def _assert_inference_supported(self) -> None:
+        """The fusion frontend's inference-time composition contract is
+        deliberately still open (see sprint 003's "Deferred, not decided
+        here"): how a prompt artifact and a target artifact combine without
+        putting two `[LANG:xx]` tags in one causal Qwen context, and how
+        long-text chunking splits without cutting a phone/`lm_token` group in
+        half. The author chose to settle that empirically once the model
+        exists, so rather than guess a contract here and have generation
+        silently produce subtly-misaligned conditioning, these paths refuse
+        to run under `text_frontend="fusion"` until it's decided.
+        """
+        if self.text_frontend == TEXT_FRONTEND_FUSION:
+            raise NotImplementedError(
+                "Inference-time text composition is not implemented for "
+                "text_frontend='fusion' yet -- the prompt/target artifact "
+                "composition and group-preserving chunking contract is an "
+                "open decision (see sprint 003's Approach, 'Deferred, not "
+                "decided here'). Training (forward/forward_text_train) works."
+            )
+
     def forward_text_train(
         self,
         tokens: List[List[int]],
         features_lens: torch.Tensor,
         zero_duration_mask: Optional[List[List[bool]]] = None,
+        phone_groups: Optional[List[Optional[List[List[int]]]]] = None,
+        qwen_group_features: Optional[torch.Tensor] = None,
+        qwen_group_valid: Optional[torch.Tensor] = None,
     ):
         """
         Process text for training, given text tokens and real feature lengths.
         """
-        embed, tokens_lens = self.forward_text_embed(tokens)
+        embed, tokens_lens = self.forward_text_embed(
+            tokens,
+            phone_groups=phone_groups,
+            qwen_group_features=qwen_group_features,
+            qwen_group_valid=qwen_group_valid,
+        )
         text_condition, padding_mask = self.forward_text_condition(
             embed, tokens_lens, features_lens, zero_duration_mask=zero_duration_mask
         )
@@ -412,6 +532,7 @@ class ZipVoice(nn.Module):
         """
         Process text for inference, given text tokens, real feature lengths and prompts.
         """
+        self._assert_inference_supported()
         cat_zero_duration_mask = _concat_zero_duration_masks(
             prompt_zero_duration_mask, zero_duration_mask, prompt_tokens, tokens
         )
@@ -438,6 +559,7 @@ class ZipVoice(nn.Module):
         Process text for inference, given text tokens and prompts,
         feature lengths are predicted with the ratio of token numbers.
         """
+        self._assert_inference_supported()
         device = (
             self.device if isinstance(self, DDP) else next(self.parameters()).device
         )
@@ -481,6 +603,9 @@ class ZipVoice(nn.Module):
         t: torch.Tensor,
         condition_drop_ratio: float = 0.0,
         zero_duration_mask: Optional[List[List[bool]]] = None,
+        phone_groups: Optional[List[Optional[List[List[int]]]]] = None,
+        qwen_group_features: Optional[torch.Tensor] = None,
+        qwen_group_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass of the model for training.
         Args:
@@ -494,7 +619,13 @@ class ZipVoice(nn.Module):
                 control tokens (e.g. LanguageModelTokenizer's [LANG:xx] tags)
                 that must receive zero acoustic duration. None (default)
                 preserves the original behaviour of giving every token an
-                equal share of the utterance's duration.
+                equal share of the utterance's duration. Note this is an
+                `lm_tokens`-side concept: under `text_frontend="fusion"`,
+                `tokens` are phones, which never contain a control token, so
+                this stays None there (see the ADR's "Artifact invariants").
+            phone_groups: fusion only -- see `forward_text_embed`.
+            qwen_group_features: fusion only -- see `forward_text_embed`.
+            qwen_group_valid: fusion only -- see `forward_text_embed`.
         Returns:
             fm_loss: the flow-matching loss.
         """
@@ -503,6 +634,9 @@ class ZipVoice(nn.Module):
             tokens=tokens,
             features_lens=features_lens,
             zero_duration_mask=zero_duration_mask,
+            phone_groups=phone_groups,
+            qwen_group_features=qwen_group_features,
+            qwen_group_valid=qwen_group_valid,
         )
 
         speech_condition_mask = condition_time_mask(
@@ -657,6 +791,9 @@ class ZipVoice(nn.Module):
         t_end: float,
         num_step: int = 1,
         guidance_scale: torch.Tensor = None,
+        phone_groups: Optional[List[Optional[List[List[int]]]]] = None,
+        qwen_group_features: Optional[torch.Tensor] = None,
+        qwen_group_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Generate acoustic features in intermediate timesteps.
@@ -673,10 +810,16 @@ class ZipVoice(nn.Module):
             num_step: The number of steps for sampling.
             guidance_scale: The scale for classifier-free guidance inference,
                 with the shape (batch, 1, 1).
+            phone_groups: fusion only -- see `forward_text_embed`.
+            qwen_group_features: fusion only -- see `forward_text_embed`.
+            qwen_group_valid: fusion only -- see `forward_text_embed`.
         """
         (text_condition, padding_mask,) = self.forward_text_train(
             tokens=tokens,
             features_lens=features_lens,
+            phone_groups=phone_groups,
+            qwen_group_features=qwen_group_features,
+            qwen_group_valid=qwen_group_valid,
         )
 
         speech_condition = torch.where(speech_condition_mask.unsqueeze(-1), 0, features)
