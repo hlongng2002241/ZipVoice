@@ -99,6 +99,28 @@ class SpeechSynthesisDataset(torch.utils.data.Dataset):
             if any(m is not None for m in masks):
                 batch["zero_duration_mask"] = masks
 
+            # Fusion frontend extras (see
+            # docs/adr/2026-09-02__qwen_phone_fusion_text_frontend.md): the
+            # model needs to know which phones share a group, and needs the
+            # utterance's lm_tokens to run the Qwen branch over. Present only
+            # when a FusionTokenizer produced these fields, so every other
+            # tokenizer keeps the exact batch schema it had before -- no
+            # present-but-always-None keys. All three stay ragged Python
+            # lists: they are consumed per-utterance (group structure differs
+            # per utterance), and the model/extractor do their own padding.
+            phone_groups = [
+                getattr(cut.supervisions[0], "phone_groups", None) for cut in cuts
+            ]
+            if any(g is not None for g in phone_groups):
+                batch["phone_groups"] = phone_groups
+                batch["lm_token_ids"] = [
+                    getattr(cut.supervisions[0], "lm_token_ids", None) for cut in cuts
+                ]
+                batch["lm_token_groups"] = [
+                    getattr(cut.supervisions[0], "lm_token_groups", None)
+                    for cut in cuts
+                ]
+
         if self.return_spk_ids:
             batch["speakers"] = [cut.supervisions[0].speaker for cut in cuts]
 

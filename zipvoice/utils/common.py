@@ -221,6 +221,7 @@ def prepare_input(
     return_feature: bool = True,
     return_audio: bool = False,
     return_zero_duration_mask: bool = False,
+    return_fusion_fields: bool = False,
 ):
     """
     Parse the features and targets of the current batch.
@@ -240,9 +241,19 @@ def prepare_input(
         `return_tokens=True` matches the original (pre-multilingual) contract
         exactly -- callers that don't ask for the mask don't get an extra,
         unexpected item in the return list.
+      return_fusion_fields:
+        If True, also return the fusion frontend's extra per-utterance
+        fields (see the Qwen+phoneme fusion ADR) as a dict with keys
+        `phone_groups` / `lm_token_ids` / `lm_token_groups`, or None when the
+        batch has none (i.e. a non-fusion tokenizer produced it). Same
+        rationale as above for defaulting to False: callers that don't ask
+        keep their exact existing return shape.
     """
     assert not (return_zero_duration_mask and not return_tokens), (
         "return_zero_duration_mask requires return_tokens=True"
+    )
+    assert not (return_fusion_fields and not return_tokens), (
+        "return_fusion_fields requires return_tokens=True"
     )
     return_list = []
 
@@ -267,6 +278,17 @@ def prepare_input(
                         for i, m in enumerate(zero_duration_mask)
                     ]
             return_list += [zero_duration_mask]
+
+        if return_fusion_fields:
+            if "phone_groups" in batch:
+                fusion_fields = {
+                    "phone_groups": batch["phone_groups"],
+                    "lm_token_ids": batch["lm_token_ids"],
+                    "lm_token_groups": batch["lm_token_groups"],
+                }
+            else:
+                fusion_fields = None
+            return_list += [fusion_fields]
 
     if return_feature:
         features = batch["features"].to(device)

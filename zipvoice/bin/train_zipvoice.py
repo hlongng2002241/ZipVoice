@@ -363,10 +363,33 @@ def get_parser():
         "--tokenizer",
         type=str,
         default="emilia",
-        choices=["emilia", "libritts", "espeak", "simple", "multilingual"],
+        choices=["emilia", "libritts", "espeak", "simple", "multilingual", "fusion"],
         help="Tokenizer type. 'multilingual' wraps an existing pretrained "
         "HuggingFace tokenizer (see --pretrained-tokenizer-name) instead of "
-        "phonemizing text -- see docs/adr/2026-08-28__choose_qwen25_tokenizer.md.",
+        "phonemizing text -- see docs/adr/2026-08-28__choose_qwen25_tokenizer.md. "
+        "'fusion' is the Qwen+phoneme fusion frontend: phones (via "
+        "FusionTokenizer, per --token-file) fused with a truncated Qwen's "
+        "per-group features -- see "
+        "docs/adr/2026-09-02__qwen_phone_fusion_text_frontend.md.",
+    )
+
+    parser.add_argument(
+        "--qwen-layers",
+        type=int,
+        default=4,
+        help="Number of Qwen transformer layers to run for the fusion "
+        "frontend's Qwen branch (N in the ADR). 4 was validated empirically "
+        "with a linear probe; 2/4/8/12 all scored ~96-98% and 24 was worse. "
+        "Only used when --tokenizer=fusion.",
+    )
+
+    parser.add_argument(
+        "--gate-init-eps",
+        type=float,
+        default=0.01,
+        help="Initial Qwen mixing weight for the fusion gate -- a "
+        "near-phone-only start, with no floor (gate collapse is an accepted, "
+        "monitored risk per the ADR). Only used when --tokenizer=fusion.",
     )
 
     parser.add_argument(
@@ -485,6 +508,8 @@ def compute_fbank_loss(
     tokens: List[List[int]],
     is_training: bool,
     zero_duration_mask: Optional[List[List[bool]]] = None,
+    fusion_fields: Optional[dict] = None,
+    qwen_extractor=None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute loss given the model and its inputs.
@@ -504,6 +529,17 @@ def compute_fbank_loss(
         True for training. False for validation. When it is True, this
         function enables autograd during computation; when it is False, it
         disables autograd.
+      fusion_fields:
+        The fusion frontend's per-utterance extras (`phone_groups`,
+        `lm_token_ids`, `lm_token_groups`) from `prepare_input`, or None for
+        every other tokenizer.
+      qwen_extractor:
+        A `TruncatedQwenExtractor`, required when `fusion_fields` is given.
+        Runs live here (per the ADR's point 6: no offline cache in v1 --
+        Qwen2.5-0.5B at 4 layers is cheap enough that a cache's
+        invalidation/serialization complexity isn't justified yet). It is
+        frozen and runs under `no_grad`, so it costs a forward pass, not a
+        backward one.
     """
 
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
@@ -521,6 +557,21 @@ def compute_fbank_loss(
             .unsqueeze(1)
             .unsqueeze(2)
         )
+    model_fusion_kwargs = {}
+    if fusion_fields is not None:
+        assert qwen_extractor is not None, (
+            "fusion_fields require a qwen_extractor to turn lm_tokens into "
+            "per-group Qwen vectors"
+        )
+        qwen_group_features, qwen_group_valid = qwen_extractor.pooled_groups(
+            fusion_fields["lm_token_ids"], fusion_fields["lm_token_groups"]
+        )
+        model_fusion_kwargs = {
+            "phone_groups": fusion_fields["phone_groups"],
+            "qwen_group_features": qwen_group_features.to(device),
+            "qwen_group_valid": qwen_group_valid.to(device),
+        }
+
     with torch.set_grad_enabled(is_training):
 
         loss = model(
@@ -531,6 +582,7 @@ def compute_fbank_loss(
             t=t,
             condition_drop_ratio=params.condition_drop_ratio,
             zero_duration_mask=zero_duration_mask,
+            **model_fusion_kwargs,
         )
 
     assert loss.requires_grad == is_training
@@ -554,6 +606,7 @@ def train_one_epoch(
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
+    qwen_extractor=None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -642,6 +695,7 @@ def train_one_epoch(
                 model=model,
                 valid_dl=valid_dl,
                 world_size=world_size,
+                qwen_extractor=qwen_extractor,
             )
             model.train()
             logging.info(
@@ -661,13 +715,20 @@ def train_one_epoch(
 
         batch_size = len(batch["text"])
 
-        tokens, zero_duration_mask, features, features_lens = prepare_input(
+        (
+            tokens,
+            zero_duration_mask,
+            fusion_fields,
+            features,
+            features_lens,
+        ) = prepare_input(
             params=params,
             batch=batch,
             device=device,
             return_tokens=True,
             return_feature=True,
             return_zero_duration_mask=True,
+            return_fusion_fields=True,
         )
 
         try:
@@ -679,6 +740,8 @@ def train_one_epoch(
                     features_lens=features_lens,
                     tokens=tokens,
                     zero_duration_mask=zero_duration_mask,
+                    fusion_fields=fusion_fields,
+                    qwen_extractor=qwen_extractor,
                     is_training=True,
                 )
 
@@ -805,6 +868,7 @@ def compute_validation_loss(
     model: Union[nn.Module, DDP],
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
+    qwen_extractor=None,
 ) -> MetricsTracker:
     """Run the validation process."""
 
@@ -815,13 +879,20 @@ def compute_validation_loss(
     tot_loss = MetricsTracker()
 
     for batch_idx, batch in enumerate(valid_dl):
-        tokens, zero_duration_mask, features, features_lens = prepare_input(
+        (
+            tokens,
+            zero_duration_mask,
+            fusion_fields,
+            features,
+            features_lens,
+        ) = prepare_input(
             params=params,
             batch=batch,
             device=device,
             return_tokens=True,
             return_feature=True,
             return_zero_duration_mask=True,
+            return_fusion_fields=True,
         )
 
         loss, loss_info = compute_fbank_loss(
@@ -831,6 +902,8 @@ def compute_validation_loss(
             features_lens=features_lens,
             tokens=tokens,
             zero_duration_mask=zero_duration_mask,
+            fusion_fields=fusion_fields,
+            qwen_extractor=qwen_extractor,
             is_training=False,
         )
         assert loss.requires_grad is False
@@ -881,6 +954,7 @@ def scan_pessimistic_batches_for_oom(
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     params: AttributeDict,
+    qwen_extractor=None,
 ):
     from lhotse.dataset import find_pessimistic_batches
 
@@ -892,13 +966,20 @@ def scan_pessimistic_batches_for_oom(
     batches, crit_values = find_pessimistic_batches(train_dl.sampler)
     for criterion, cuts in batches.items():
         batch = train_dl.dataset[cuts]
-        tokens, zero_duration_mask, features, features_lens = prepare_input(
+        (
+            tokens,
+            zero_duration_mask,
+            fusion_fields,
+            features,
+            features_lens,
+        ) = prepare_input(
             params=params,
             batch=batch,
             device=device,
             return_tokens=True,
             return_feature=True,
             return_zero_duration_mask=True,
+            return_fusion_fields=True,
         )
         try:
             with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
@@ -910,6 +991,8 @@ def scan_pessimistic_batches_for_oom(
                     features_lens=features_lens,
                     tokens=tokens,
                     zero_duration_mask=zero_duration_mask,
+                    fusion_fields=fusion_fields,
+                    qwen_extractor=qwen_extractor,
                     is_training=True,
                 )
             loss.backward()
@@ -929,6 +1012,59 @@ def scan_pessimistic_batches_for_oom(
             f"Maximum memory allocated so far is "
             f"{torch.cuda.max_memory_allocated() // 1000000}MB"
         )
+
+
+def tokenize_text_fusion(c: Cut, tokenizers: dict):
+    """Tokenize one cut with the Qwen+phoneme fusion frontend.
+
+    Unlike the other tokenizers, `FusionTokenizer` is locked to a single
+    language per instance (see its docstring), so `tokenizers` maps a
+    canonical short code ("en"/"vi"/"zh") to the instance for that language,
+    and the cut's own `supervision.language` selects between them.
+
+    That per-utterance language is exactly the "immutable ground truth" the
+    ADR's point 1 builds the phone branch on. Sprint 001 found it is *not*
+    reliable in this corpus (~95% of "English"-labelled utterances are
+    actually Vietnamese with embedded English words), which the author chose
+    to leave unfixed -- so this path knowingly phonemizes those utterances
+    under the wrong language. Recorded here rather than silently relied on;
+    see sprint 003's "Known accepted data-quality issue".
+
+    Attaches the whole artifact's fields to the supervision so the dataset
+    can collate them: `tokens` (phone ids -- same field name the rest of the
+    pipeline already reads), plus `phone_groups`, `lm_token_ids` and
+    `lm_token_groups` for the Qwen branch.
+    """
+    raw_lang = getattr(c.supervisions[0], "language", None)
+    lang = normalize_language_name(raw_lang)
+    if lang is None:
+        raise ValueError(
+            f"cut {c.id!r} has a missing or unrecognized language "
+            f"({raw_lang!r}). Every utterance must have a valid language; "
+            f"this should have been caught during data preparation (see "
+            f"scripts/*/m00_prepare_manifest.py)."
+        )
+    if lang not in tokenizers:
+        raise ValueError(
+            f"cut {c.id!r} is {lang!r}, but no FusionTokenizer was built for "
+            f"that language (have: {sorted(tokenizers)})."
+        )
+
+    artifact = tokenizers[lang].text_to_artifact(c.supervisions[0].text)
+    c.supervisions[0].tokens = artifact.phone_ids
+    c.supervisions[0].phone_groups = artifact.phone_groups
+    c.supervisions[0].lm_token_ids = artifact.lm_token_ids
+    c.supervisions[0].lm_token_groups = artifact.lm_token_groups
+    # The fusion frontend owns no zero-duration phones: `[LANG:xx]` lives on
+    # the lm_token side only, and every phone this emits is acoustic. Cleared
+    # rather than merely not-set, so a supervision that arrived carrying a
+    # mask from some other tokenizer cannot leak into this batch -- that mask
+    # counts lm_tokens, so against phone counts it would either trip
+    # `prepare_avg_tokens_durations`' length assert or, if the two counts
+    # happened to match, silently zero the duration of real phones.
+    # Assigning None is lhotse's documented way to remove a custom field.
+    c.supervisions[0].zero_duration_mask = None
+    return c
 
 
 def tokenize_text(
@@ -955,7 +1091,22 @@ def tokenize_text(
         at manifest-prep time.
     """
     if hasattr(c.supervisions[0], "tokens"):
-        tokens = tokenizer.tokens_to_token_ids([c.supervisions[0].tokens])
+        existing = c.supervisions[0].tokens
+        # This branch means "the manifest was pre-tokenized into symbol
+        # *strings*". `tokens_to_token_ids` looks each one up in a str-keyed
+        # vocabulary and silently `continue`s past anything missing, so a
+        # sequence of ints -- which is what the fusion frontend stores in
+        # this same field -- would not raise here: every id would miss, and
+        # the cut would come out with `tokens=[]`, failing much later and
+        # much less obviously in duration allocation.
+        if any(isinstance(t, int) for t in existing):
+            raise ValueError(
+                f"cut {c.id!r} already carries integer `tokens`, which is "
+                f"what the fusion frontend writes. This tokenizer expects "
+                f"pre-tokenized input to be symbol strings; re-run "
+                f"tokenization from text instead of reusing a fused cut."
+            )
+        tokens = tokenizer.tokens_to_token_ids([existing])
     else:
         text = c.supervisions[0].text
         if lang_rng is not None:
@@ -974,7 +1125,82 @@ def tokenize_text(
     c.supervisions[0].tokens = tokens[0]
     if hasattr(tokenizer, "zero_duration_mask"):
         c.supervisions[0].zero_duration_mask = tokenizer.zero_duration_mask(tokens[0])
+    else:
+        c.supervisions[0].zero_duration_mask = None
+    # Symmetrically to `tokenize_text_fusion`: the non-fusion frontends emit
+    # no groups, so clear any that a fusion pass left behind. Otherwise the
+    # dataset would collate fusion fields for a run whose `qwen_extractor` is
+    # None, and `compute_fbank_loss` would reject the batch.
+    c.supervisions[0].phone_groups = None
+    c.supervisions[0].lm_token_ids = None
+    c.supervisions[0].lm_token_groups = None
     return c
+
+
+#: Settings that define what the text actually looks like to the model. A
+#: resume that changes one of these loads without error and then trains
+#: against a different representation than the checkpoint learned.
+RESUME_CRITICAL_KEYS = (
+    "qwen_layers",
+    "tokenizer",
+    "text_frontend",
+    # Selects *which* frozen Qwen supplies the conditioning. A different
+    # checkpoint at the same hidden width loads and runs without complaint.
+    "pretrained_tokenizer_name",
+)
+
+
+def _effective_setting(key: str, value):
+    """What a saved/current setting actually selects.
+
+    `pretrained_tokenizer_name=None` is a real value, not a missing one: the
+    extractor resolves it as `params.pretrained_tokenizer_name or
+    DEFAULT_MODEL_NAME`. So None and the explicit default name select the
+    same frozen Qwen and must compare equal, or resuming a default-model run
+    while passing the name explicitly would be rejected for no reason.
+    """
+    from zipvoice.models.modules.qwen_extractor import DEFAULT_MODEL_NAME
+
+    if key == "pretrained_tokenizer_name":
+        return value or DEFAULT_MODEL_NAME
+    return value
+
+
+def check_resume_text_frontend(params, checkpoints) -> None:
+    """Refuse to resume a fusion run whose text frontend has changed.
+
+    `resume_checkpoint` restores only the five training counters, so every
+    other setting silently comes from this invocation's CLI rather than the
+    checkpoint. For most settings that is intended -- you may well want a
+    different learning rate on resume. For the frozen extractor's depth it
+    is not: `qwen_layers` changes which Qwen layer the conditioning comes
+    from, but *not* the pooled width (always 896), so
+    `--tokenizer fusion --start-epoch 2` with `--qwen-layers` omitted loads
+    cleanly, silently falls back to the argparse default, and continues
+    training against a different representation with nothing to indicate it.
+    The same argument applies to `pretrained_tokenizer_name`, which selects
+    *which* frozen Qwen is used: a different checkpoint at the same hidden
+    width also loads without complaint.
+    """
+    if checkpoints is None or params.tokenizer != "fusion":
+        return
+    for key in RESUME_CRITICAL_KEYS:
+        # `key not in checkpoints` is the test for "this checkpoint predates
+        # the setting", NOT `saved is None`: None is a legitimate *value* for
+        # `pretrained_tokenizer_name`, meaning the default model. Treating it
+        # as missing metadata would wave through a resume that swapped in a
+        # different same-width Qwen.
+        if key not in params or key not in checkpoints:
+            continue
+        saved = _effective_setting(key, checkpoints[key])
+        current = _effective_setting(key, params[key])
+        if saved != current:
+            raise ValueError(
+                f"resuming with {key}={current!r} but the checkpoint was "
+                f"trained with {key}={saved!r}. The model would load without "
+                f"error and train against a different text representation -- "
+                f"pass the checkpoint's value explicitly if this is deliberate."
+            )
 
 
 def run(rank, world_size, args):
@@ -1024,12 +1250,50 @@ def run(rank, world_size, args):
         params.device = torch.device("cpu")
     logging.info(f"Device: {params.device}")
 
+    # Populated only by the fusion frontend; every other tokenizer leaves
+    # these None and the fusion-specific code paths stay inert.
+    fusion_tokenizers = None
+    qwen_extractor = None
+
     if params.tokenizer == "emilia":
         tokenizer = EmiliaTokenizer(token_file=params.token_file)
     elif params.tokenizer == "libritts":
         tokenizer = LibriTTSTokenizer(token_file=params.token_file)
     elif params.tokenizer == "espeak":
         tokenizer = EspeakTokenizer(token_file=params.token_file, lang=params.lang)
+    elif params.tokenizer == "fusion":
+        # One FusionTokenizer per language (each instance is locked to a
+        # single `lang`), sharing one LanguageModelTokenizer so the Qwen
+        # tokenizer is loaded once. See the fusion ADR.
+        from zipvoice.models.modules.qwen_extractor import (
+            DEFAULT_MODEL_NAME,
+            TruncatedQwenExtractor,
+        )
+        from zipvoice.tokenizer.fusion_tokenizer import FusionTokenizer
+
+        lm_tokenizer_kwargs = {}
+        if params.pretrained_tokenizer_name is not None:
+            lm_tokenizer_kwargs["pretrained_model_name"] = (
+                params.pretrained_tokenizer_name
+            )
+        lm_tokenizer = LanguageModelTokenizer(**lm_tokenizer_kwargs)
+        fusion_tokenizers = {
+            lang: FusionTokenizer(
+                token_file=params.token_file, lang=lang, lm_tokenizer=lm_tokenizer
+            )
+            for lang in ("en", "vi", "zh")
+        }
+        # `tokenizer` still stands in for vocab_size/pad_id below: they are
+        # the *phone* vocabulary's, identical across the three instances.
+        tokenizer = fusion_tokenizers["vi"]
+        qwen_extractor = TruncatedQwenExtractor(
+            model_name=params.pretrained_tokenizer_name or DEFAULT_MODEL_NAME,
+            num_layers=params.qwen_layers,
+            device=params.device,
+        )
+        # Same reason the multilingual path saves its tokenizer: inference
+        # must rebuild the identical lm_token vocabulary.
+        lm_tokenizer.hf_tokenizer.save_pretrained(f"{params.exp_dir}/tokenizer")
     elif params.tokenizer == "multilingual":
         multilingual_kwargs = {}
         if params.pretrained_tokenizer_name is not None:
@@ -1046,6 +1310,14 @@ def run(rank, world_size, args):
         tokenizer = SimpleTokenizer(token_file=params.token_file)
 
     tokenizer_config = {"vocab_size": tokenizer.vocab_size, "pad_id": tokenizer.pad_id}
+    if params.tokenizer == "fusion":
+        # Under fusion, `vocab_size`/`pad_id` above are the *phone*
+        # vocabulary's; the Qwen side never becomes an embedding table in
+        # the model (it enters as pooled features), so there is no second
+        # vocab_size to thread through.
+        tokenizer_config["text_frontend"] = "fusion"
+        tokenizer_config["qwen_hidden_size"] = qwen_extractor.hidden_size
+        tokenizer_config["gate_init_eps"] = params.gate_init_eps
     params.update(tokenizer_config)
 
     logging.info(params)
@@ -1081,6 +1353,8 @@ def run(rank, world_size, args):
             checkpoints = resume_checkpoint(
                 params=params, model=model, model_avg=model_avg
             )
+
+        check_resume_text_frontend(params, checkpoints)
 
     model = model.to(params.device)
     if world_size > 1:
@@ -1179,6 +1453,23 @@ def run(rank, world_size, args):
                 f"will tokenize on-the-fly, which can slow down training significantly."
             )
     lang_rng = None
+    if params.tokenizer == "fusion":
+        # ADR point 2: the phone branch always phonemizes under the immutable
+        # `supervision.language`, so a sampled `[LANG:auto]`/wrong tag on the
+        # lm_token side would put the two branches on different premises for
+        # the same utterance. Enforced in code rather than left to shell
+        # convention, because it is silent and load-bearing if violated.
+        if params.lang_auto_prob != 0.0 or params.lang_wrong_prob != 0.0:
+            raise ValueError(
+                "--tokenizer=fusion requires --lang-auto-prob=0 and "
+                "--lang-wrong-prob=0 (got "
+                f"{params.lang_auto_prob} / {params.lang_wrong_prob}). The "
+                "phone branch is always built from the true "
+                "supervision.language, so a sampled or deliberately-wrong "
+                "language tag would desynchronize the two branches. See the "
+                "ADR's point 2, 'Config enforcement required for "
+                "training-time consistency'."
+            )
     if params.tokenizer == "multilingual":
         assert 0.0 <= params.lang_auto_prob <= 1.0, params.lang_auto_prob
         assert 0.0 <= params.lang_wrong_prob <= 1.0, params.lang_wrong_prob
@@ -1199,20 +1490,29 @@ def run(rank, world_size, args):
             f"RNG, so validation never perturbs the training dropout stream."
         )
 
-    _tokenize_text_train = partial(
-        tokenize_text,
-        tokenizer=tokenizer,
-        lang_auto_prob=params.lang_auto_prob,
-        lang_wrong_prob=params.lang_wrong_prob,
-        lang_rng=lang_rng,
-    )
-    _tokenize_text_dev = partial(
-        tokenize_text,
-        tokenizer=tokenizer,
-        lang_auto_prob=0.0,
-        lang_wrong_prob=0.0,
-        lang_rng=random.Random(params.seed) if lang_rng is not None else None,
-    )
+    if params.tokenizer == "fusion":
+        # No tag sampling here at all: the fusion frontend's `[LANG:xx]` is
+        # deterministic (the ADR requires --lang-auto-prob/--lang-wrong-prob
+        # to be 0, enforced above) and `FusionTokenizer` prepends it itself.
+        _tokenize_text_train = partial(
+            tokenize_text_fusion, tokenizers=fusion_tokenizers
+        )
+        _tokenize_text_dev = _tokenize_text_train
+    else:
+        _tokenize_text_train = partial(
+            tokenize_text,
+            tokenizer=tokenizer,
+            lang_auto_prob=params.lang_auto_prob,
+            lang_wrong_prob=params.lang_wrong_prob,
+            lang_rng=lang_rng,
+        )
+        _tokenize_text_dev = partial(
+            tokenize_text,
+            tokenizer=tokenizer,
+            lang_auto_prob=0.0,
+            lang_wrong_prob=0.0,
+            lang_rng=random.Random(params.seed) if lang_rng is not None else None,
+        )
     train_cuts = train_cuts.map(_tokenize_text_train)
     dev_cuts = dev_cuts.map(_tokenize_text_dev)
 
@@ -1226,6 +1526,7 @@ def run(rank, world_size, args):
             train_dl=train_dl,
             optimizer=optimizer,
             params=params,
+            qwen_extractor=qwen_extractor,
         )
 
     logging.info("Training started")
@@ -1255,6 +1556,7 @@ def run(rank, world_size, args):
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,
+            qwen_extractor=qwen_extractor,
         )
 
         if params.num_iters > 0 and params.batch_idx_train > params.num_iters:
