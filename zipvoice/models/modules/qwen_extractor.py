@@ -140,7 +140,8 @@ class TruncatedQwenExtractor:
         logging.info(
             f"TruncatedQwenExtractor: {model_name}, running {num_layers}/"
             f"{total_layers} layers, hidden_size={self.hidden_size}, "
-            f"dtype={dtype}, include_lang_tag={include_lang_tag}, "
+            f"dtype={dtype}, device={self.device}, "
+            f"include_lang_tag={include_lang_tag}, "
             f"final RMSNorm skipped, frozen."
         )
 
