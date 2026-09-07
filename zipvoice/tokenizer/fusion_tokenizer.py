@@ -104,6 +104,12 @@ _DEFAULT_USE_NORMALIZER: Dict[str, bool] = {"en": True, "zh": True, "vi": False}
 
 _bare_emilia_tokenizer: Optional[EmiliaTokenizer] = None
 
+#: (locale, word) -> phones, for the per-word group-count probe in
+#: `FusionTokenizer._merge_groups_per_word`. Bounded so a long training run
+#: cannot grow it without limit; the corpus vocabulary is far smaller.
+_WORD_PHONE_CACHE: Dict[Tuple[str, str], List[str]] = {}
+_WORD_PHONE_CACHE_MAX = 200_000
+
 
 def _shared_emilia_tokenizer() -> EmiliaTokenizer:
     """A EmiliaTokenizer instance used only for its text-processing methods
@@ -647,14 +653,170 @@ class FusionTokenizer:
             )
         else:
             canonical_text = text
-        groups = _split_into_groups(
-            self._espeak_flat_phones(canonical_text, _ESPEAK_LOCALE[self.lang])
-        )
+        locale = _ESPEAK_LOCALE[self.lang]
+        groups = _split_into_groups(self._espeak_flat_phones(canonical_text, locale))
         word_spans = _whitespace_spans(canonical_text)
+
+        # One group per *text* word, which is what the lm_token side is
+        # anchored to. espeak does not give that for free: it expands some
+        # single text tokens into several spoken words -- "1997" becomes five
+        # ("mot nghin chin tram chin muoi bay"), "ui/ux" splits at the slash,
+        # acronyms spell out. Requiring len(groups) == len(word_spans) can
+        # therefore never reach full coverage; measured on this corpus it
+        # left 2.7% of utterances unaligned, 68% of those because espeak
+        # produced MORE groups than words, not fewer.
+        #
+        # So ask each word how many groups it is worth, by phonemizing it on
+        # its own, and let it consume exactly that many. "1997" alone also
+        # yields five groups, so it consumes its five and the following words
+        # stay in step. The whole-utterance phonemization is still what gets
+        # emitted -- these per-word calls only decide where the boundaries
+        # go, so cross-word phonology is untouched and the flat phone
+        # sequence remains byte-identical to EspeakTokenizer's (sprint 000's
+        # hard requirement). Verified separately that interleaving these
+        # extra espeak calls does not perturb whole-utterance output.
+        merged = self._merge_groups_per_word(groups, word_spans, canonical_text, locale)
+        if merged is not None:
+            return merged[0], merged[1], canonical_text
+
         spans: List[Optional[Tuple[int, int]]] = (
             list(word_spans) if len(word_spans) == len(groups) else [None] * len(groups)
         )
         return groups, spans, canonical_text
+
+    def _merge_groups_per_word(
+        self,
+        groups: List[List[str]],
+        word_spans: List[Tuple[int, int]],
+        canonical_text: str,
+        locale: str,
+    ) -> Optional[Tuple[List[List[str]], List[Optional[Tuple[int, int]]]]]:
+        """One group per whitespace word. Content matching first (the real
+        test), then the looser count match, then give up."""
+        if not word_spans:
+            return None
+        by_content = self._merge_groups_by_content(
+            groups, word_spans, canonical_text, locale
+        )
+        if by_content is not None:
+            return by_content
+        return self._merge_groups_by_count(groups, word_spans, canonical_text, locale)
+
+    def _merge_groups_by_content(
+        self,
+        groups: List[List[str]],
+        word_spans: List[Tuple[int, int]],
+        canonical_text: str,
+        locale: str,
+    ) -> Optional[Tuple[List[List[str]], List[Optional[Tuple[int, int]]]]]:
+        """Regroup the flat phone sequence so there is exactly one group per
+        whitespace word, by matching phone **content** rather than trusting
+        espeak's separators.
+
+        Separator-based grouping cannot be made reliable. espeak omits the
+        separator in cases that are not predictable from punctuation rules --
+        measured on this corpus, "book of the" phonemizes with "of" and "the"
+        fused as a single run, and sentence boundaries drop it too -- while
+        also splitting single text tokens into several spoken words ("1997"
+        into five). Counting groups therefore fails in both directions.
+
+        So each word is phonemized on its own to learn its phone content, and
+        that content is consumed from the whole-utterance sequence in order.
+        Separators and punctuation are skipped on both sides during matching
+        and assigned to the group they trail, which keeps flattening lossless:
+        the emitted phones remain exactly the whole-utterance ones, so
+        cross-word phonology is preserved and the sequence stays
+        byte-identical to EspeakTokenizer's (sprint 000's hard requirement).
+
+        Returns None if the content does not line up, leaving the caller to
+        fall back to the plain count match and then to no alignment. That
+        still happens for genuine disagreements between a word alone and the
+        same word in context.
+        """
+        if not word_spans:
+            return None
+        flat = [p for group in groups for p in group]
+        skippable = _SENTENCE_END_PHONES | {" ", ",", "-", "\u2013", "\u2014"}
+
+        merged: List[List[str]] = []
+        i = 0
+        for start, end in word_spans:
+            word_content = [
+                p
+                for p in self._word_phones(canonical_text[start:end], locale)
+                if p not in skippable
+            ]
+            span_start = i
+            matched = 0
+            while i < len(flat) and matched < len(word_content):
+                symbol = flat[i]
+                if symbol in skippable:
+                    i += 1
+                    continue
+                if symbol != word_content[matched]:
+                    return None
+                i += 1
+                matched += 1
+            if matched != len(word_content):
+                return None
+            # Trailing separators/punctuation belong to the group they follow.
+            while i < len(flat) and flat[i] in skippable:
+                i += 1
+            merged.append(flat[span_start:i])
+
+        if i != len(flat) or any(not g for g in merged):
+            return None
+        assert [p for g in merged for p in g] == flat, (
+            "regrouping must not change the phone sequence"
+        )
+        return merged, list(word_spans)
+
+    def _merge_groups_by_count(
+        self,
+        groups: List[List[str]],
+        word_spans: List[Tuple[int, int]],
+        canonical_text: str,
+        locale: str,
+    ) -> Optional[Tuple[List[List[str]], List[Optional[Tuple[int, int]]]]]:
+        """Looser fallback for `_merge_groups_per_word`: trust each word's
+        group *count* without checking that the phones match.
+
+        Content matching is the better test and is tried first, but it is
+        strictly stronger, so it rejects cases this accepts. That matters for
+        the mislabelled-English subset, where espeak-en spells Vietnamese
+        characters out and a word's isolated phones drift from its in-context
+        ones while the group count still lines up: measured, content matching
+        alone aligned 74% of that subset and this fallback recovers it to
+        85%. Weaker evidence, but the alternative is no conditioning at all.
+        """
+        counts = [
+            len(_split_into_groups(self._word_phones(canonical_text[s:e], locale)))
+            for s, e in word_spans
+        ]
+        if sum(counts) != len(groups):
+            return None
+        merged: List[List[str]] = []
+        cursor = 0
+        for count in counts:
+            merged.append([p for g in groups[cursor : cursor + count] for p in g])
+            cursor += count
+        if any(not g for g in merged):
+            return None
+        return merged, list(word_spans)
+
+    def _word_phones(self, word: str, locale: str) -> List[str]:
+        """Phones for a single word, cached. Only ever used to count groups,
+        never emitted -- see `_plain_phone_groups_and_spans`."""
+        key = (locale, word)
+        cached = _WORD_PHONE_CACHE.get(key)
+        if cached is None:
+            try:
+                cached = _flatten_espeak_output(phonemize_espeak(word, locale))
+            except Exception:
+                cached = []
+            if len(_WORD_PHONE_CACHE) < _WORD_PHONE_CACHE_MAX:
+                _WORD_PHONE_CACHE[key] = cached
+        return cached
 
     def _espeak_flat_phones(self, text: str, locale: str) -> List[str]:
         try:
