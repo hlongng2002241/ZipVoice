@@ -861,11 +861,12 @@ def test_punctuation_only_word_joins_its_neighbour():
     assert [w for b in word_blocks for w in b] == "xin chao - cac ban".split()
 
 
-def test_chinese_reports_no_alignment_rather_than_a_wrong_one():
+def test_chinese_aligns_and_does_not_overlap():
     """Chinese used to emit OVERLAPPING lm groups -- measured, lm_token 6
-    assigned to two different phone groups. Wrong conditioning is worse than
-    none, so that path now returns no alignment at all until it gets a
-    design of its own (see the 2026-09-07 ADR).
+    assigned to two different phone groups. It briefly returned no alignment
+    at all rather than a wrong one; with script routing plus boundary
+    coarsening it now aligns correctly, so assert the correctness rather
+    than the old containment.
     """
     from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
 
@@ -878,9 +879,81 @@ def test_chinese_reports_no_alignment_rather_than_a_wrong_one():
     tok = FusionTokenizer(
         token_file=token_file, lang="zh", lm_tokenizer=LanguageModelTokenizer()
     )
-    artifact = tok.text_to_artifact("你好世界。今天天气很好")
-    assert artifact.phone_groups, "Chinese must still produce phones"
+    for text in ("你好世界", "今天天气很好", "我喜欢学习中文"):
+        artifact = tok.text_to_artifact(text)
+        assert artifact.phone_groups, text
+        assert artifact.lm_token_groups is not None, text
+        flat = [i for group in artifact.lm_token_groups for i in group]
+        assert flat == list(range(1, len(artifact.lm_token_ids))), (
+            f"{text}: every lm_token must be in exactly one group -- "
+            f"duplicates were the original Chinese defect"
+        )
+        assert len(artifact.lm_token_groups) == len(artifact.phone_groups)
+
+
+def test_token_crossing_a_boundary_coarsens_it():
+    """A boundary an lm_token straddles is not a usable group boundary.
+
+    jieba and BPE disagree: measured, jieba cuts "今天|天气|很好" while BPE
+    emits "很好" across the 天气/很好 boundary, and "我喜欢" across two
+    boundaries in "我喜欢学习中文". Assigning such a token to one side gives
+    that group a token containing the other group's text -- silent, since
+    every group is still non-empty and every token still used exactly once.
+    Routing decides which phonemizer runs; it need not survive as a
+    conditioning boundary, so the contradicted boundary is dropped.
+    """
+    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
+
+    token_file = (
+        "scripts/all/pretrained_model_cache/"
+        "hynt__ZipVoice-Vietnamese-2500h/tokens.txt"
+    )
+    if not os.path.exists(token_file):
+        pytest.skip(f"{token_file} not available")
+    tok = FusionTokenizer(
+        token_file=token_file, lang="vi", lm_tokenizer=LanguageModelTokenizer()
+    )
+    hf = tok.lm_tokenizer.hf_tokenizer
+
+    for text in ("今天天气很好", "我喜欢学习中文"):
+        artifact = tok.text_to_artifact(text)
+        assert artifact.lm_token_groups is not None
+        offsets = hf(
+            text, add_special_tokens=False, return_offsets_mapping=True
+        )["offset_mapping"]
+        # No surviving boundary may be straddled by a token. Reconstruct the
+        # boundaries from group sizes over the token offsets.
+        cuts = []
+        consumed = 0
+        for group in artifact.lm_token_groups[:-1]:
+            consumed += len(group)
+            cuts.append(offsets[consumed - 1][1])
+        for start, end in offsets:
+            for cut in cuts:
+                assert not (start < cut < end), (
+                    f"{text}: token ({start},{end}) still straddles cut {cut}"
+                )
+
+
+def test_all_oov_returns_no_alignment_instead_of_crashing():
+    """When every phone group is filtered away there is no destination group
+    for the offset walk. That used to raise IndexError; the full lm_tokens
+    are kept and alignment is reported as unavailable.
+    """
+    import tempfile
+
+    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
+
+    directory = tempfile.mkdtemp()
+    token_file = os.path.join(directory, "tokens.txt")
+    with open(token_file, "w", encoding="utf-8") as handle:
+        handle.write("_\t0\n")  # nothing but the pad symbol
+    tok = FusionTokenizer(
+        token_file=token_file, lang="vi", lm_tokenizer=LanguageModelTokenizer()
+    )
+    artifact = tok.text_to_artifact("xin chao")
     assert artifact.lm_token_groups is None
+    assert len(artifact.lm_token_ids) > 1, "the lm_tokens must still be kept"
 
 
 # --- Defects found by external review of the 2026-09-07 redesign ----------

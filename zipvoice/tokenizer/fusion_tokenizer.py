@@ -650,8 +650,15 @@ class FusionTokenizer:
         for raw_idx, filtered_idx in raw_to_filtered.items():
             filtered_phones[filtered_idx] = flat_phones[raw_idx]
 
-        lm_tokens, lm_token_ids, lm_token_groups = self._lm_tokens_and_groups(
-            canonical_text, filtered_ends if block_ends is not None else None
+        (
+            lm_tokens,
+            lm_token_ids,
+            lm_token_groups,
+            filtered_groups,
+        ) = self._lm_tokens_and_groups(
+            canonical_text,
+            filtered_ends if block_ends is not None else None,
+            filtered_groups,
         )
         zero_duration_mask = (
             self.lm_tokenizer.zero_duration_mask(lm_token_ids)
@@ -674,7 +681,8 @@ class FusionTokenizer:
         self,
         canonical_text: str,
         block_ends: Optional[List[int]],
-    ) -> Tuple[List[str], List[int], Optional[List[List[int]]]]:
+        phone_groups: List[List[int]],
+    ) -> Tuple[List[str], List[int], Optional[List[List[int]]], List[List[int]]]:
         """lm_tokens for the utterance, grouped to match `word_blocks`.
 
         Each block's words are tokenized on their own and concatenated,
@@ -691,7 +699,7 @@ class FusionTokenizer:
         construction removes that class of gap entirely.
         """
         if self.lm_tokenizer is None:
-            return [], [], None
+            return [], [], None, phone_groups
 
         hf = self.lm_tokenizer.hf_tokenizer
         # This fusion architecture always uses the deterministic, immutable
@@ -714,6 +722,7 @@ class FusionTokenizer:
                 [tag] + hf.convert_ids_to_tokens(ids),
                 [tag_id] + ids,
                 None,
+                phone_groups,
             )
 
         # The lm_token sequence is the WHOLE-text tokenization, always --
@@ -721,11 +730,10 @@ class FusionTokenizer:
         # Qwen. Only the grouping is derived here.
         #
         # An earlier attempt tokenized each block separately and relied on
-        # Qwen's BPE being concatenative at whitespace. That holds for
-        # single spaces but NOT for runs: the vocabulary has multi-whitespace
-        # tokens, so "xin  chao" (double space) tokenizes differently whole
-        # than in pieces. Depending on it meant either rewriting the text
-        # Qwen sees or raising on odd whitespace, neither acceptable.
+        # Qwen's BPE being concatenative at whitespace. That holds for single
+        # spaces but NOT for runs -- the vocabulary has multi-whitespace
+        # tokens -- so it silently rewrote the text Qwen sees. Tokenizing the
+        # whole text drops that assumption entirely.
         #
         # Assignment is total: walking tokens and blocks together in order,
         # a token belongs to the first block whose end it has not passed.
@@ -741,26 +749,64 @@ class FusionTokenizer:
         lm_token_ids = [tag_id] + list(ids)
         lm_tokens = [tag] + hf.convert_ids_to_tokens(ids)
 
-        lm_token_groups: List[List[int]] = [[] for _ in block_ends]
+        if not block_ends:
+            # Every phone group was filtered away (all-OOV, or text that is
+            # only whitespace). There is nothing to attach conditioning to,
+            # and the walk below needs at least one destination group.
+            logging.warning(
+                "FusionTokenizer: no phone groups survived; keeping the full "
+                "lm_tokens but leaving lm_token_groups=None."
+            )
+            return lm_tokens, lm_token_ids, None, phone_groups
+
+        # A phone-block boundary is only usable if no lm_token straddles it.
+        # A token that covers substantive characters from two blocks cannot
+        # be split between them, and assigning it to one silently gives that
+        # block a token containing another block's text -- measured on real
+        # Chinese: jieba cuts "今天|天气|很好" while BPE emits "很好" across
+        # the 天气/很好 boundary, and "我喜欢" across two boundaries.
+        #
+        # Routing and word boundaries decide which phonemizer runs; they do
+        # not have to survive as conditioning boundaries. So drop the
+        # boundaries the tokenizer contradicts and merge those blocks. This
+        # also subsumes the leading-separator case, where a token spans a
+        # separator-only first block and the word after it.
+        incompatible = set()
+        for token_start, token_end in offsets:
+            for boundary, end in enumerate(block_ends[:-1]):
+                if token_start < end < token_end:
+                    incompatible.add(boundary)
+
+        merged_ends: List[int] = []
+        merged_phone_groups: List[List[int]] = []
+        current: List[int] = []
+        for index, end in enumerate(block_ends):
+            current = current + phone_groups[index]
+            if index not in incompatible:
+                merged_ends.append(end)
+                merged_phone_groups.append(current)
+                current = []
+        if current:  # trailing blocks whose boundary was dropped
+            merged_phone_groups[-1] = merged_phone_groups[-1] + current
+
+        lm_token_groups: List[List[int]] = [[] for _ in merged_ends]
         block_number = 0
         for token_index, (token_start, _) in enumerate(offsets):
             while (
-                block_number < len(block_ends) - 1
-                and token_start >= block_ends[block_number]
+                block_number < len(merged_ends) - 1
+                and token_start >= merged_ends[block_number]
             ):
                 block_number += 1
             lm_token_groups[block_number].append(token_index + 1)
 
         if any(not g for g in lm_token_groups):
-            # A word that produces no tokens would give a group with no Qwen
-            # evidence, which the extractor marks invalid exactly like
-            # padding -- invisible downstream. Refuse instead.
             logging.warning(
-                "FusionTokenizer: a word produced no lm_tokens; leaving "
-                "lm_token_groups=None rather than emitting an empty group."
+                "FusionTokenizer: a group received no lm_tokens even after "
+                "coarsening; leaving lm_token_groups=None rather than "
+                "emitting an empty group."
             )
-            return lm_tokens, lm_token_ids, None
-        return lm_tokens, lm_token_ids, lm_token_groups
+            return lm_tokens, lm_token_ids, None, phone_groups
+        return lm_tokens, lm_token_ids, lm_token_groups, merged_phone_groups
 
     # -- internal: unified phone-groups + canonical-text-span frontend --
 
