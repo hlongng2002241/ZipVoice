@@ -149,7 +149,9 @@ def _report_mismatches(mismatches, total, label):
     )
 
 
-def _check_corpus_equivalence(samples, old_phones_fn, new_groups_fn, label):
+def _check_corpus_equivalence(
+    samples, old_phones_fn, new_groups_fn, label, script="latin"
+):
     """Compute each tokenizer's output in its own clean, uninterrupted pass
     over all samples before comparing -- NOT interleaved per-sample.
 
@@ -164,6 +166,47 @@ def _check_corpus_equivalence(samples, old_phones_fn, new_groups_fn, label):
     e.g. tokenizer.py's `add_tokens()`), which requires computing all of one
     tokenizer's outputs before starting the other's.
     """
+    # Two classes of sample are excluded, both deliberately.
+    #
+    # 1. Text containing Han characters. Since 2026-09-07 the tokenizer
+    #    routes Han-script segments through the Chinese pinyin path whatever
+    #    `lang` is, because the alternative was espeak announcing "chinese
+    #    letter" once per character. Byte-identity with a single-voice
+    #    EspeakTokenizer therefore holds only for non-Han text, and that is
+    #    the point rather than a regression.
+    # 2. Non-empty text that phonemizes to nothing at all -- raw web corpus
+    #    lines like '[' or '-------'. The tokenizer now raises on those
+    #    rather than emitting an empty artifact, so they cannot be
+    #    equivalence cases.
+    from zipvoice.tokenizer.fusion_tokenizer import _has_han
+
+    # `script` says which half of the routing this call is checking.
+    #   "latin": non-Han text only. Han text now goes through the Chinese
+    #            path whatever `lang` is, so it is deliberately no longer
+    #            byte-identical to a single-voice EspeakTokenizer.
+    #   "han":   Han text only. Latin text under lang="zh" now follows the
+    #            Vietnamese fallback rather than EmiliaTokenizer's en-us, so
+    #            it is deliberately no longer Emilia-identical.
+    usable = []
+    for text in samples:
+        if (script == "latin") == _has_han(text):
+            continue
+        if script == "han" and any(c.isascii() and c.isalpha() for c in text):
+            # Mixed Han+Latin. Under lang="zh" a Latin segment follows the
+            # Vietnamese fallback by the author's routing rule, where
+            # EmiliaTokenizer used en-us -- so "Amazon.co.uk" inside Chinese
+            # is deliberately no longer Emilia-identical. What must stay
+            # identical is the Chinese phonemization itself, which Han-only
+            # samples test directly.
+            continue
+        try:
+            old_phones_fn(text)
+            new_groups_fn(text)
+        except ValueError:
+            continue
+        usable.append(text)
+    samples = usable
+
     old_results = [old_phones_fn(text) for text in samples]
     new_group_results = [new_groups_fn(text) for text in samples]
 
@@ -240,6 +283,7 @@ def test_zh_corpus_equivalence():
         lambda text: old.texts_to_tokens([text])[0],
         new.phone_groups,
         "zh",
+        script="han",
     )
 
 
@@ -837,3 +881,202 @@ def test_chinese_reports_no_alignment_rather_than_a_wrong_one():
     artifact = tok.text_to_artifact("你好世界。今天天气很好")
     assert artifact.phone_groups, "Chinese must still produce phones"
     assert artifact.lm_token_groups is None
+
+
+# --- Defects found by external review of the 2026-09-07 redesign ----------
+#
+# All five were confirmed by measurement before being fixed. Each passed the
+# partition and byte-identity checks that were already in place, which is
+# why they need cases of their own: internally consistent bookkeeping is not
+# evidence of correct correspondence.
+
+
+def test_unusual_whitespace_does_not_change_qwen_input():
+    """The lm_token sequence must be the whole-text tokenization, always.
+
+    An earlier version tokenized each block separately and relied on Qwen's
+    BPE being concatenative at whitespace. It is not, for *runs* of
+    whitespace -- the vocabulary contains multi-whitespace tokens -- so
+    "xin  chao" (double space) tokenized differently whole than in pieces,
+    silently rewriting the text Qwen sees. Worse, the verification only ran
+    when the rebuilt text already matched, i.e. never on the inputs that
+    could break it.
+    """
+    tok = _vi_tokenizer_or_skip()
+    hf = tok.lm_tokenizer.hf_tokenizer
+    for text in ("xin chao cac ban", "xin  chao\tcac ban", " xin chao ", "xin\n chao"):
+        artifact = tok.text_to_artifact(text)
+        assert artifact.lm_token_ids[1:] == hf.encode(
+            text, add_special_tokens=False
+        ), f"lm_tokens differ from the whole-text tokenization for {text!r}"
+
+
+def test_every_lm_token_belongs_to_exactly_one_group():
+    """Total coverage, not just in-range indices.
+
+    A minimum-index check permits gaps and duplicates. The original
+    character-overlap rule left standalone space tokens in no group at all
+    (0.30% of lm_tokens, measured), and the Chinese path assigned one token
+    to two groups.
+    """
+    tok = _vi_tokenizer_or_skip()
+    for text in _vi_fixture_samples_or_skip()[:25]:
+        artifact = tok.text_to_artifact(text)
+        assert artifact.lm_token_groups is not None
+        flat = [i for group in artifact.lm_token_groups for i in group]
+        assert flat == list(range(1, len(artifact.lm_token_ids))), (
+            "lm_token_groups must partition every token exactly once, "
+            "excluding the [LANG:xx] tag at index 0"
+        )
+
+
+def test_oov_word_keeps_its_place_in_the_qwen_input():
+    """A word whose phones are all OOV must not vanish from the LM input.
+
+    Dropping it removes context from every token after it. Measured before
+    the fix: "xin chao ban" reached Qwen as "xin ban". The word now merges
+    into a neighbouring group -- the phone side loses what the vocabulary
+    cannot represent, the text side stays whole.
+    """
+    import tempfile
+
+    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
+
+    full = _vi_tokenizer_or_skip()
+    text = "xin chao ban"
+    blocks, words, _ = full._plain_phone_groups_and_spans(text)
+    middle = set(blocks[next(i for i, w in enumerate(words) if w == ["chao"])])
+    vocab = ["_"] + sorted({p for b in blocks for p in b} - middle)
+
+    directory = tempfile.mkdtemp()
+    token_file = os.path.join(directory, "tokens.txt")
+    with open(token_file, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(f"{s}\t{i}" for i, s in enumerate(vocab)))
+
+    tok = FusionTokenizer(
+        token_file=token_file, lang="vi", lm_tokenizer=LanguageModelTokenizer()
+    )
+    artifact = tok.text_to_artifact(text)
+    seen = tok.lm_tokenizer.hf_tokenizer.decode(artifact.lm_token_ids[1:])
+    assert "chao" in seen, f"the OOV word was deleted from Qwen's input: {seen!r}"
+    assert len(artifact.lm_token_groups) == len(artifact.phone_groups)
+
+
+def test_stress_mark_is_not_absorbed_by_the_preceding_group():
+    """Ignoring a symbol when comparing and deciding who owns it are
+    different operations.
+
+    Stress belongs to the syllable it precedes, i.e. the next word. Treating
+    every ignorable symbol as a trailing separator moved it backwards, and
+    both the partition and byte-identity checks still passed.
+    """
+    from zipvoice.tokenizer.fusion_tokenizer import _match_phone_content
+
+    flat = ["a", " ", "ˈ", "b"]
+    end = _match_phone_content(flat, 0, ["a"])
+    assert end == 2, (
+        f"consumed {flat[0:end]} -- the next syllable's stress mark was "
+        f"absorbed into the previous group"
+    )
+    assert _match_phone_content(flat, end, ["ˈ", "b"]) == 4
+
+
+def test_leftover_phones_are_attached_not_asserted_away():
+    """A greedy prefix match can leave phones behind.
+
+    With P("X")=[a], P("Y")=[b] but P("X Y")=[a,b,c], the walk accepts X then
+    Y, exhausts the words, and never tries the span that would consume 'c'.
+    That used to fail the partition assert -- a crash, killing the batch.
+    The words are exhausted, so the leftovers belong to the final block.
+    """
+    import zipvoice.tokenizer.fusion_tokenizer as module
+
+    tok = _vi_tokenizer_or_skip()
+    original = module.FusionTokenizer._word_phones
+    probes = {"X": ["a"], "Y": ["b"], "X Y": ["a", "b", "c"]}
+    module.FusionTokenizer._word_phones = lambda self, w, l: probes.get(w, list(w))
+    try:
+        blocks, words = tok._blocks_from_words(["a", "b", "c"], ["X", "Y"], "vi")
+    finally:
+        module.FusionTokenizer._word_phones = original
+
+    assert [p for b in blocks for p in b] == ["a", "b", "c"]
+    assert [w for b in words for w in b] == ["X", "Y"]
+    assert all(blocks)
+
+
+def test_text_with_no_phones_returns_nothing_rather_than_asserting():
+    """`words=["-"]` with no phones must not crash the partition assert.
+
+    Callers reject non-empty text that yields zero phones upstream, so this
+    is only reachable directly -- but an assert here would be a crash, and
+    the honest answer is "no blocks".
+    """
+    tok = _vi_tokenizer_or_skip()
+    assert tok._blocks_from_words([], ["-"], "vi") == ([], [])
+
+
+# --- Script routing (2026-09-07, author's rule) ---------------------------
+#
+# A Han segment is always phonemized as Chinese whatever `lang` is; a Latin
+# segment follows `lang`, with lang="zh" falling back to Vietnamese. Before
+# this, a VI-primary run rendered 你好 as espeak announcing "chinese letter"
+# once per character.
+
+
+def test_han_is_phonemized_as_chinese_whatever_the_lang():
+    """The rule's first half. Under lang="vi" espeak has no reading for Han
+    characters and announced their character class instead -- measured,
+    "你好世界" became 'tʃˈaɪniːzlˈetə' four times.
+    """
+    tok = _vi_tokenizer_or_skip()
+    artifact = tok.text_to_artifact("Tôi thích 你好世界 rồi")
+    phones = "".join(artifact.phones)
+    assert "n0i2h0ao3" in phones, f"Chinese not routed to pinyin: {phones}"
+    assert "aɪniːz" not in phones, f"espeak announced the character class: {phones}"
+    assert "t̪ˈoj" in phones, "Vietnamese must still be Vietnamese"
+
+
+def test_latin_follows_lang_and_zh_falls_back_to_vietnamese():
+    """The rule's second half, including the author's explicit choice that
+    lang="zh" reads Latin as Vietnamese rather than English. That trades
+    English-inside-Chinese ("Amazon" reads Vietnamese) for consistency with
+    a Vietnamese-primary project; it was raised and confirmed deliberately.
+    """
+    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
+
+    token_file = (
+        "scripts/all/pretrained_model_cache/"
+        "hynt__ZipVoice-Vietnamese-2500h/tokens.txt"
+    )
+    if not os.path.exists(token_file):
+        pytest.skip(f"{token_file} not available")
+
+    lm = LanguageModelTokenizer()
+    text = "你好 phở"
+    phones = {}
+    for lang in ("vi", "en", "zh"):
+        tok = FusionTokenizer(token_file=token_file, lang=lang, lm_tokenizer=lm)
+        phones[lang] = "".join(tok.text_to_artifact(text).phones)
+
+    # Chinese identical in all three -- it never follows `lang`.
+    assert "n0i2h0ao3" in phones["vi"]
+    assert "n0i2h0ao3" in phones["en"]
+    assert "n0i2h0ao3" in phones["zh"]
+    # Latin follows lang: en spells the Vietnamese word out, vi does not.
+    assert phones["vi"] != phones["en"]
+    # lang="zh" falls back to the Vietnamese voice for Latin.
+    assert phones["zh"] == phones["vi"]
+
+
+def test_mixed_script_utterance_aligns_completely():
+    """Routing must not cost alignment: every lm_token still belongs to
+    exactly one group, across a three-language utterance."""
+    tok = _vi_tokenizer_or_skip()
+    text = "Tôi thích ăn phở và 你好世界 cùng machine learning"
+    artifact = tok.text_to_artifact(text)
+    assert artifact.lm_token_groups is not None
+    flat = [i for group in artifact.lm_token_groups for i in group]
+    assert flat == list(range(1, len(artifact.lm_token_ids)))
+    assert len(artifact.lm_token_groups) == len(artifact.phone_groups)
+    assert all(artifact.lm_token_groups)

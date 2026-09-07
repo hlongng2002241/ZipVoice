@@ -168,6 +168,40 @@ is emitted.
 limit, it is the whole utterance -- one coarse group, not a dropped
 utterance.
 
+## Script routing (added after the block construction)
+
+Group construction alone does not decide *which phonemizer* a span goes to,
+and that turned out to be a separate hole: with `lang="vi"`, espeak has no
+reading for Han characters and announced their class instead -- `你好世界`
+became `tʃˈaɪniːzlˈetə` four times, "chinese letter" per character. The
+utterance aligned perfectly and was nonsense, which is worth noting on its
+own: **alignment coverage says nothing about whether the phones are right.**
+
+The rule, per the author:
+
+- a **Han** segment is phonemized as Chinese whatever `lang` says;
+- a **Latin** segment follows `lang`, and `lang="zh"` falls back to
+  Vietnamese.
+
+"Latin" is a script class, not a language: `EmiliaTokenizer.get_segment`
+only distinguishes Han from not-Han, so `"Tôi thích ăn phở"`,
+`"machine learning"` and `"Amazon.co.uk"` are all one bucket and share a
+voice. That is workable because espeak-vi reads embedded English acceptably
+(`məʃˈiːn lˈɜːnɪŋ`), so a Vietnamese-primary instance handles all three
+languages.
+
+Text containing no Han characters skips routing entirely, so the 100% of
+this corpus that is VI/EN keeps byte-identical behaviour.
+
+**Accepted cost, raised and confirmed deliberately:** under `lang="zh"`,
+embedded English now reads with Vietnamese phonology -- `Amazon.co.uk`
+becomes `ˈaməzən tʃˈəɜm kˈɔ` where `EmiliaTokenizer` gave
+`ˈæmɐzˌɑːn dˈɑːt`. The author chose consistency with a Vietnamese-primary
+project over English-inside-Chinese. Consequently the sprint 000 byte-
+identity requirement now holds for **non-Han text only**, and for
+`lang="zh"` only on Han-only samples; the equivalence tests are scoped
+accordingly rather than weakened.
+
 ## Consequences
 
 **Better:**
