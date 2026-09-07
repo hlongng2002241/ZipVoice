@@ -128,20 +128,28 @@ def _flatten_espeak_output(sentences) -> List[str]:
     return reduce(lambda x, y: x + y, sentences, [])
 
 
-#: Phone symbols after which espeak may start a new word *without* emitting a
-#: separating ' '. See `_split_into_groups`.
+#: Phone symbols that end a group in addition to the literal ' '.
 #:
-#: ',' is deliberately absent, and not because breaking on it would double-
-#: break (the lookahead guard already prevents that): espeak emits a space
-#: after a comma, so the space rule already closes the group exactly once.
-#: Verified -- "alpha, beta" phonemizes to [... 'ə', ',', ' ', 'b', ...].
+#: CORRECTION (2026-09-07). The original comment here claimed espeak "emits
+#: no space after a sentence-final period", with a voice-dependent story
+#: about espeak-vi versus espeak-en-us. That is not the mechanism.
+#: `phonemize_espeak` returns ONE LIST PER SENTENCE -- for
+#: "mọi người. Rất nhiều" it returns
+#: [['m','ˌ','ɔ','6','j',' ','ŋ','ˈ','y','ə','2','j','.'],
+#:  ['z','ˈ','ə','ɜ','t','̪',...]] -- and the boundary is lost by
+#: `_flatten_espeak_output`, which joins them with `reduce(x + y)` and no
+#: separator. That flattening is required: upstream `EspeakTokenizer.g2p`
+#: (tokenizer.py:142) does exactly the same, and the source checkpoint was
+#: trained on the concatenated sequence, so the phones must stay as they
+#: are.
 #:
-#: Note this behaviour is **voice-dependent**, which is why the sentence-
-#: boundary bug hit Vietnamese and not English: espeak-vi emits '.' with no
-#: following space ("nguoi. Rat" -> [... 'j', '.', 'z', ...]), while
-#: espeak-en-us drops the '.' entirely and emits a space instead
-#: ("beta. gamma" -> [... 'ə', ' ', 'ɡ', ...]). Adding a voice must therefore
-#: re-check this set against that voice's real output rather than assume it.
+#: What was wrong was rebuilding the boundary by guessing at punctuation
+#: instead of reading it off the sentence list the phonemizer already
+#: returned. This set is therefore a workaround for information this module
+#: discards, and should be replaced by carrying the sentence offsets through
+#: `_flatten_espeak_output`. Kept for now because the block matcher recovers
+#: these boundaries anyway (alignment measures 100%), so removing it is a
+#: simplification rather than a fix, and it would change grouping mid-run.
 _SENTENCE_END_PHONES = frozenset(".!?;:")
 
 

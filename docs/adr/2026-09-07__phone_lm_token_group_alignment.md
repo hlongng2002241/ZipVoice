@@ -53,11 +53,34 @@ to whitespace:
 
 | espeak behaviour | example | effect on the count |
 |---|---|---|
-| no separator after a sentence period | `"người. Rất"` -> `... j . z ...` | one group short per sentence |
+| sentence boundary lost when flattening\* | `"người. Rất"` -> `... j . z ...` | one group short per sentence |
 | expands one token into several words | `"1997"` -> five spoken words | several groups long |
 | fuses adjacent words | `"book of the"` -> `ɒvðə` | one group short |
 | drops punctuation-only tokens | `"a - b"` | one group short |
 | context-dependent pronunciation | `the` = `tˈɛ` alone, `ðə` in an English run | content mismatch |
+
+\* **Correction (2026-09-07).** Earlier revisions of this ADR said espeak
+"emits no space after a sentence-final period", with a voice-dependent story
+about espeak-vi versus espeak-en-us. That is not the mechanism.
+`phonemize_espeak` returns **one list per sentence**; the boundary is
+destroyed by `_flatten_espeak_output`, which joins them with `reduce(x + y)`
+and no separator. That flattening is required -- upstream
+`EspeakTokenizer.g2p` (tokenizer.py:142) does the same, and the source
+checkpoint was trained on the concatenated sequence -- but the boundary was
+available and got discarded, then guessed back from punctuation. The
+`.!?;:` set is a workaround for information this code threw away, not a
+description of espeak.
+
+`ŋˈyə2j.zˈəɜt̪` was also used as an example of cross-word phonology that
+per-word phonemization cannot reproduce. It is not: those are two
+independent sentences concatenated, with no phonological interaction. The
+genuine example is `of the` -> `ɒvðə` **within** one sentence, which is what
+actually motivates whole-utterance phonemization and block widening.
+
+The code is unaffected -- the block matcher recovers these boundaries either
+way, and alignment measures 100% -- so replacing the punctuation set with
+the sentence offsets is a simplification, not a correctness fix.
+
 
 ## The mistake
 
