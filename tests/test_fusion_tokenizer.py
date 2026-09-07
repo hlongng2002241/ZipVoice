@@ -578,25 +578,52 @@ def test_flatten_reports_where_sentences_joined():
     assert flat[ends[0] - 1] == "." and flat[ends[0]] != " "
 
 
-def test_blocks_never_span_a_sentence_boundary():
-    """Two sentences are phonemized independently, so a block covering both
-    would merge units with no phonological relationship. Sentence ends are
-    hard cuts, and block widening must not cross them.
+def test_sentence_end_bounds_trailing_attachment():
+    """A separator emitted after a sentence end belongs to the NEXT sentence.
+
+    Trailing-separator attachment must stop there, or a block absorbs the
+    following sentence's leading whitespace. This is the only thing sentence
+    metadata is used for.
+
+    It is deliberately NOT a group boundary. Two sentences being phonemized
+    independently means widening across one is unnecessary to recover
+    pronunciation context; it does not make a shared conditioning group
+    invalid, and a conditioning group is not required to be a phonological
+    unit. Enforcing it as a hard cut made results strictly worse -- a
+    rejected match fell through to the whole-remainder fallback, producing a
+    coarser block that crossed the boundary anyway.
     """
+    from zipvoice.tokenizer.fusion_tokenizer import _match_phone_content
+
+    flat = ["a", ".", " ", "b"]
+    # sentence 1 ends at index 2, so the space at index 2 is sentence 2's
+    assert _match_phone_content(flat, 0, ["a", "."], limit=2) == 2
+    # without the limit the space is absorbed into the preceding block
+    assert _match_phone_content(flat, 0, ["a", "."]) == 3
+
+
+def test_sentence_metadata_never_makes_blocks_coarser(monkeypatch):
+    """Supplying sentence ends must never produce a worse segmentation than
+    omitting them. The first attempt did exactly that.
+    """
+    import zipvoice.tokenizer.fusion_tokenizer as module
+
     tok = _vi_tokenizer_or_skip()
-    text = "mọi người. Rất nhiều công ty"
-    flat, ends = tok._espeak_flat_phones(text, "vi")
-    blocks, words = tok._blocks_from_words(
-        flat, text.split(), "vi", hard_cuts=frozenset(ends)
+    probes = {"X.": ["a", "."], "Y": ["b"], "X. Y": ["a", ".", "b"]}
+    monkeypatch.setattr(
+        module.FusionTokenizer,
+        "_word_phones",
+        lambda self, w, l: probes.get(w, list(w)),
     )
-    boundary = ends[0]
-    running = 0
-    for block in blocks:
-        assert not (running < boundary < running + len(block)), (
-            f"a block spans the sentence boundary at {boundary}"
-        )
-        running += len(block)
-    assert running == len(flat)
+    flat = ["a", ".", " ", "b"]
+    without = tok._blocks_from_words(flat, ["X.", "Y"], "vi")[0]
+    with_ends = tok._blocks_from_words(
+        flat, ["X.", "Y"], "vi", sentence_ends=[2, 4]
+    )[0]
+    assert len(with_ends) >= len(without), (
+        f"sentence metadata coarsened the result: {without} -> {with_ends}"
+    )
+    assert [p for b in with_ends for p in b] == flat
 
 
 def test_split_into_groups_flattening_is_lossless():

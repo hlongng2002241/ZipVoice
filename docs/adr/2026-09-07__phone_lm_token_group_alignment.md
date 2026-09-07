@@ -77,11 +77,25 @@ independent sentences concatenated, with no phonological interaction. The
 genuine example is `of the` -> `ɒvðə` **within** one sentence, which is what
 actually motivates whole-utterance phonemization and block widening.
 
-**Fixed.** `_flatten_espeak_output` now returns the sentence-end offsets
-alongside the concatenated phones, and `_blocks_from_words` treats them as
-**hard cuts**: a block may not span a sentence boundary. Two sentences are
-phonemized independently, so merging them was always wrong -- previously
-possible precisely because the information had been discarded. The
+**Fixed, then narrowed.** `_flatten_espeak_output` returns the sentence-end
+offsets alongside the concatenated phones. The first attempt then treated
+them as **hard cuts** -- a block may not span a sentence boundary -- on the
+reasoning that two independently phonemized sentences must never share a
+group.
+
+That reasoning does not hold, and review rejected it. Independent
+phonemization means widening across a boundary is *unnecessary* to recover
+pronunciation context; it does not make a shared conditioning group invalid.
+A conditioning group is not required to be a phonological unit -- requiring
+that is exactly the restriction this ADR removed, reintroduced under a new
+name. It was also strictly harmful in practice: a rejected match fell
+through to the whole-remainder fallback, producing a *coarser* block that
+crossed the boundary anyway, and two other emission paths ignored the cuts
+entirely.
+
+The surviving, justified use is narrow: a separator emitted after a sentence
+end belongs to the **next** sentence, so trailing-separator attachment stops
+there. That is a matching-correctness point, not a grouping policy. The
 punctuation set survives under its real name, `_IGNORABLE_PUNCTUATION`,
 whose only job is to let a content match skip punctuation; it no longer
 pretends to detect sentences, and `_split_into_groups` is back to splitting

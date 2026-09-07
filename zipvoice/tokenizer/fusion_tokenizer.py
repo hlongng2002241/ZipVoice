@@ -68,7 +68,7 @@ this module never computes it itself. Empty (``[]``) when no
 import logging
 from dataclasses import dataclass, field
 from functools import reduce
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import jieba
 from pypinyin import Style, lazy_pinyin
@@ -265,8 +265,27 @@ def _has_han(text: str) -> bool:
     return any(emilia.is_chinese(ch) for ch in text)
 
 
+def _next_after(sentence_ends: Sequence[int], cursor: int) -> Optional[int]:
+    """First sentence end strictly greater than `cursor`, or None.
+
+    Used only to bound trailing-separator attachment. Sentence boundaries do
+    NOT force group boundaries: two sentences being phonemized independently
+    means widening across one is unnecessary to recover pronunciation
+    context, not that a shared conditioning group is invalid. A conditioning
+    group is not required to be a phonological unit -- requiring that is the
+    restriction this design removed, and briefly reintroduced. Enforcing it
+    also made results strictly worse: a rejected match fell through to the
+    whole-remainder fallback, which produced a COARSER block that crossed
+    the boundary anyway.
+    """
+    for end in sentence_ends:
+        if end > cursor:
+            return end
+    return None
+
+
 def _match_phone_content(
-    flat: List[str], cursor: int, wanted: List[str]
+    flat: List[str], cursor: int, wanted: List[str], limit: Optional[int] = None
 ) -> Optional[int]:
     """Consume `wanted`'s phone content from `flat` at `cursor`, ignoring
     `_IGNORED_WHEN_MATCHING` on both sides. Returns the new cursor, or None
@@ -288,7 +307,13 @@ def _match_phone_content(
         matched += 1
     if matched != len(content):
         return None
-    while i < len(flat) and flat[i] in _TRAILING_ATTACHABLE:
+    # Trailing separators are absorbed, but never past `limit`. That is
+    # the one place a sentence boundary legitimately constrains matching: a
+    # separator after a sentence end was emitted as part of the NEXT
+    # sentence, so consuming it would pull the next sentence's leading
+    # whitespace into this block.
+    stop = len(flat) if limit is None else min(len(flat), limit)
+    while i < stop and flat[i] in _TRAILING_ATTACHABLE:
         i += 1
     return i
 
@@ -874,7 +899,7 @@ class FusionTokenizer:
                     words = [seg_canonical[a:b] for a, b in spans]
                     groups, word_groups = self._blocks_from_words(
                         flat, words, latin_locale,
-                        hard_cuts=frozenset(seg_sentence_ends),
+                        sentence_ends=seg_sentence_ends,
                     )
                     consumed = 0
                     for group, block_words in zip(groups, word_groups):
@@ -956,7 +981,7 @@ class FusionTokenizer:
         flat, sentence_ends = self._espeak_flat_phones(canonical_text, locale)
         words = canonical_text.split()
         phone_blocks, word_blocks = self._blocks_from_words(
-            flat, words, locale, hard_cuts=frozenset(sentence_ends)
+            flat, words, locale, sentence_ends=sentence_ends
         )
         return phone_blocks, word_blocks, canonical_text
 
@@ -965,7 +990,7 @@ class FusionTokenizer:
         flat: List[str],
         words: List[str],
         locale: str,
-        hard_cuts: frozenset = frozenset(),
+        sentence_ends: Sequence[int] = (),
     ) -> Tuple[List[List[str]], List[List[str]]]:
         """Cut `flat` into blocks, one per group of consecutive `words`.
 
@@ -996,17 +1021,9 @@ class FusionTokenizer:
                 upper = min(i + _MAX_BLOCK_WORDS, len(words))
                 for j in range(max(i + 1, must_cover + 1), upper + 1):
                     probe = self._word_phones(" ".join(words[i:j]), locale)
-                    end = _match_phone_content(flat, cursor, probe)
-                    # espeak's own sentence boundaries are known-true cuts.
-                    # Two sentences are phonemized independently, so a block
-                    # spanning one would merge units with no phonological
-                    # relationship -- always wrong, and previously possible
-                    # because this information was thrown away and guessed
-                    # back from punctuation instead.
-                    if end is not None and any(
-                        cursor < cut < end for cut in hard_cuts
-                    ):
-                        end = None
+                    end = _match_phone_content(
+                        flat, cursor, probe, limit=_next_after(sentence_ends, cursor)
+                    )
                     # `end == cursor` means the words consumed no phones at
                     # all -- a punctuation-only token like "-" that espeak
                     # renders as nothing. Emitting it as its own group would
@@ -1021,8 +1038,6 @@ class FusionTokenizer:
                         break
                 if emitted or not phone_blocks:
                     break
-                if cursor in hard_cuts:
-                    break  # never widen backwards across a sentence boundary
                 # Absorb the previous block and retry with more left context.
                 prev_phones = phone_blocks.pop()
                 prev_words = word_blocks.pop()
@@ -1053,9 +1068,11 @@ class FusionTokenizer:
         # but it is heuristic assignment, NOT verified correspondence: the
         # leftover is evidence that an earlier cut was wrong, and appending
         # it does not establish which. The honest reading is that this keeps
-        # a contradiction from crashing the batch, while the boundary
-        # coarsening in `_lm_tokens_and_groups` is what actually removes
-        # unusable cuts.
+        # a contradiction from crashing the batch. Note the boundary
+        # coarsening in `_lm_tokens_and_groups` does NOT repair this: it can
+        # only remove cuts an lm_token contradicts. If X and Y each own their
+        # own token, nothing there flags the uncertain assignment, so a
+        # successful grouping is not evidence the phone cut was right.
         if cursor < len(flat) and phone_blocks:
             phone_blocks[-1] = phone_blocks[-1] + flat[cursor:]
         elif cursor < len(flat):
