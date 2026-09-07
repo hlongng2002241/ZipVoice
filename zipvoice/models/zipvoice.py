@@ -474,24 +474,39 @@ class ZipVoice(nn.Module):
         )  # (B, T, F)
         return text_condition, padding_mask
 
-    def _assert_inference_supported(self) -> None:
-        """The fusion frontend's inference-time composition contract is
-        deliberately still open (see sprint 003's "Deferred, not decided
-        here"): how a prompt artifact and a target artifact combine without
-        putting two `[LANG:xx]` tags in one causal Qwen context, and how
-        long-text chunking splits without cutting a phone/`lm_token` group in
-        half. The author chose to settle that empirically once the model
-        exists, so rather than guess a contract here and have generation
-        silently produce subtly-misaligned conditioning, these paths refuse
-        to run under `text_frontend="fusion"` until it's decided.
+    def _require_inference_fusion_fields(
+        self,
+        phone_groups,
+        qwen_group_features,
+    ) -> None:
+        """Under `text_frontend="fusion"`, inference must be given the fusion
+        fields for the **already-composed** prompt+target sequence.
+
+        Sprint 003 left this path raising NotImplementedError because the
+        prompt/target composition contract was undecided. It is decided now
+        (`fusion_tokenizer.compose_artifacts`): only the prompt carries the
+        `[LANG:xx]` tag, matching what the pre-fusion multilingual inference
+        path already did, and matching what training saw -- one utterance,
+        one leading tag.
+
+        What remains worth guarding is the same thing the training path
+        guards: a fusion-configured model handed no fusion fields would
+        silently fall back to the phone embedding and generate audio from a
+        *different architecture* than the checkpoint was trained as, with
+        nothing to indicate it. That is how a whole training run went ~93%
+        phone-only unnoticed. Missing fields are a caller error, not a
+        fallback.
         """
-        if self.text_frontend == TEXT_FRONTEND_FUSION:
-            raise NotImplementedError(
-                "Inference-time text composition is not implemented for "
-                "text_frontend='fusion' yet -- the prompt/target artifact "
-                "composition and group-preserving chunking contract is an "
-                "open decision (see sprint 003's Approach, 'Deferred, not "
-                "decided here'). Training (forward/forward_text_train) works."
+        if self.text_frontend != TEXT_FRONTEND_FUSION:
+            return
+        if phone_groups is None or qwen_group_features is None:
+            raise ValueError(
+                "text_frontend='fusion' requires phone_groups and "
+                "qwen_group_features at inference, for the composed "
+                "prompt+target sequence (see "
+                "zipvoice.tokenizer.fusion_tokenizer.compose_artifacts and "
+                "TruncatedQwenExtractor.pooled_groups). Without them the "
+                "model would silently generate as a phone-only model."
             )
 
     def forward_text_train(
@@ -528,11 +543,17 @@ class ZipVoice(nn.Module):
         prompt_features_lens: torch.Tensor,
         zero_duration_mask: Optional[List[List[bool]]] = None,
         prompt_zero_duration_mask: Optional[List[List[bool]]] = None,
+        phone_groups: Optional[List[Optional[List[List[int]]]]] = None,
+        qwen_group_features: Optional[torch.Tensor] = None,
+        qwen_group_valid: Optional[torch.Tensor] = None,
     ):
         """
         Process text for inference, given text tokens, real feature lengths and prompts.
+
+        `phone_groups`/`qwen_group_features`/`qwen_group_valid` describe the
+        **concatenated** prompt+target sequence, matching `cat_tokens` below.
         """
-        self._assert_inference_supported()
+        self._require_inference_fusion_fields(phone_groups, qwen_group_features)
         cat_zero_duration_mask = _concat_zero_duration_masks(
             prompt_zero_duration_mask, zero_duration_mask, prompt_tokens, tokens
         )
@@ -540,7 +561,12 @@ class ZipVoice(nn.Module):
             prompt_token + token for prompt_token, token in zip(prompt_tokens, tokens)
         ]
         features_lens = prompt_features_lens + features_lens
-        embed, tokens_lens = self.forward_text_embed(tokens)
+        embed, tokens_lens = self.forward_text_embed(
+            tokens,
+            phone_groups=phone_groups,
+            qwen_group_features=qwen_group_features,
+            qwen_group_valid=qwen_group_valid,
+        )
         text_condition, padding_mask = self.forward_text_condition(
             embed, tokens_lens, features_lens, zero_duration_mask=cat_zero_duration_mask
         )
@@ -554,12 +580,18 @@ class ZipVoice(nn.Module):
         speed: float,
         zero_duration_mask: Optional[List[List[bool]]] = None,
         prompt_zero_duration_mask: Optional[List[List[bool]]] = None,
+        phone_groups: Optional[List[Optional[List[List[int]]]]] = None,
+        qwen_group_features: Optional[torch.Tensor] = None,
+        qwen_group_valid: Optional[torch.Tensor] = None,
     ):
         """
         Process text for inference, given text tokens and prompts,
         feature lengths are predicted with the ratio of token numbers.
+
+        `phone_groups`/`qwen_group_features`/`qwen_group_valid` describe the
+        **concatenated** prompt+target sequence, matching `cat_tokens` below.
         """
-        self._assert_inference_supported()
+        self._require_inference_fusion_fields(phone_groups, qwen_group_features)
         device = (
             self.device if isinstance(self, DDP) else next(self.parameters()).device
         )
@@ -583,7 +615,12 @@ class ZipVoice(nn.Module):
             device=device,
         )
 
-        cat_embed, cat_tokens_lens = self.forward_text_embed(cat_tokens)
+        cat_embed, cat_tokens_lens = self.forward_text_embed(
+            cat_tokens,
+            phone_groups=phone_groups,
+            qwen_group_features=qwen_group_features,
+            qwen_group_valid=qwen_group_valid,
+        )
 
         features_lens = prompt_features_lens + torch.ceil(
             (prompt_features_lens / prompt_tokens_lens * tokens_lens / speed)
@@ -683,6 +720,9 @@ class ZipVoice(nn.Module):
         guidance_scale: float = 0.5,
         zero_duration_mask: Optional[List[List[bool]]] = None,
         prompt_zero_duration_mask: Optional[List[List[bool]]] = None,
+        phone_groups: Optional[List[Optional[List[List[int]]]]] = None,
+        qwen_group_features: Optional[torch.Tensor] = None,
+        qwen_group_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Generate acoustic features, given text tokens, prompts feature
@@ -705,6 +745,12 @@ class ZipVoice(nn.Module):
                 receive zero acoustic duration, matching training. None
                 (default) means `tokens` has no control tokens.
             prompt_zero_duration_mask: same, for `prompt_tokens`.
+            phone_groups / qwen_group_features / qwen_group_valid: required
+                under text_frontend="fusion", and describing the
+                **concatenated** prompt+target sequence -- build them with
+                `fusion_tokenizer.compose_artifacts` and
+                `TruncatedQwenExtractor.pooled_groups`, not from the target
+                alone.
         """
 
         assert duration in ["real", "predict"]
@@ -720,6 +766,9 @@ class ZipVoice(nn.Module):
                 speed=speed,
                 zero_duration_mask=zero_duration_mask,
                 prompt_zero_duration_mask=prompt_zero_duration_mask,
+                phone_groups=phone_groups,
+                qwen_group_features=qwen_group_features,
+                qwen_group_valid=qwen_group_valid,
             )
         else:
             assert features_lens is not None
@@ -730,6 +779,9 @@ class ZipVoice(nn.Module):
                 prompt_features_lens=prompt_features_lens,
                 zero_duration_mask=zero_duration_mask,
                 prompt_zero_duration_mask=prompt_zero_duration_mask,
+                phone_groups=phone_groups,
+                qwen_group_features=qwen_group_features,
+                qwen_group_valid=qwen_group_valid,
             )
         batch_size, num_frames, _ = text_condition.shape
 

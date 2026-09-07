@@ -183,27 +183,105 @@ def test_fusion_requires_phone_groups():
         model.forward_text_embed(tokens, None, qwen, valid)
 
 
-def test_inference_paths_refuse_until_the_contract_is_decided():
-    """Generation must not silently invent a prompt/target composition
-    contract while that decision is still open -- see sprint 003's
-    "Deferred, not decided here".
+def test_inference_refuses_fusion_without_the_composed_fields():
+    """Sprint 003's prompt/target composition contract is now decided
+    (`fusion_tokenizer.compose_artifacts`: only the prompt carries the
+    `[LANG:xx]` tag), so these paths run -- but only when handed the fusion
+    fields for the composed sequence.
+
+    Handed none, a fusion-configured model would silently generate as a
+    phone-only model, from a checkpoint trained as something else, with
+    nothing to indicate it. That is the same silent-degradation shape that
+    let a whole training run go ~93% phone-only, so it is a loud error.
     """
     model = _model()
     tokens, _, _, _ = _batch()
-    with pytest.raises(NotImplementedError, match="composition"):
-        model.forward_text_inference_ratio_duration(
+    for call in (
+        lambda **kw: model.forward_text_inference_ratio_duration(
             tokens=tokens,
             prompt_tokens=[[1, 2], [3, 4]],
             prompt_features_lens=torch.tensor([10, 10]),
             speed=1.0,
-        )
-    with pytest.raises(NotImplementedError, match="composition"):
-        model.forward_text_inference_gt_duration(
+            **kw,
+        ),
+        lambda **kw: model.forward_text_inference_gt_duration(
             tokens=tokens,
             features_lens=torch.tensor([20, 20]),
             prompt_tokens=[[1, 2], [3, 4]],
             prompt_features_lens=torch.tensor([10, 10]),
+            **kw,
+        ),
+    ):
+        with pytest.raises(ValueError, match="requires phone_groups"):
+            call()
+
+
+def test_compose_artifacts_keeps_one_lang_tag_and_shifts_indices():
+    """The composition contract itself.
+
+    `model.sample()` concatenates prompt+target into one sequence, and
+    training only ever saw one utterance with one leading tag -- so the
+    target's own `[LANG:xx]` is dropped, and its group indices shift past
+    the prompt's on both sides. This mirrors what the pre-fusion
+    multilingual inference path already did with the raw text.
+    """
+    from zipvoice.tokenizer.fusion_tokenizer import (
+        FusionTokenizerArtifact,
+        compose_artifacts,
+    )
+
+    def artifact(phones, lm, groups):
+        return FusionTokenizerArtifact(
+            language="vi",
+            phones=[str(p) for p in phones],
+            phone_ids=list(phones),
+            phone_groups=groups["phone"],
+            lm_tokens=[f"t{i}" for i in lm],
+            lm_token_ids=list(lm),
+            lm_token_groups=groups["lm"],
+            zero_duration_mask=[i == 0 for i in range(len(lm))],
         )
+
+    # tag at lm index 0, two words
+    prompt = artifact([1, 2, 3], [900, 10, 11], {"phone": [[0], [1, 2]], "lm": [[1], [2]]})
+    target = artifact([4, 5], [900, 20, 21], {"phone": [[0], [1]], "lm": [[1], [2]]})
+    c = compose_artifacts(prompt, target)
+
+    assert c.phone_ids == [1, 2, 3, 4, 5]
+    assert c.phone_groups == [[0], [1, 2], [3], [4]]
+    # target's tag dropped: 3 + 3 - 1 = 5 lm tokens, exactly one tag
+    assert c.lm_token_ids == [900, 10, 11, 20, 21]
+    assert sum(1 for t in c.lm_token_ids if t == 900) == 1
+    # target lm index 1 -> 3 + 1 - 1 = 3
+    assert c.lm_token_groups == [[1], [2], [3], [4]]
+    assert len(c.lm_token_groups) == len(c.phone_groups)
+    assert len(c.zero_duration_mask) == len(c.lm_token_ids)
+
+
+def test_compose_artifacts_falls_back_when_either_side_failed():
+    """Alignment failure on either side collapses to phone-only. Partial
+    recovery would condition the target on a prompt whose group structure is
+    unknown -- a different premise than training.
+    """
+    from zipvoice.tokenizer.fusion_tokenizer import (
+        FusionTokenizerArtifact,
+        compose_artifacts,
+    )
+
+    ok = FusionTokenizerArtifact(
+        language="vi", phones=["a"], phone_ids=[1], phone_groups=[[0]],
+        lm_tokens=["tag", "x"], lm_token_ids=[900, 10],
+        lm_token_groups=[[1]], zero_duration_mask=[True, False],
+    )
+    failed = FusionTokenizerArtifact(
+        language="vi", phones=["b"], phone_ids=[2], phone_groups=[[0]],
+        lm_tokens=["tag", "y"], lm_token_ids=[900, 20],
+        lm_token_groups=None, zero_duration_mask=[True, False],
+    )
+    assert compose_artifacts(ok, failed).lm_token_groups is None
+    assert compose_artifacts(failed, ok).lm_token_groups is None
+    # phones still concatenate normally in the fallback
+    assert compose_artifacts(ok, failed).phone_ids == [1, 2]
 
 
 def test_fusion_rejects_pretrained_embed_source():
