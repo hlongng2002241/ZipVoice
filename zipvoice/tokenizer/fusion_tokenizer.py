@@ -121,18 +121,61 @@ def _flatten_espeak_output(sentences) -> List[str]:
     return reduce(lambda x, y: x + y, sentences, [])
 
 
+#: Phone symbols after which espeak may start a new word *without* emitting a
+#: separating ' '. See `_split_into_groups`.
+#:
+#: ',' is deliberately absent, and not because breaking on it would double-
+#: break (the lookahead guard already prevents that): espeak emits a space
+#: after a comma, so the space rule already closes the group exactly once.
+#: Verified -- "alpha, beta" phonemizes to [... 'ə', ',', ' ', 'b', ...].
+#:
+#: Note this behaviour is **voice-dependent**, which is why the sentence-
+#: boundary bug hit Vietnamese and not English: espeak-vi emits '.' with no
+#: following space ("nguoi. Rat" -> [... 'j', '.', 'z', ...]), while
+#: espeak-en-us drops the '.' entirely and emits a space instead
+#: ("beta. gamma" -> [... 'ə', ' ', 'ɡ', ...]). Adding a voice must therefore
+#: re-check this set against that voice's real output rather than assume it.
+_SENTENCE_END_PHONES = frozenset(".!?;:")
+
+
 def _split_into_groups(flat_phones: List[str]) -> List[List[str]]:
-    """Split a flat phone sequence into word-equivalent groups on the
-    literal ' ' phone symbol (which `phonemize_espeak` emits as an ordinary
-    element -- confirmed empirically). The space itself is kept (not
-    dropped) as the trailing element of the group before it, so flattening
-    the returned groups reproduces `flat_phones` exactly, unchanged.
+    """Split a flat phone sequence into word-equivalent groups.
+
+    Groups break on the literal ' ' phone symbol (which `phonemize_espeak`
+    emits as an ordinary element -- confirmed empirically), and *also* after
+    sentence-final punctuation. The space itself is kept (not dropped) as the
+    trailing element of the group before it, so flattening the returned
+    groups reproduces `flat_phones` exactly, unchanged.
+
+    The sentence-final rule exists because espeak emits **no space after a
+    sentence-final period**: "nguoi. Rat" phonemizes to `... j . z ...` with
+    no ' ' between, so a space-only split silently merges the last word of
+    one sentence with the first word of the next. Every internal sentence
+    boundary then costs exactly one group, the group count stops matching
+    the whitespace-word count, and `text_to_artifact` gives up and returns
+    `lm_token_groups=None` for the whole utterance -- disabling the Qwen
+    branch for it entirely.
+
+    That was not a corner case. Measured on this project's training corpus
+    before the fix, alignment succeeded for only **7.3%** of utterances
+    (2.7% of those over 50 words, which is most of the corpus at a 28.9s
+    mean), because long utterances contain many sentences. The first
+    training run was therefore ~93% phone-only.
+
+    A break is suppressed when a ' ' already follows the punctuation, so
+    that case still closes the group exactly once and no group is emitted
+    that consists solely of a separator.
     """
     groups: List[List[str]] = []
     current: List[str] = []
-    for symbol in flat_phones:
+    last = len(flat_phones) - 1
+    for i, symbol in enumerate(flat_phones):
         current.append(symbol)
-        if symbol == " ":
+        if symbol == " " or (
+            symbol in _SENTENCE_END_PHONES
+            and i < last
+            and flat_phones[i + 1] != " "
+        ):
             groups.append(current)
             current = []
     if current:
@@ -541,10 +584,31 @@ class FusionTokenizer:
     def _espeak_flat_phones(self, text: str, locale: str) -> List[str]:
         try:
             sentences = phonemize_espeak(text, locale)
-            return _flatten_espeak_output(sentences)
         except Exception as ex:
-            logging.warning(f"Tokenization of {locale} text failed: {ex}")
-            return []
+            # Deliberately not swallowed into an empty list. Returning []
+            # here makes `groups` and `spans` BOTH empty, so the alignment
+            # check downstream sees equal lengths with no missing spans and
+            # returns `lm_token_groups=[]` -- a phonemizer crash then looks
+            # exactly like a successful alignment of an utterance that
+            # happens to have no words. The empty phone sequence goes on to
+            # fail much later in duration allocation
+            # (`assert n_acoustic_tokens > 0`), far from the cause and with
+            # the original exception long gone. Raise with the reason
+            # attached instead.
+            raise ValueError(
+                f"phonemization failed for locale {locale!r} on text "
+                f"{text[:80]!r}: {ex}"
+            ) from ex
+        phones = _flatten_espeak_output(sentences)
+        if text.strip() and not phones:
+            raise ValueError(
+                f"phonemization of locale {locale!r} produced no phones for "
+                f"non-empty text {text[:80]!r}. An empty phone sequence is "
+                f"not a usable training sample, and passes the alignment "
+                f"check silently because empty groups trivially match empty "
+                f"spans."
+            )
+        return phones
 
     # -- internal: Emilia-routed path (zh), matching
     # EmiliaTokenizer.texts_to_tokens() when use_normalizer is True

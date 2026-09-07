@@ -592,6 +592,63 @@ run log); multi-GPU execution (the DDP path was read, never exercised);
 corpus-wide alignment accuracy, convergence or speech quality; and the
 deferred inference path, which still raises `NotImplementedError`.
 
+## The sentence-boundary incident, and the known gaps it left (2026-09-07)
+
+The first training run (sprint 004's run log) was stopped after ~1.5 epochs
+on discovering it had been **~93% phone-only**. `_split_into_groups` broke
+word groups only on the literal `' '` phone, but espeak-vi emits no space
+after a sentence-final period, so the last word of every sentence merged
+with the first of the next. The group count then no longer matched the
+whitespace-word count and `text_to_artifact` returned
+`lm_token_groups=None` -- a legal, documented fallback meaning "phone-only
+for this utterance". Vietnamese alignment was 7.3%; it is now 97.2%.
+
+The bug is fixed (`0ba3f94`). What is worth recording here is why it
+survived, because that generalizes:
+
+- The only positive alignment test used a **single-sentence** string, so it
+  was structurally incapable of failing.
+- The tests that used real multi-sentence corpus text compared **only
+  phones**, which the bug does not affect -- the one test with realistic
+  data checked the one property that could not break.
+- The fallback is **legal**, so no correctness assertion could fail when it
+  fired. Its only symptom was its *frequency*, which nothing measured.
+- Even the first replacement regression test was vacuous: it used English,
+  and espeak-en-us drops the period and emits a space, so English never had
+  the bug at all. Voice-dependent behaviour has to be tested per voice.
+
+The rule this yields: **for a fallback that is legal but undesirable, assert
+its rate on real data, and assert that the non-fallback path is correct --
+not merely that it was taken.** Both now exist, plus per-log-line coverage
+at model input (`qwen_cov_utt`/`qwen_cov_grp`) and a corpus preflight
+(`scripts/fusion/m02_preflight_corpus.py`).
+
+**Known gaps, deliberately deferred** (external audit, 2026-09-07). None
+affect the VI/EN corpus, which is why the restart proceeds without them:
+
+- **Chinese `lm_token_groups` overlap.** Measured: `你好世界。今天天气很好`
+  yields groups `[[1],[2],[3],[4,5],[6],[6]]` -- index 6 assigned to two
+  phone groups, with a one-position shift after punctuation, so groups
+  double-count tokens. Vietnamese shows 0 overlapping groups in 20,109, so
+  this is specific to the jieba/segment span path. **Must be fixed before
+  Chinese is enabled**; ZH is 0% of this corpus.
+- **Chinese segment deletion.** A normalization failure or an
+  unknown-language segment removes that segment from *both* the phones and
+  the canonical text, so the remaining utterance can align perfectly while
+  having silently lost spoken content. Logged as a warning, but structurally
+  invisible downstream.
+- **Downstream bounds checks assume intact artifacts.** The fusion module's
+  group-index range check uses the *batch-wide* Qwen width, and the
+  extractor validates gathered indices against the batch maximum rather than
+  each row's own length. Unreachable from an intact artifact (its
+  `lm_token_groups` count equals its phone-group count), so these are
+  defensive gaps against corrupted or independently constructed input, not
+  live defects.
+- **OOV loss is not visible in conditioning coverage.** Dropped symbols and
+  emptied groups shrink the denominator before coverage is measured, so an
+  utterance can lose whole words and still report 100% coverage over its
+  survivors. The preflight reports it; the training-time metrics cannot.
+
 ## Why a separate pre-architecture oracle-validation sprint was dropped
 
 An earlier version of this plan (sprint 002, since removed) proposed

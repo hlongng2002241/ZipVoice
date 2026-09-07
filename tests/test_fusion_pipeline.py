@@ -415,3 +415,77 @@ def test_fusion_fields_without_extractor_is_rejected(fusion_tokenizers):
             },
             qwen_extractor=None,
         )
+
+
+def test_configured_fusion_run_rejects_a_batch_with_no_fusion_fields(
+    fusion_tokenizers, extractor
+):
+    """The dangerous converse of the assert above.
+
+    A fusion-configured run whose batch carries no fusion fields is
+    indistinguishable, at the model, from an intentional phone-only run: the
+    model falls back to the phone embedding and trains happily. That is
+    exactly how an entire training run was spent ~93% phone-only after the
+    `_split_into_groups` sentence-boundary bug, with nothing failing and
+    nothing logged above debug level. Missing metadata is a pipeline error
+    and must be loud, unlike the per-utterance alignment fallback (which
+    keeps the fields and sets lm_token_groups=None only for the affected
+    utterances).
+    """
+    params = AttributeDict({"feat_scale": 1.0, "condition_drop_ratio": 0.0})
+    model = ZipVoice(
+        vocab_size=fusion_tokenizers["vi"].vocab_size,
+        text_embed_dim=192,
+        text_frontend="fusion",
+        **_TINY_KWARGS,
+    )
+    with pytest.raises(AssertionError, match="no fusion fields"):
+        compute_fbank_loss(
+            params=params,
+            model=model,
+            features=torch.randn(1, 40, 100),
+            features_lens=torch.tensor([40]),
+            tokens=[[1, 2, 3]],
+            is_training=True,
+            fusion_fields=None,
+            qwen_extractor=extractor,
+        )
+
+
+def test_training_step_reports_qwen_coverage(fusion_tokenizers, extractor):
+    """Coverage must be observable in the training log.
+
+    The sentence-boundary bug was invisible for a whole run because nothing
+    measured how often conditioning actually reached the model. These two
+    metrics make that a number on every log line: one utterance aligned,
+    one not, must report 50% utterance coverage.
+    """
+    params = AttributeDict({"feat_scale": 1.0, "condition_drop_ratio": 0.0})
+    model = ZipVoice(
+        vocab_size=fusion_tokenizers["vi"].vocab_size,
+        text_embed_dim=192,
+        text_frontend="fusion",
+        **_TINY_KWARGS,
+    )
+    features_lens = torch.tensor([40, 40])
+    _, info = compute_fbank_loss(
+        params=params,
+        model=model,
+        features=torch.randn(2, 40, 100),
+        features_lens=features_lens,
+        tokens=[[1, 2, 3], [4, 5, 6]],
+        is_training=True,
+        fusion_fields={
+            "phone_groups": [[[0], [1, 2]], [[0], [1, 2]]],
+            "lm_token_ids": [[1, 2], [3, 4]],
+            # Second utterance failed alignment -- the legal fallback.
+            "lm_token_groups": [[[0], [1]], None],
+        },
+        qwen_extractor=extractor,
+    )
+    frames = int(features_lens.sum().item())
+    assert info["qwen_cov_utt"] / frames == pytest.approx(0.5), (
+        "one of two utterances aligned -> 50% utterance coverage"
+    )
+    # Both groups of the aligned utterance carry real lm_tokens.
+    assert info["qwen_cov_grp"] / frames == pytest.approx(1.0)
