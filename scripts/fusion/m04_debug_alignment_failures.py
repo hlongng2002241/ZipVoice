@@ -209,6 +209,61 @@ def tokenize(text):
     return blocks
 
 
+def align(phone_blocks, token_blocks):
+    """Merge the two block lists into [(words, phones, lm_tokens), ...].
+
+    Both inputs cover the same word sequence but cut it differently:
+    `tokenize` always gives one word per block, `phonemize` occasionally
+    merges a few (see its docstring). Two pointers walk the lists, always
+    advancing whichever side is behind on words, and a group is emitted the
+    moment the two sides have consumed the same words. The result is the
+    coarsest-common-refinement of the two segmentations -- as fine as
+    possible, only as coarse as the phone side forces.
+
+    Because the emitted group boundaries are word boundaries on both sides,
+    this cannot silently misalign: either the words agree at the cut point
+    (asserted) or nothing is emitted.
+    """
+    aligned = []
+    i = j = 0
+    words_p, phones = [], []
+    words_t, tokens = [], []
+
+    while i < len(phone_blocks) or j < len(token_blocks):
+        # Advance the side that has consumed fewer words. Ties go to the
+        # phone side, which is the one that may merge.
+        if len(words_p) <= len(words_t) and i < len(phone_blocks):
+            block_words, block_units = phone_blocks[i]
+            i += 1
+            words_p = words_p + list(block_words)
+            phones = phones + list(block_units)
+        elif j < len(token_blocks):
+            block_words, block_units = token_blocks[j]
+            j += 1
+            words_t = words_t + list(block_words)
+            tokens = tokens + list(block_units)
+        else:
+            break  # one side ran out while the other still owes words
+
+        if len(words_p) == len(words_t) and words_p:
+            assert words_p == words_t, (
+                f"the two segmentations disagree on words: "
+                f"{words_p} vs {words_t}"
+            )
+            aligned.append((words_p, phones, tokens))
+            words_p, phones, words_t, tokens = [], [], [], []
+
+    assert not words_p and not words_t, (
+        f"unconsumed tail: phones side {words_p}, lm_token side {words_t}"
+    )
+    return aligned
+
+
+def align_text(text):
+    """Convenience: text -> [(words, phones, lm_tokens), ...]."""
+    return align(phonemize(text), tokenize(text))
+
+
 def get_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True)
@@ -343,10 +398,24 @@ def main():
 
 def attempt(text: str = None):
     text = "Quyển sách thứ hai mà mình đọc trong năm nay là quyển trước lư đồng mắt cua của tác giả nguyễn tuân và quyển này thì là book of the măng của tháng hai thì phải. Cái sách này mình nghĩ là nó được xếp vào cái dạng gọi là tùy bút và nó theo dòng hồi tưởng của nguyễn tuân về một cái thời trai trẻ của ông, cho nên lànó hơi mang hơi hướng là một quyển tùy bút nhưng mà kiểu bán tự truyện vì cái thể loại như vậy cho nên là mình thấy tác giả không chú trọng vào cái kết cấu của câu chuyện, không phải là cố làm cho câu chuyện có một cái tứ, có một cái thắt nút mở nút gì cả, mà nó chỉ là theo những cái dòng suy nghĩ của tác giả vềquá khứ và nó được liên kết với nhau qua cái hình ảnh của chiếc lư đồng mắt cua. Nhân vật tôi trong chuyện thể hiện rất nhiều mâu thuẫn là một người yêu cáiđẹp, yêu cái hào hoa văn hóa, nhưng lại có một cái cuộc sống rất là chán trường, bệ dạc và mình nghĩ là cái điều này có thể không chỉ là thể hiện mỗi cái cánhân đó mà còn phản ánh cái hơi hướng của thời đại lúc đó. Cái giọng văn của nguyễn tuân thì rất là tài hoa, nó mang cái tính ngoài cổ mà nó đẹp nhưng mà một cách kiểu như là rất sầu não ấy. Mình thì lúc mà mình đọc thì có những đoạn mình cảm thấy là wow phê quá kiểu quá hay, nhưng mà cũng có những đoạn thì mìnhkiểu mệt mỏi thực sự kiểu."
+
+    text = "Quyển sách thứ hai mà mình đọc trong năm nay là quyển trước lư đồng mắt cua của tác giả nguyễn tuân và quyển này thì là book of the măng của tháng hai thì phải."
+
+    for t in tokenize(text):
+        print(t)
+    print()
+
+    for p in phonemize(text):
+        print(p)
+
+    return
+
     lm_tokenizer = LanguageModelTokenizer()
     tokenizer = F.FusionTokenizer(token_file="exp/fusion/tokens.txt", lang="vi", use_normalizer=False, lm_tokenizer=lm_tokenizer)
     output = tokenizer.text_to_artifact(text)
     print(output)
+
+    # return
 
     for pg, lmg in zip(output.phone_groups, output.lm_token_groups):
         print([output.phones[i] for i in pg], "=", [output.lm_tokens[i] for i in lmg])
