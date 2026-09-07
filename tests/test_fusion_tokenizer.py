@@ -579,51 +579,98 @@ def test_flatten_reports_where_sentences_joined():
 
 
 def test_sentence_end_bounds_trailing_attachment():
-    """A separator emitted after a sentence end belongs to the NEXT sentence.
+    """A separator emitted after a sentence end belongs to the NEXT sentence,
+    so trailing attachment stops there.
 
-    Trailing-separator attachment must stop there, or a block absorbs the
-    following sentence's leading whitespace. This is the only thing sentence
-    metadata is used for.
-
-    It is deliberately NOT a group boundary. Two sentences being phonemized
-    independently means widening across one is unnecessary to recover
-    pronunciation context; it does not make a shared conditioning group
-    invalid, and a conditioning group is not required to be a phonological
-    unit. Enforcing it as a hard cut made results strictly worse -- a
-    rejected match fell through to the whole-remainder fallback, producing a
-    coarser block that crossed the boundary anyway.
+    This is the only thing sentence metadata does. It is NOT a group
+    boundary: two sentences being phonemized independently means widening
+    across one is unnecessary to recover pronunciation context, not that a
+    shared conditioning group is invalid, and a conditioning group need not
+    be a phonological unit. Enforcing it as a hard cut made results strictly
+    worse -- a rejected match fell through to the whole-remainder fallback,
+    producing a coarser block that crossed the boundary anyway.
     """
     from zipvoice.tokenizer.fusion_tokenizer import _match_phone_content
 
     flat = ["a", ".", " ", "b"]
     # sentence 1 ends at index 2, so the space at index 2 is sentence 2's
-    assert _match_phone_content(flat, 0, ["a", "."], limit=2) == 2
-    # without the limit the space is absorbed into the preceding block
+    assert _match_phone_content(flat, 0, ["a", "."], sentence_ends=[2, 4]) == 2
+    # without metadata the space is absorbed into the preceding block
     assert _match_phone_content(flat, 0, ["a", "."]) == 3
 
 
-def test_sentence_metadata_never_makes_blocks_coarser(monkeypatch):
-    """Supplying sentence ends must never produce a worse segmentation than
-    omitting them. The first attempt did exactly that.
+def test_trailing_limit_follows_the_match_not_its_start(monkeypatch):
+    """The limit must come from where content matching ENDED.
+
+    A match may legitimately span sentences -- boundaries constrain
+    separator ownership, not grouping. Deriving the limit from the starting
+    cursor then strands the match's own punctuation: with
+    flat=[a,'.',b,'.',c] and ends=[2,4,5], a probe of [a,'.',b,'.'] matches
+    through index 3, but a start-derived limit of 2 blocked the '.' and
+    handed it to the following word.
     """
     import zipvoice.tokenizer.fusion_tokenizer as module
 
     tok = _vi_tokenizer_or_skip()
-    probes = {"X.": ["a", "."], "Y": ["b"], "X. Y": ["a", ".", "b"]}
+    probes = {"X.Y.": ["a", ".", "b", "."], "Z": ["c"]}
     monkeypatch.setattr(
         module.FusionTokenizer,
         "_word_phones",
         lambda self, w, l: probes.get(w, list(w)),
     )
-    flat = ["a", ".", " ", "b"]
-    without = tok._blocks_from_words(flat, ["X.", "Y"], "vi")[0]
-    with_ends = tok._blocks_from_words(
-        flat, ["X.", "Y"], "vi", sentence_ends=[2, 4]
-    )[0]
-    assert len(with_ends) >= len(without), (
-        f"sentence metadata coarsened the result: {without} -> {with_ends}"
+    flat = ["a", ".", "b", ".", "c"]
+    blocks, _ = tok._blocks_from_words(
+        flat, ["X.Y.", "Z"], "vi", sentence_ends=[2, 4, 5]
     )
-    assert [p for b in with_ends for p in b] == flat
+    assert blocks == [["a", ".", "b", "."], ["c"]], (
+        f"the match's own trailing '.' was reassigned: {blocks}"
+    )
+
+
+def test_sentence_metadata_does_not_change_grouping(monkeypatch):
+    """Metadata corrects separator OWNERSHIP; it must not otherwise alter
+    the segmentation.
+
+    Asserted as exact output rather than a group count -- equal counts can
+    still hide wrong boundaries, which is how the previous version's defect
+    survived its own regression test. The empty-probe/backtracking case
+    below is adversarial, not observed espeak output; it pins the
+    interaction because the implementation permits empty probes.
+    """
+    import zipvoice.tokenizer.fusion_tokenizer as module
+
+    tok = _vi_tokenizer_or_skip()
+
+    probes = {
+        "X": ["b"], "X Y": [], "X Y Z": [".", "b", "."],
+        "Y": [], "Y Z": ["b"], "Z": ["b"],
+    }
+    monkeypatch.setattr(
+        module.FusionTokenizer,
+        "_word_phones",
+        lambda self, w, l: probes.get(w, list(w)),
+    )
+    flat = [".", "b", "."]
+    without = tok._blocks_from_words(flat, ["X", "Y", "Z"], "vi")[0]
+    with_ends = tok._blocks_from_words(
+        flat, ["X", "Y", "Z"], "vi", sentence_ends=[1, 3]
+    )[0]
+    assert with_ends == without, f"metadata changed grouping: {without} -> {with_ends}"
+
+    # The one case it is meant to change: separator ownership.
+    probes2 = {"X.": ["a", "."], "Y": ["b"], "X. Y": ["a", ".", "b"]}
+    monkeypatch.setattr(
+        module.FusionTokenizer,
+        "_word_phones",
+        lambda self, w, l: probes2.get(w, list(w)),
+    )
+    flat2 = ["a", ".", " ", "b"]
+    assert tok._blocks_from_words(flat2, ["X.", "Y"], "vi")[0] == [
+        ["a", ".", " "], ["b"]
+    ]
+    assert tok._blocks_from_words(
+        flat2, ["X.", "Y"], "vi", sentence_ends=[2, 4]
+    )[0] == [["a", "."], [" ", "b"]]
 
 
 def test_split_into_groups_flattening_is_lossless():

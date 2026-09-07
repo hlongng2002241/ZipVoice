@@ -65,6 +65,7 @@ this module never computes it itself. Empty (``[]``) when no
 ``lm_tokenizer`` is supplied, exactly like ``lm_tokens``/``lm_token_ids``.
 """
 
+import bisect
 import logging
 from dataclasses import dataclass, field
 from functools import reduce
@@ -265,34 +266,32 @@ def _has_han(text: str) -> bool:
     return any(emilia.is_chinese(ch) for ch in text)
 
 
-def _next_after(sentence_ends: Sequence[int], cursor: int) -> Optional[int]:
-    """First sentence end strictly greater than `cursor`, or None.
-
-    Used only to bound trailing-separator attachment. Sentence boundaries do
-    NOT force group boundaries: two sentences being phonemized independently
-    means widening across one is unnecessary to recover pronunciation
-    context, not that a shared conditioning group is invalid. A conditioning
-    group is not required to be a phonological unit -- requiring that is the
-    restriction this design removed, and briefly reintroduced. Enforcing it
-    also made results strictly worse: a rejected match fell through to the
-    whole-remainder fallback, which produced a COARSER block that crossed
-    the boundary anyway.
-    """
-    for end in sentence_ends:
-        if end > cursor:
-            return end
-    return None
-
-
 def _match_phone_content(
-    flat: List[str], cursor: int, wanted: List[str], limit: Optional[int] = None
+    flat: List[str],
+    cursor: int,
+    wanted: List[str],
+    sentence_ends: Sequence[int] = (),
 ) -> Optional[int]:
     """Consume `wanted`'s phone content from `flat` at `cursor`, ignoring
     `_IGNORED_WHEN_MATCHING` on both sides. Returns the new cursor, or None
     if the content diverges.
 
-    Trailing separators are absorbed, but stress marks are not -- they
-    belong to the syllable that follows them.
+    Trailing separators are absorbed afterwards, but not past the end of the
+    sentence containing the **last matched content phone**. A separator
+    emitted after a sentence end was produced as part of the next sentence,
+    so absorbing it would pull that sentence's leading whitespace backwards.
+
+    The limit must be derived from where matching *ended*, not where it
+    began. A match may legitimately span sentences -- sentence boundaries do
+    not constrain grouping, only separator ownership -- and bounding by the
+    starting cursor then strands the match's own trailing punctuation:
+    for flat=[a,'.',b,'.',c] with ends=[2,4,5], a probe of [a,'.',b,'.']
+    matches through index 3 but a start-derived limit of 2 blocks the '.',
+    handing it to the following word.
+
+    Sentence ends are cumulative and therefore sorted, so the containing end
+    is found by binary search rather than scanning them all -- with one word
+    per sentence a linear scan is quadratic over the utterance.
     """
     content = [p for p in wanted if p not in _IGNORED_WHEN_MATCHING]
     i = cursor
@@ -307,12 +306,18 @@ def _match_phone_content(
         matched += 1
     if matched != len(content):
         return None
-    # Trailing separators are absorbed, but never past `limit`. That is
-    # the one place a sentence boundary legitimately constrains matching: a
-    # separator after a sentence end was emitted as part of the NEXT
-    # sentence, so consuming it would pull the next sentence's leading
-    # whitespace into this block.
-    stop = len(flat) if limit is None else min(len(flat), limit)
+
+    # First sentence end at or after the content cursor. `bisect_left` gives
+    # exactly that: when `i` is itself a sentence end, attachment stops there
+    # rather than reaching into the next sentence. An empty probe never
+    # advanced `i`, so it is bounded by the sentence containing `cursor`,
+    # which is the only defined answer for it.
+    if sentence_ends:
+        position = bisect.bisect_left(sentence_ends, i)
+        stop = sentence_ends[position] if position < len(sentence_ends) else len(flat)
+    else:
+        stop = len(flat)
+    stop = min(stop, len(flat))
     while i < stop and flat[i] in _TRAILING_ATTACHABLE:
         i += 1
     return i
@@ -1022,7 +1027,7 @@ class FusionTokenizer:
                 for j in range(max(i + 1, must_cover + 1), upper + 1):
                     probe = self._word_phones(" ".join(words[i:j]), locale)
                     end = _match_phone_content(
-                        flat, cursor, probe, limit=_next_after(sentence_ends, cursor)
+                        flat, cursor, probe, sentence_ends=sentence_ends
                     )
                     # `end == cursor` means the words consumed no phones at
                     # all -- a punctuation-only token like "-" that espeak
