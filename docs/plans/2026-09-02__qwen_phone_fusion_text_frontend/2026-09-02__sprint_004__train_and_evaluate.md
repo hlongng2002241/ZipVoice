@@ -120,6 +120,32 @@ on the order of 0.01 per epoch. Fusion behaviour therefore becomes
 measurable within the first day or two rather than at epoch 50, which is an
 argument for evaluating early checkpoints rather than waiting.
 
+### Run 1 (2026-09-06): stopped, invalid
+
+Stopped at epoch 2 / batch ~32000 (19.6 h/epoch, 30,092 batches/epoch --
+both measured, not estimated) on discovering the run was **~93%
+phone-only**: the `_split_into_groups` sentence-boundary merge disabled the
+Qwen branch for all but 7.3% of Vietnamese utterances. See the ADR's
+"sentence-boundary incident" section. Validation loss fell normally
+throughout (0.03889 -> 0.03804 over 24k batches) and stayed below the
+pre-fusion baseline, which is exactly why loss alone could not be trusted as
+evidence the architecture was working -- it was measuring a phone-only model.
+
+The checkpoints in `exp/fusion/` are from this invalid run.
+
+### Before restarting
+
+1. `python3 scripts/fusion/m02_preflight_corpus.py --manifest ... --token-file ...`
+   must pass. It reports per-language alignment, phonemizer failures, and
+   the OOV/emptied-group losses that training-time coverage cannot see.
+   Expect Vietnamese ~97%; expect **English to fail** at ~0%, which is the
+   known mislabelling (95.5% of "English"-labelled utterances contain
+   Vietnamese diacritics), not an alignment defect.
+2. Watch `qwen_cov_utt` / `qwen_cov_grp` on the first log lines. They should
+   be ~0.97 and ~1.0. If either is near zero the conditioning is not
+   reaching the model and the run is not worth continuing -- this is the
+   check whose absence cost run 1.
+
 ## Rollout
 
 Checkpoints from this sprint are handed off to the separate evaluation
