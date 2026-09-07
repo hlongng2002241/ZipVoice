@@ -77,9 +77,15 @@ independent sentences concatenated, with no phonological interaction. The
 genuine example is `of the` -> `ɒvðə` **within** one sentence, which is what
 actually motivates whole-utterance phonemization and block widening.
 
-The code is unaffected -- the block matcher recovers these boundaries either
-way, and alignment measures 100% -- so replacing the punctuation set with
-the sentence offsets is a simplification, not a correctness fix.
+**Fixed.** `_flatten_espeak_output` now returns the sentence-end offsets
+alongside the concatenated phones, and `_blocks_from_words` treats them as
+**hard cuts**: a block may not span a sentence boundary. Two sentences are
+phonemized independently, so merging them was always wrong -- previously
+possible precisely because the information had been discarded. The
+punctuation set survives under its real name, `_IGNORABLE_PUNCTUATION`,
+whose only job is to let a content match skip punctuation; it no longer
+pretends to detect sentences, and `_split_into_groups` is back to splitting
+on ' ' alone.
 
 
 ## The mistake

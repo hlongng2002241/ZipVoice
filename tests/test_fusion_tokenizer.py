@@ -554,27 +554,49 @@ def test_artifact_post_init_rejects_out_of_range_lm_token_groups_index():
 # correctness on one handpicked string.
 
 
-def test_split_into_groups_breaks_after_sentence_final_punctuation():
-    from zipvoice.tokenizer.fusion_tokenizer import _split_into_groups
+def test_flatten_reports_where_sentences_joined():
+    """espeak returns ONE LIST PER SENTENCE, and that boundary is real
+    information.
 
-    # espeak's real shape at a sentence boundary: '.' with no following ' '.
-    flat = ["a", " ", "b", ".", "c", " ", "d"]
-    groups = _split_into_groups(flat)
-    assert ["".join(g) for g in groups] == ["a ", "b.", "c ", "d"], (
-        "the word after a sentence-final period must start a new group"
+    The original code discarded it in `reduce(x + y)` and then guessed
+    boundaries back from punctuation, on the mistaken belief that espeak
+    "emits no space after a period". The concatenation itself must stay --
+    upstream `EspeakTokenizer.g2p` does the same and the source checkpoint
+    was trained on the concatenated sequence -- so the boundary is reported
+    alongside instead.
+    """
+    from zipvoice.tokenizer.fusion_tokenizer import _flatten_espeak_output
+    from zipvoice.tokenizer.tokenizer import phonemize_espeak
+
+    sentences = phonemize_espeak("mọi người. Rất nhiều", "vi")
+    assert len(sentences) == 2, "espeak should split this into two sentences"
+
+    flat, ends = _flatten_espeak_output(sentences)
+    assert flat == [p for s in sentences for p in s], "concatenation unchanged"
+    assert ends == [len(sentences[0]), len(flat)]
+    # the join really is separator-free -- that is why it had to be reported
+    assert flat[ends[0] - 1] == "." and flat[ends[0]] != " "
+
+
+def test_blocks_never_span_a_sentence_boundary():
+    """Two sentences are phonemized independently, so a block covering both
+    would merge units with no phonological relationship. Sentence ends are
+    hard cuts, and block widening must not cross them.
+    """
+    tok = _vi_tokenizer_or_skip()
+    text = "mọi người. Rất nhiều công ty"
+    flat, ends = tok._espeak_flat_phones(text, "vi")
+    blocks, words = tok._blocks_from_words(
+        flat, text.split(), "vi", hard_cuts=frozenset(ends)
     )
-
-
-def test_split_into_groups_does_not_double_break_on_punct_then_space():
-    from zipvoice.tokenizer.fusion_tokenizer import _split_into_groups
-
-    # When a space *does* follow the punctuation, the space rule closes the
-    # group; breaking on both would emit a group consisting only of ' '.
-    groups = _split_into_groups(["a", ".", " ", "b"])
-    assert ["".join(g) for g in groups] == ["a. ", "b"]
-    assert all(g and "".join(g).strip(" .!?;:") for g in groups), (
-        "no group may consist solely of separators"
-    )
+    boundary = ends[0]
+    running = 0
+    for block in blocks:
+        assert not (running < boundary < running + len(block)), (
+            f"a block spans the sentence boundary at {boundary}"
+        )
+        running += len(block)
+    assert running == len(flat)
 
 
 def test_split_into_groups_flattening_is_lossless():

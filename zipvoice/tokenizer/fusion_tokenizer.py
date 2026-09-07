@@ -124,73 +124,52 @@ def _shared_emilia_tokenizer() -> EmiliaTokenizer:
     return _bare_emilia_tokenizer
 
 
-def _flatten_espeak_output(sentences) -> List[str]:
-    return reduce(lambda x, y: x + y, sentences, [])
+def _flatten_espeak_output(sentences) -> Tuple[List[str], List[int]]:
+    """Concatenate espeak's per-sentence lists, keeping where they joined.
+
+    `phonemize_espeak` returns ONE LIST PER SENTENCE. The concatenation is
+    required -- upstream `EspeakTokenizer.g2p` (tokenizer.py:142) does the
+    same `reduce(x + y)`, and the source checkpoint was trained on the
+    concatenated sequence, so the phones must not change. But the sentence
+    boundary is real information, and discarding it is what forced this
+    module to guess boundaries back from punctuation.
+
+    Returns (flat, sentence_ends), where `sentence_ends` are indices into
+    `flat` marking the end of each sentence (the last is len(flat)).
+    """
+    flat: List[str] = []
+    sentence_ends: List[int] = []
+    for sentence in sentences:
+        flat.extend(sentence)
+        sentence_ends.append(len(flat))
+    return flat, sentence_ends
 
 
-#: Phone symbols that end a group in addition to the literal ' '.
+#: Punctuation that carries no segmental content, so it is skipped when
+#: comparing phone sequences and attached to the group it follows.
 #:
-#: CORRECTION (2026-09-07). The original comment here claimed espeak "emits
-#: no space after a sentence-final period", with a voice-dependent story
-#: about espeak-vi versus espeak-en-us. That is not the mechanism.
-#: `phonemize_espeak` returns ONE LIST PER SENTENCE -- for
-#: "mọi người. Rất nhiều" it returns
-#: [['m','ˌ','ɔ','6','j',' ','ŋ','ˈ','y','ə','2','j','.'],
-#:  ['z','ˈ','ə','ɜ','t','̪',...]] -- and the boundary is lost by
-#: `_flatten_espeak_output`, which joins them with `reduce(x + y)` and no
-#: separator. That flattening is required: upstream `EspeakTokenizer.g2p`
-#: (tokenizer.py:142) does exactly the same, and the source checkpoint was
-#: trained on the concatenated sequence, so the phones must stay as they
-#: are.
-#:
-#: What was wrong was rebuilding the boundary by guessing at punctuation
-#: instead of reading it off the sentence list the phonemizer already
-#: returned. This set is therefore a workaround for information this module
-#: discards, and should be replaced by carrying the sentence offsets through
-#: `_flatten_espeak_output`. Kept for now because the block matcher recovers
-#: these boundaries anyway (alignment measures 100%), so removing it is a
-#: simplification rather than a fix, and it would change grouping mid-run.
-_SENTENCE_END_PHONES = frozenset(".!?;:")
+#: This used to be called _IGNORABLE_PUNCTUATION and was used to *detect*
+#: sentence boundaries, on the mistaken belief that espeak emitted no space
+#: after a period. It does not need detecting: `phonemize_espeak` returns one
+#: list per sentence and `_flatten_espeak_output` now reports where they
+#: joined. The set's real and only job is punctuation that should not block a
+#: content match.
+_IGNORABLE_PUNCTUATION = frozenset(".!?;:")
 
 
 def _split_into_groups(flat_phones: List[str]) -> List[List[str]]:
-    """Split a flat phone sequence into word-equivalent groups.
+    """Split a flat phone sequence on the literal ' ' phone symbol.
 
-    Groups break on the literal ' ' phone symbol (which `phonemize_espeak`
-    emits as an ordinary element -- confirmed empirically), and *also* after
-    sentence-final punctuation. The space itself is kept (not dropped) as the
-    trailing element of the group before it, so flattening the returned
-    groups reproduces `flat_phones` exactly, unchanged.
-
-    The sentence-final rule exists because espeak emits **no space after a
-    sentence-final period**: "nguoi. Rat" phonemizes to `... j . z ...` with
-    no ' ' between, so a space-only split silently merges the last word of
-    one sentence with the first word of the next. Every internal sentence
-    boundary then costs exactly one group, the group count stops matching
-    the whitespace-word count, and `text_to_artifact` gives up and returns
-    `lm_token_groups=None` for the whole utterance -- disabling the Qwen
-    branch for it entirely.
-
-    That was not a corner case. Measured on this project's training corpus
-    before the fix, alignment succeeded for only **7.3%** of utterances
-    (2.7% of those over 50 words, which is most of the corpus at a 28.9s
-    mean), because long utterances contain many sentences. The first
-    training run was therefore ~93% phone-only.
-
-    A break is suppressed when a ' ' already follows the punctuation, so
-    that case still closes the group exactly once and no group is emitted
-    that consists solely of a separator.
+    Used only by the Chinese path's embedded-English segments, where the
+    blocks are later coarsened against lm_token offsets anyway. The plain
+    path does not use it: `_blocks_from_words` locates boundaries by matching
+    phone content, with espeak's own sentence boundaries as hard cuts.
     """
     groups: List[List[str]] = []
     current: List[str] = []
-    last = len(flat_phones) - 1
-    for i, symbol in enumerate(flat_phones):
+    for symbol in flat_phones:
         current.append(symbol)
-        if symbol == " " or (
-            symbol in _SENTENCE_END_PHONES
-            and i < last
-            and flat_phones[i + 1] != " "
-        ):
+        if symbol == " ":
             groups.append(current)
             current = []
     if current:
@@ -231,7 +210,7 @@ _MAX_BLOCK_WORDS = 8
 #: would force those words to merge for a difference that cannot change
 #: which word a phone belongs to.
 _IGNORED_WHEN_MATCHING = (
-    _SENTENCE_END_PHONES
+    _IGNORABLE_PUNCTUATION
     | {" ", ",", "-", "\u2013", "\u2014"}
     | {"\u02c8", "\u02cc"}  # primary / secondary stress
 )
@@ -246,7 +225,7 @@ _IGNORED_WHEN_MATCHING = (
 #: trailing ignorable would give X = [a, ' ', ˈ] and Y = [b], moving Y's
 #: stress into X. Both the partition and byte-identity checks still pass,
 #: which is exactly why this needed a separate set rather than an assert.
-_TRAILING_ATTACHABLE = _SENTENCE_END_PHONES | {" ", ",", "-", "\u2013", "\u2014"}
+_TRAILING_ATTACHABLE = _IGNORABLE_PUNCTUATION | {" ", ",", "-", "\u2013", "\u2014"}
 
 
 def _ends_from_word_blocks(
@@ -888,13 +867,14 @@ class FusionTokenizer:
                 else:
                     seg_canonical = seg_text
                 if seg_lang == "en":
-                    flat = self._espeak_flat_phones(
+                    flat, seg_sentence_ends = self._espeak_flat_phones(
                         seg_canonical, latin_locale, allow_empty=True
                     )
                     spans = _whitespace_spans(seg_canonical)
                     words = [seg_canonical[a:b] for a, b in spans]
                     groups, word_groups = self._blocks_from_words(
-                        flat, words, latin_locale
+                        flat, words, latin_locale,
+                        hard_cuts=frozenset(seg_sentence_ends),
                     )
                     consumed = 0
                     for group, block_words in zip(groups, word_groups):
@@ -973,13 +953,19 @@ class FusionTokenizer:
         # and _ESPEAK_LOCALE has no zh entry because Chinese never goes
         # through espeak at all.
         locale = _ESPEAK_LOCALE["vi" if self.lang == "zh" else self.lang]
-        flat = self._espeak_flat_phones(canonical_text, locale)
+        flat, sentence_ends = self._espeak_flat_phones(canonical_text, locale)
         words = canonical_text.split()
-        phone_blocks, word_blocks = self._blocks_from_words(flat, words, locale)
+        phone_blocks, word_blocks = self._blocks_from_words(
+            flat, words, locale, hard_cuts=frozenset(sentence_ends)
+        )
         return phone_blocks, word_blocks, canonical_text
 
     def _blocks_from_words(
-        self, flat: List[str], words: List[str], locale: str
+        self,
+        flat: List[str],
+        words: List[str],
+        locale: str,
+        hard_cuts: frozenset = frozenset(),
     ) -> Tuple[List[List[str]], List[List[str]]]:
         """Cut `flat` into blocks, one per group of consecutive `words`.
 
@@ -1011,6 +997,16 @@ class FusionTokenizer:
                 for j in range(max(i + 1, must_cover + 1), upper + 1):
                     probe = self._word_phones(" ".join(words[i:j]), locale)
                     end = _match_phone_content(flat, cursor, probe)
+                    # espeak's own sentence boundaries are known-true cuts.
+                    # Two sentences are phonemized independently, so a block
+                    # spanning one would merge units with no phonological
+                    # relationship -- always wrong, and previously possible
+                    # because this information was thrown away and guessed
+                    # back from punctuation instead.
+                    if end is not None and any(
+                        cursor < cut < end for cut in hard_cuts
+                    ):
+                        end = None
                     # `end == cursor` means the words consumed no phones at
                     # all -- a punctuation-only token like "-" that espeak
                     # renders as nothing. Emitting it as its own group would
@@ -1025,6 +1021,8 @@ class FusionTokenizer:
                         break
                 if emitted or not phone_blocks:
                     break
+                if cursor in hard_cuts:
+                    break  # never widen backwards across a sentence boundary
                 # Absorb the previous block and retry with more left context.
                 prev_phones = phone_blocks.pop()
                 prev_words = word_blocks.pop()
@@ -1083,7 +1081,7 @@ class FusionTokenizer:
         cached = _WORD_PHONE_CACHE.get(key)
         if cached is None:
             try:
-                cached = _flatten_espeak_output(phonemize_espeak(word, locale))
+                cached, _ = _flatten_espeak_output(phonemize_espeak(word, locale))
             except Exception:
                 cached = []
             if len(_WORD_PHONE_CACHE) < _WORD_PHONE_CACHE_MAX:
@@ -1092,7 +1090,7 @@ class FusionTokenizer:
 
     def _espeak_flat_phones(
         self, text: str, locale: str, allow_empty: bool = False
-    ) -> List[str]:
+    ) -> Tuple[List[str], List[int]]:
         try:
             sentences = phonemize_espeak(text, locale)
         except Exception as ex:
@@ -1110,7 +1108,7 @@ class FusionTokenizer:
                 f"phonemization failed for locale {locale!r} on text "
                 f"{text[:80]!r}: {ex}"
             ) from ex
-        phones = _flatten_espeak_output(sentences)
+        phones, sentence_ends = _flatten_espeak_output(sentences)
         # `allow_empty` is for per-SEGMENT calls on the mixed-script path: a
         # segment can legitimately be punctuation only and phonemize to
         # nothing, while a whole utterance that does so is a real failure.
@@ -1122,7 +1120,7 @@ class FusionTokenizer:
                 f"check silently because empty groups trivially match empty "
                 f"spans."
             )
-        return phones
+        return phones, sentence_ends
 
     # -- internal: Emilia-routed path (zh), matching
     # EmiliaTokenizer.texts_to_tokens() when use_normalizer is True
@@ -1172,7 +1170,7 @@ class FusionTokenizer:
                     else seg_text
                 )
                 seg_groups = _split_into_groups(
-                    self._espeak_flat_phones(normalized, "en-us")
+                    self._espeak_flat_phones(normalized, "en-us")[0]
                 )
                 seg_canonical = normalized
             elif seg_lang == "pinyin":
