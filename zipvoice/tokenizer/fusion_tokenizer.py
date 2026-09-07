@@ -584,10 +584,31 @@ class FusionTokenizer:
     def _espeak_flat_phones(self, text: str, locale: str) -> List[str]:
         try:
             sentences = phonemize_espeak(text, locale)
-            return _flatten_espeak_output(sentences)
         except Exception as ex:
-            logging.warning(f"Tokenization of {locale} text failed: {ex}")
-            return []
+            # Deliberately not swallowed into an empty list. Returning []
+            # here makes `groups` and `spans` BOTH empty, so the alignment
+            # check downstream sees equal lengths with no missing spans and
+            # returns `lm_token_groups=[]` -- a phonemizer crash then looks
+            # exactly like a successful alignment of an utterance that
+            # happens to have no words. The empty phone sequence goes on to
+            # fail much later in duration allocation
+            # (`assert n_acoustic_tokens > 0`), far from the cause and with
+            # the original exception long gone. Raise with the reason
+            # attached instead.
+            raise ValueError(
+                f"phonemization failed for locale {locale!r} on text "
+                f"{text[:80]!r}: {ex}"
+            ) from ex
+        phones = _flatten_espeak_output(sentences)
+        if text.strip() and not phones:
+            raise ValueError(
+                f"phonemization of locale {locale!r} produced no phones for "
+                f"non-empty text {text[:80]!r}. An empty phone sequence is "
+                f"not a usable training sample, and passes the alignment "
+                f"check silently because empty groups trivially match empty "
+                f"spans."
+            )
+        return phones
 
     # -- internal: Emilia-routed path (zh), matching
     # EmiliaTokenizer.texts_to_tokens() when use_normalizer is True

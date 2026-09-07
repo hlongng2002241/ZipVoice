@@ -550,10 +550,15 @@ def test_split_into_groups_flattening_is_lossless():
         assert [s for g in _split_into_groups(flat) for s in g] == flat
 
 
-def test_multi_sentence_text_aligns(tmp_path):
-    """The regression proper: a two-sentence utterance must still produce
-    lm_token_groups. The pre-existing alignment test used one sentence, so
-    it passed throughout the bug's lifetime.
+def test_multi_sentence_text_aligns_en(tmp_path):
+    """Multi-sentence English must produce lm_token_groups.
+
+    NOTE: this does NOT exercise the sentence-boundary bug, and must not be
+    mistaken for its regression test. espeak-en-us drops the sentence period
+    and emits a space, so English never had the merge -- verified: this test
+    passes unchanged against the old space-only splitter. The real
+    regression is test_multi_sentence_text_aligns_vi below. Kept because
+    multi-sentence alignment is worth covering in both voices.
     """
     from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
 
@@ -621,17 +626,16 @@ def test_vi_corpus_alignment_rate():
 
 
 def test_vi_corpus_group_correspondence_is_correct_not_just_present():
-    """Alignment succeeding is not the same as alignment being *right*.
+    """Check the span -> lm_token half of the mapping.
 
-    The count-matching rule (`len(word_spans) == len(groups)`) can in
-    principle accept a wrong alignment: one spurious merge plus one spurious
-    split cancel numerically, giving equal counts with every group off by
-    one. `test_vi_corpus_alignment_rate` would pass in that state, exactly
-    as the whole suite passed while the Qwen branch was disabled -- the same
-    failure shape that let the sentence-boundary bug ship.
-
-    So assert correspondence directly: decode each group's lm_tokens and
-    require them to reproduce that group's whitespace word.
+    SCOPE, precisely: word span i is assigned to phone group i *by position*
+    once the counts match, so decoding LM group i back to word i validates
+    that the character-offset overlap picked the right lm_tokens for that
+    span. It does NOT independently establish what phone group i contains --
+    a compensating merge and split would still decode correctly here. The
+    phone side is covered separately, against a reference that never touches
+    group indices, by
+    test_vi_phone_groups_match_independent_per_word_phonemization.
     """
     from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
     import unicodedata
@@ -676,4 +680,101 @@ def test_vi_corpus_group_correspondence_is_correct_not_just_present():
     assert not mismatches, (
         f"{len(mismatches)}/{checked} groups do not correspond to their word "
         f"-- alignment is accepted but wrong. First 5: {mismatches[:5]}"
+    )
+
+
+def test_multi_sentence_text_aligns_vi():
+    """THE regression for the sentence-boundary bug.
+
+    Must be Vietnamese, and must have a capitalised word after the period:
+    that is the exact shape espeak-vi emits as `... j '.' z ...` with no
+    separating space. Verified discriminating -- against the old space-only
+    splitter this text yields 12 groups for 14 words and falls back to
+    lm_token_groups=None; with the fix it yields 14 and aligns.
+    """
+    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
+
+    token_file = (
+        "scripts/all/pretrained_model_cache/"
+        "hynt__ZipVoice-Vietnamese-2500h/tokens.txt"
+    )
+    if not os.path.exists(token_file):
+        pytest.skip(f"{token_file} not available")
+
+    text = "toi di hoc moi ngay. Ban di lam moi tuan. Chung ta gap nhau"
+    tok = FusionTokenizer(
+        token_file=token_file, lang="vi", lm_tokenizer=LanguageModelTokenizer()
+    )
+    artifact = tok.text_to_artifact(text)
+    assert len(artifact.phone_groups) == len(text.split()), (
+        f"expected one phone group per word, got {len(artifact.phone_groups)} "
+        f"for {len(text.split())} words -- sentence boundaries are merging again"
+    )
+    assert artifact.lm_token_groups is not None, (
+        "multi-sentence Vietnamese fell back to phone-only -- the "
+        "sentence-boundary merge has regressed"
+    )
+
+
+def test_vi_phone_groups_match_independent_per_word_phonemization():
+    """Independent phone-to-word check.
+
+    The span/LM-token test above cannot establish this on its own: word span
+    i is assigned to phone group i *by position* after count matching, so
+    decoding LM group i back to word i is partly circular -- a compensating
+    merge and split would still decode correctly. This reference never
+    touches group indices: it phonemizes each word alone and compares.
+
+    Scoped to Vietnamese, where per-word phonemization was verified to
+    reproduce whole-utterance output exactly (4521/4521 groups). Other
+    voices have contextual pronunciation that this reference would not
+    reproduce, so do not widen it without re-establishing that.
+    """
+    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
+    from zipvoice.tokenizer.tokenizer import phonemize_espeak
+
+    from zipvoice.tokenizer.fusion_tokenizer import _whitespace_spans
+
+    token_file = (
+        "scripts/all/pretrained_model_cache/"
+        "hynt__ZipVoice-Vietnamese-2500h/tokens.txt"
+    )
+    if not os.path.exists(token_file):
+        pytest.skip(f"{token_file} not available")
+
+    tok = FusionTokenizer(
+        token_file=token_file, lang="vi", lm_tokenizer=LanguageModelTokenizer()
+    )
+    samples = _vi_fixture_samples_or_skip()[:15]
+    # espeak is stateful across calls, so do one clean pass per side.
+    artifacts = [tok.text_to_artifact(t) for t in samples]
+    per_word = {}
+    for text in samples:
+        for word in text.split():
+            if word not in per_word:
+                per_word[word] = "".join(
+                    p for sent in phonemize_espeak(word, "vi") for p in sent
+                )
+
+    strip = lambda s: s.strip(" .,!?;:")  # noqa: E731  separators only
+    checked, mismatches = 0, []
+    for text, artifact in zip(samples, artifacts):
+        if artifact.lm_token_groups is None:
+            continue
+        words = [text[s:e] for s, e in _whitespace_spans(text)]
+        phone_groups = [
+            [artifact.phones[i] for i in g] for g in artifact.phone_groups
+        ]
+        if len(phone_groups) != len(words):
+            continue
+        for word, group in zip(words, phone_groups):
+            checked += 1
+            if strip("".join(group)) != strip(per_word[word]):
+                mismatches.append((word, "".join(group), per_word[word]))
+
+    assert checked > 300, f"too few groups checked ({checked}) to be meaningful"
+    assert not mismatches, (
+        f"{len(mismatches)}/{checked} phone groups do not match the word "
+        f"phonemized on its own -- groups are misassigned even though the "
+        f"counts line up. First 5: {mismatches[:5]}"
     )
