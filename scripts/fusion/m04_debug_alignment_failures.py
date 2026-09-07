@@ -424,3 +424,6 @@ def attempt(text: str = None):
 if __name__ == "__main__":
     # sys.exit(main())
     attempt()
+
+
+(['of', 'the'], ['ɒ', 'v', 'ð', 'ə', ' '], ['Ġof', 'Ġthe'])

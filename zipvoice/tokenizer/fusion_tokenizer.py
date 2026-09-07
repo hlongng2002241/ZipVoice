@@ -65,10 +65,11 @@ this module never computes it itself. Empty (``[]``) when no
 ``lm_tokenizer`` is supplied, exactly like ``lm_tokens``/``lm_token_ids``.
 """
 
+import bisect
 import logging
 from dataclasses import dataclass, field
 from functools import reduce
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import jieba
 from pypinyin import Style, lazy_pinyin
@@ -105,10 +106,11 @@ _DEFAULT_USE_NORMALIZER: Dict[str, bool] = {"en": True, "zh": True, "vi": False}
 _bare_emilia_tokenizer: Optional[EmiliaTokenizer] = None
 
 #: (locale, word) -> phones, for the per-word group-count probe in
-#: `FusionTokenizer._merge_groups_per_word`. Bounded so a long training run
+#: `FusionTokenizer._blocks_from_words`. Bounded so a long training run
 #: cannot grow it without limit; the corpus vocabulary is far smaller.
 _WORD_PHONE_CACHE: Dict[Tuple[str, str], List[str]] = {}
 _WORD_PHONE_CACHE_MAX = 200_000
+
 
 
 def _shared_emilia_tokenizer() -> EmiliaTokenizer:
@@ -123,65 +125,52 @@ def _shared_emilia_tokenizer() -> EmiliaTokenizer:
     return _bare_emilia_tokenizer
 
 
-def _flatten_espeak_output(sentences) -> List[str]:
-    return reduce(lambda x, y: x + y, sentences, [])
+def _flatten_espeak_output(sentences) -> Tuple[List[str], List[int]]:
+    """Concatenate espeak's per-sentence lists, keeping where they joined.
+
+    `phonemize_espeak` returns ONE LIST PER SENTENCE. The concatenation is
+    required -- upstream `EspeakTokenizer.g2p` (tokenizer.py:142) does the
+    same `reduce(x + y)`, and the source checkpoint was trained on the
+    concatenated sequence, so the phones must not change. But the sentence
+    boundary is real information, and discarding it is what forced this
+    module to guess boundaries back from punctuation.
+
+    Returns (flat, sentence_ends), where `sentence_ends` are indices into
+    `flat` marking the end of each sentence (the last is len(flat)).
+    """
+    flat: List[str] = []
+    sentence_ends: List[int] = []
+    for sentence in sentences:
+        flat.extend(sentence)
+        sentence_ends.append(len(flat))
+    return flat, sentence_ends
 
 
-#: Phone symbols after which espeak may start a new word *without* emitting a
-#: separating ' '. See `_split_into_groups`.
+#: Punctuation that carries no segmental content, so it is skipped when
+#: comparing phone sequences and attached to the group it follows.
 #:
-#: ',' is deliberately absent, and not because breaking on it would double-
-#: break (the lookahead guard already prevents that): espeak emits a space
-#: after a comma, so the space rule already closes the group exactly once.
-#: Verified -- "alpha, beta" phonemizes to [... 'ə', ',', ' ', 'b', ...].
-#:
-#: Note this behaviour is **voice-dependent**, which is why the sentence-
-#: boundary bug hit Vietnamese and not English: espeak-vi emits '.' with no
-#: following space ("nguoi. Rat" -> [... 'j', '.', 'z', ...]), while
-#: espeak-en-us drops the '.' entirely and emits a space instead
-#: ("beta. gamma" -> [... 'ə', ' ', 'ɡ', ...]). Adding a voice must therefore
-#: re-check this set against that voice's real output rather than assume it.
-_SENTENCE_END_PHONES = frozenset(".!?;:")
+#: This used to be called _IGNORABLE_PUNCTUATION and was used to *detect*
+#: sentence boundaries, on the mistaken belief that espeak emitted no space
+#: after a period. It does not need detecting: `phonemize_espeak` returns one
+#: list per sentence and `_flatten_espeak_output` now reports where they
+#: joined. The set's real and only job is punctuation that should not block a
+#: content match.
+_IGNORABLE_PUNCTUATION = frozenset(".!?;:")
 
 
 def _split_into_groups(flat_phones: List[str]) -> List[List[str]]:
-    """Split a flat phone sequence into word-equivalent groups.
+    """Split a flat phone sequence on the literal ' ' phone symbol.
 
-    Groups break on the literal ' ' phone symbol (which `phonemize_espeak`
-    emits as an ordinary element -- confirmed empirically), and *also* after
-    sentence-final punctuation. The space itself is kept (not dropped) as the
-    trailing element of the group before it, so flattening the returned
-    groups reproduces `flat_phones` exactly, unchanged.
-
-    The sentence-final rule exists because espeak emits **no space after a
-    sentence-final period**: "nguoi. Rat" phonemizes to `... j . z ...` with
-    no ' ' between, so a space-only split silently merges the last word of
-    one sentence with the first word of the next. Every internal sentence
-    boundary then costs exactly one group, the group count stops matching
-    the whitespace-word count, and `text_to_artifact` gives up and returns
-    `lm_token_groups=None` for the whole utterance -- disabling the Qwen
-    branch for it entirely.
-
-    That was not a corner case. Measured on this project's training corpus
-    before the fix, alignment succeeded for only **7.3%** of utterances
-    (2.7% of those over 50 words, which is most of the corpus at a 28.9s
-    mean), because long utterances contain many sentences. The first
-    training run was therefore ~93% phone-only.
-
-    A break is suppressed when a ' ' already follows the punctuation, so
-    that case still closes the group exactly once and no group is emitted
-    that consists solely of a separator.
+    Used only by the Chinese path's embedded-English segments, where the
+    blocks are later coarsened against lm_token offsets anyway. The plain
+    path does not use it: `_blocks_from_words` locates boundaries by matching
+    phone content, with espeak's own sentence boundaries as hard cuts.
     """
     groups: List[List[str]] = []
     current: List[str] = []
-    last = len(flat_phones) - 1
-    for i, symbol in enumerate(flat_phones):
+    for symbol in flat_phones:
         current.append(symbol)
-        if symbol == " " or (
-            symbol in _SENTENCE_END_PHONES
-            and i < last
-            and flat_phones[i + 1] != " "
-        ):
+        if symbol == " ":
             groups.append(current)
             current = []
     if current:
@@ -207,6 +196,131 @@ def _whitespace_spans(text: str) -> List[Tuple[int, int]]:
     if start is not None:
         spans.append((start, len(text)))
     return spans
+
+
+#: How many words a block may span before the rest of the utterance is taken
+#: as one block. Merges observed in practice are 2-3 words ("of the"); the
+#: bound stops a pathological utterance from going quadratic.
+_MAX_BLOCK_WORDS = 8
+
+#: Ignored when *comparing* phone content. Still emitted, always.
+#:
+#: Includes the IPA stress marks. Stress is sentence-level prosody, not
+#: segmental content: espeak gives "how" as 'hˈaʊ' alone but 'hˌaʊ' inside a
+#: sentence, and "this" as 'ðˈɪs' alone but 'ðɪs' unstressed. Comparing them
+#: would force those words to merge for a difference that cannot change
+#: which word a phone belongs to.
+_IGNORED_WHEN_MATCHING = (
+    _IGNORABLE_PUNCTUATION
+    | {" ", ",", "-", "\u2013", "\u2014"}
+    | {"\u02c8", "\u02cc"}  # primary / secondary stress
+)
+
+#: Attached to the block they follow once its content is matched. Strictly
+#: smaller than `_IGNORED_WHEN_MATCHING`: **stress marks are excluded**.
+#:
+#: Ignoring a symbol when comparing and deciding which group owns it are
+#: different operations, and conflating them misassigns. A stress mark
+#: belongs to the syllable it precedes, i.e. to the NEXT word: for
+#: `flat = [a, ' ', ˈ, b]` with words X=[a] and Y=[ˈ, b], attaching every
+#: trailing ignorable would give X = [a, ' ', ˈ] and Y = [b], moving Y's
+#: stress into X. Both the partition and byte-identity checks still pass,
+#: which is exactly why this needed a separate set rather than an assert.
+_TRAILING_ATTACHABLE = _IGNORABLE_PUNCTUATION | {" ", ",", "-", "\u2013", "\u2014"}
+
+
+def _ends_from_word_blocks(
+    word_blocks: Optional[List[List[str]]], canonical_text: str
+) -> Optional[List[int]]:
+    """Character offset where each word block ends, for the lm_token walk."""
+    if word_blocks is None:
+        return None
+    spans = _whitespace_spans(canonical_text)
+    ends: List[int] = []
+    consumed = 0
+    for block in word_blocks:
+        consumed += len(block)
+        ends.append(spans[consumed - 1][1] if consumed else 0)
+    return ends
+
+
+def _has_han(text: str) -> bool:
+    """True if `text` contains a character the *segmenter* treats as Chinese.
+
+    Delegates to `EmiliaTokenizer.is_chinese` rather than defining its own
+    range, so the outer routing gate and the segmenter cannot disagree. They
+    did when this had its own list: it accepted the CJK compatibility block
+    (U+F900..) which `is_chinese` (U+4E00..U+9FA5) rejects, so such text took
+    the mixed path only to be labelled Latin anyway -- and picked up
+    `preprocess_text` on the way, altering text for no reason.
+
+    Widening the class here alone would not help: supplementary ideographs
+    (U+20000 and beyond) are rejected by the segmenter too, so routing them
+    in would change nothing. Extending Chinese coverage means changing
+    `is_chinese`, and that belongs with the deferred Chinese work.
+
+    Text with no such character skips routing entirely and keeps the plain
+    single-voice path byte-for-byte.
+    """
+    emilia = _shared_emilia_tokenizer()
+    return any(emilia.is_chinese(ch) for ch in text)
+
+
+def _match_phone_content(
+    flat: List[str],
+    cursor: int,
+    wanted: List[str],
+    sentence_ends: Sequence[int] = (),
+) -> Optional[int]:
+    """Consume `wanted`'s phone content from `flat` at `cursor`, ignoring
+    `_IGNORED_WHEN_MATCHING` on both sides. Returns the new cursor, or None
+    if the content diverges.
+
+    Trailing separators are absorbed afterwards, but not past the end of the
+    sentence containing the **last matched content phone**. A separator
+    emitted after a sentence end was produced as part of the next sentence,
+    so absorbing it would pull that sentence's leading whitespace backwards.
+
+    The limit must be derived from where matching *ended*, not where it
+    began. A match may legitimately span sentences -- sentence boundaries do
+    not constrain grouping, only separator ownership -- and bounding by the
+    starting cursor then strands the match's own trailing punctuation:
+    for flat=[a,'.',b,'.',c] with ends=[2,4,5], a probe of [a,'.',b,'.']
+    matches through index 3 but a start-derived limit of 2 blocks the '.',
+    handing it to the following word.
+
+    Sentence ends are cumulative and therefore sorted, so the containing end
+    is found by binary search rather than scanning them all -- with one word
+    per sentence a linear scan is quadratic over the utterance.
+    """
+    content = [p for p in wanted if p not in _IGNORED_WHEN_MATCHING]
+    i = cursor
+    matched = 0
+    while i < len(flat) and matched < len(content):
+        if flat[i] in _IGNORED_WHEN_MATCHING:
+            i += 1
+            continue
+        if flat[i] != content[matched]:
+            return None
+        i += 1
+        matched += 1
+    if matched != len(content):
+        return None
+
+    # First sentence end at or after the content cursor. `bisect_left` gives
+    # exactly that: when `i` is itself a sentence end, attachment stops there
+    # rather than reaching into the next sentence. An empty probe never
+    # advanced `i`, so it is bounded by the sentence containing `cursor`,
+    # which is the only defined answer for it.
+    if sentence_ends:
+        position = bisect.bisect_left(sentence_ends, i)
+        stop = sentence_ends[position] if position < len(sentence_ends) else len(flat)
+    else:
+        stop = len(flat)
+    stop = min(stop, len(flat))
+    while i < stop and flat[i] in _TRAILING_ATTACHABLE:
+        i += 1
+    return i
 
 
 @dataclass
@@ -520,7 +634,7 @@ class FusionTokenizer:
         assert (
             self.has_tokens
         ), "Please initialize FusionTokenizer with a tokens file."
-        groups, spans, canonical_text = self._frontend(text)
+        groups, block_ends, canonical_text = self._frontend(text)
 
         flat_phones: List[str] = []
         raw_groups: List[List[int]] = []  # indices into flat_phones (pre-OOV)
@@ -538,20 +652,36 @@ class FusionTokenizer:
             raw_to_filtered[raw_idx] = len(phone_ids)
             phone_ids.append(self.token2id[symbol])
 
+        # OOV filtering can empty a phone group. Dropping its *text* would
+        # remove that word from what Qwen reads and change the context of
+        # every token after it (measured: "xin chao ban" reached Qwen as
+        # "xin ban"). Dropping only the group's BOUNDARY instead merges its
+        # characters into the next surviving group, so the lm side stays
+        # whole while the phone side loses only what the vocabulary cannot
+        # represent.
         filtered_groups: List[List[int]] = []
-        filtered_spans: List[Optional[Tuple[int, int]]] = []
-        for raw_group, span in zip(raw_groups, spans):
+        filtered_ends: List[int] = []
+        ends = block_ends if block_ends is not None else [None] * len(raw_groups)
+        for raw_group, end in zip(raw_groups, ends):
             filtered = [raw_to_filtered[i] for i in raw_group if i in raw_to_filtered]
             if filtered:
                 filtered_groups.append(filtered)
-                filtered_spans.append(span)
+                if end is not None:
+                    filtered_ends.append(end)
 
         filtered_phones = [""] * len(phone_ids)
         for raw_idx, filtered_idx in raw_to_filtered.items():
             filtered_phones[filtered_idx] = flat_phones[raw_idx]
 
-        lm_tokens, lm_token_ids, lm_token_groups = self._lm_tokens_and_groups(
-            canonical_text, filtered_groups, filtered_spans
+        (
+            lm_tokens,
+            lm_token_ids,
+            lm_token_groups,
+            filtered_groups,
+        ) = self._lm_tokens_and_groups(
+            canonical_text,
+            filtered_ends if block_ends is not None else None,
+            filtered_groups,
         )
         zero_duration_mask = (
             self.lm_tokenizer.zero_duration_mask(lm_token_ids)
@@ -573,236 +703,398 @@ class FusionTokenizer:
     def _lm_tokens_and_groups(
         self,
         canonical_text: str,
-        filtered_groups: List[List[int]],
-        filtered_spans: List[Optional[Tuple[int, int]]],
-    ) -> Tuple[List[str], List[int], Optional[List[List[int]]]]:
-        if self.lm_tokenizer is None:
-            return [], [], None
+        block_ends: Optional[List[int]],
+        phone_groups: List[List[int]],
+    ) -> Tuple[List[str], List[int], Optional[List[List[int]]], List[List[int]]]:
+        """lm_tokens for the utterance, grouped to match `word_blocks`.
 
+        Each block's words are tokenized on their own and concatenated,
+        which reproduces the whole-text tokenization exactly because Qwen's
+        BPE is concatenative at whitespace boundaries -- the vocabulary's
+        only multi-word tokens are runs of whitespace, so no merge crosses a
+        space between real words. That is asserted below rather than
+        trusted, and it is what makes the group boundaries exact instead of
+        inferred from character offsets.
+
+        The previous implementation mapped word character-spans onto
+        `offset_mapping`, which left standalone space tokens belonging to no
+        group at all (measured: 0.30% of lm_tokens). Grouping by
+        construction removes that class of gap entirely.
+        """
+        if self.lm_tokenizer is None:
+            return [], [], None, phone_groups
+
+        hf = self.lm_tokenizer.hf_tokenizer
         # This fusion architecture always uses the deterministic, immutable
         # `[LANG:xx]` tag for `self.lang` (never `[LANG:auto]` or a wrong
-        # tag -- see the ADR's point 2, which requires --lang-auto-prob and
-        # --lang-wrong-prob both be 0 for this architecture), so it is
-        # prepended here rather than left to a caller. It occupies
-        # lm_token index 0 -- a control token, never part of any group --
-        # so every group's lm_token indices are offset by +1 below.
+        # tag -- see the 2026-09-02 ADR's point 2). It occupies lm_token
+        # index 0, a control token that belongs to no group, so every
+        # group's indices below start at 1.
         tag = f"[LANG:{self.lang}]"
         assert tag in self.lm_tokenizer.lang_tags, (
             f"lm_tokenizer was not constructed with the {tag!r} control "
             f"token (has {self.lm_tokenizer.lang_tags}) -- FusionTokenizer "
             "requires it to prepend the utterance's language tag."
         )
-        tag_id = self.lm_tokenizer.hf_tokenizer.convert_tokens_to_ids(tag)
+        tag_id = hf.convert_tokens_to_ids(tag)
 
-        encoding = self.lm_tokenizer.hf_tokenizer(
+        if block_ends is None:
+            # No word segmentation for this path (Chinese, see `_frontend`).
+            ids = hf.encode(canonical_text, add_special_tokens=False)
+            return (
+                [tag] + hf.convert_ids_to_tokens(ids),
+                [tag_id] + ids,
+                None,
+                phone_groups,
+            )
+
+        # The lm_token sequence is the WHOLE-text tokenization, always --
+        # authoritative, and identical to what a non-fusion run would feed
+        # Qwen. Only the grouping is derived here.
+        #
+        # An earlier attempt tokenized each block separately and relied on
+        # Qwen's BPE being concatenative at whitespace. That holds for single
+        # spaces but NOT for runs -- the vocabulary has multi-whitespace
+        # tokens -- so it silently rewrote the text Qwen sees. Tokenizing the
+        # whole text drops that assumption entirely.
+        #
+        # Assignment is total: walking tokens and blocks together in order,
+        # a token belongs to the first block whose end it has not passed.
+        # Whitespace between two blocks therefore lands on the FOLLOWING
+        # block, and every token lands in exactly one group -- unlike the
+        # original character-overlap rule, which left standalone space
+        # tokens (0.30% of lm_tokens, measured) in no group at all.
+        encoding = hf(
             canonical_text, add_special_tokens=False, return_offsets_mapping=True
         )
-        lm_token_ids: List[int] = [tag_id] + encoding["input_ids"]
-        lm_tokens: List[str] = [
-            tag
-        ] + self.lm_tokenizer.hf_tokenizer.convert_ids_to_tokens(encoding["input_ids"])
+        ids: List[int] = encoding["input_ids"]
         offsets: List[Tuple[int, int]] = encoding["offset_mapping"]
+        lm_token_ids = [tag_id] + list(ids)
+        lm_tokens = [tag] + hf.convert_ids_to_tokens(ids)
 
-        if len(filtered_spans) != len(filtered_groups) or any(
-            s is None for s in filtered_spans
-        ):
-            logging.debug(
-                "FusionTokenizer: could not align phone groups with "
-                "lm_token character spans (missing/mismatched word spans) "
-                "-- lm_token_groups left as None for this utterance."
+        if not block_ends:
+            # Every phone group was filtered away (all-OOV, or text that is
+            # only whitespace). There is nothing to attach conditioning to,
+            # and the walk below needs at least one destination group.
+            logging.warning(
+                "FusionTokenizer: no phone groups survived; keeping the full "
+                "lm_tokens but leaving lm_token_groups=None."
             )
-            return lm_tokens, lm_token_ids, None
+            return lm_tokens, lm_token_ids, None, phone_groups
 
-        lm_token_groups: List[List[int]] = []
-        for start, end in filtered_spans:
-            lm_token_groups.append(
-                [
-                    i + 1
-                    for i, (o_start, o_end) in enumerate(offsets)
-                    if o_end > start and o_start < end
-                ]
+        # A phone-block boundary is only usable if no lm_token straddles it.
+        # A token that covers substantive characters from two blocks cannot
+        # be split between them, and assigning it to one silently gives that
+        # block a token containing another block's text -- measured on real
+        # Chinese: jieba cuts "今天|天气|很好" while BPE emits "很好" across
+        # the 天气/很好 boundary, and "我喜欢" across two boundaries.
+        #
+        # Routing and word boundaries decide which phonemizer runs; they do
+        # not have to survive as conditioning boundaries. So drop the
+        # boundaries the tokenizer contradicts and merge those blocks. This
+        # also subsumes the leading-separator case, where a token spans a
+        # separator-only first block and the word after it.
+        incompatible = set()
+        for token_start, token_end in offsets:
+            for boundary, end in enumerate(block_ends[:-1]):
+                if token_start < end < token_end:
+                    incompatible.add(boundary)
+
+        merged_ends: List[int] = []
+        merged_phone_groups: List[List[int]] = []
+        current: List[int] = []
+        for index, end in enumerate(block_ends):
+            current = current + phone_groups[index]
+            if index not in incompatible:
+                merged_ends.append(end)
+                merged_phone_groups.append(current)
+                current = []
+        if current:  # trailing blocks whose boundary was dropped
+            merged_phone_groups[-1] = merged_phone_groups[-1] + current
+
+        lm_token_groups: List[List[int]] = [[] for _ in merged_ends]
+        block_number = 0
+        for token_index, (token_start, _) in enumerate(offsets):
+            while (
+                block_number < len(merged_ends) - 1
+                and token_start >= merged_ends[block_number]
+            ):
+                block_number += 1
+            lm_token_groups[block_number].append(token_index + 1)
+
+        if any(not g for g in lm_token_groups):
+            logging.warning(
+                "FusionTokenizer: a group received no lm_tokens even after "
+                "coarsening; leaving lm_token_groups=None rather than "
+                "emitting an empty group."
             )
-        return lm_tokens, lm_token_ids, lm_token_groups
+            return lm_tokens, lm_token_ids, None, phone_groups
+        return lm_tokens, lm_token_ids, lm_token_groups, merged_phone_groups
 
     # -- internal: unified phone-groups + canonical-text-span frontend --
 
     def _frontend(
         self, text: str
-    ) -> Tuple[List[List[str]], List[Optional[Tuple[int, int]]], str]:
-        """Returns (phone_groups, group_spans, canonical_text), where
-        `group_spans[i]` is the (start, end) character span of group `i`
-        within `canonical_text` (or None if unavailable), and
-        `canonical_text` is the exact text phones were derived from --
-        i.e. `text` after this tokenizer's own opt-in normalization, if
-        any. `lm_tokens` are computed over this same `canonical_text` so
-        that offsets on both sides line up.
+    ) -> Tuple[List[List[str]], Optional[List[int]], str]:
+        """Returns (phone_blocks, block_end_offsets, canonical_text).
+
+        `block_end_offsets[i]` is the character offset in `canonical_text`
+        where block `i` ends; the lm_token side groups by walking token
+        offsets against these. Offsets rather than words, because Chinese
+        has no whitespace to count.
+
+        Routing follows the author's rule: a Han-script segment is always
+        phonemized as Chinese regardless of this instance's `lang`, and a
+        Latin-script segment follows `lang` -- with `lang="zh"` falling back
+        to Vietnamese for Latin text, since "Chinese" says nothing about how
+        to read embedded Latin words.
+
+        Text with no Han characters skips routing entirely and takes the
+        plain path, so the 100% of this corpus that is VI/EN keeps exactly
+        the behaviour (and the byte-identity with EspeakTokenizer) it had
+        before routing existed.
         """
-        if self.lang == "zh":
-            return self._zh_phone_groups_and_spans(text)
-        return self._plain_phone_groups_and_spans(text)
+        if not _has_han(text):
+            blocks, word_blocks, canonical = self._plain_phone_groups_and_spans(text)
+            return blocks, _ends_from_word_blocks(word_blocks, canonical), canonical
+        return self._mixed_script_blocks(text)
+
+    def _mixed_script_blocks(
+        self, text: str
+    ) -> Tuple[List[List[str]], List[int], str]:
+        """Per-segment routing for text that mixes Han and Latin script."""
+        emilia = _shared_emilia_tokenizer()
+        # Full/half-width punctuation mapping, required for get_segment's own
+        # routing to work. Applied only on this path, so non-Han text is
+        # untouched.
+        canonical_source = emilia.preprocess_text(text)
+        latin_locale = _ESPEAK_LOCALE["vi" if self.lang == "zh" else self.lang]
+
+        phone_blocks: List[List[str]] = []
+        block_ends: List[int] = []
+        parts: List[str] = []
+        cursor = 0
+        for seg_text, seg_lang in emilia.get_segment(canonical_source):
+            if seg_lang == "zh":
+                groups, spans, seg_canonical = self._zh_segment_groups_and_spans(
+                    seg_text, emilia, cursor
+                )
+                for group, span in zip(groups, spans):
+                    if not group:
+                        continue
+                    phone_blocks.append(group)
+                    block_ends.append(
+                        span[1] if span else cursor + len(seg_canonical)
+                    )
+            elif seg_lang in ("en", "pinyin", "tag"):
+                if seg_lang == "en" and self.lang == "en" and self.use_normalizer:
+                    # Same normalization the plain path applies. Without
+                    # this, adding one Han character to an utterance
+                    # silently turned off the English normalizer everywhere
+                    # else in it.
+                    seg_canonical = _shared_emilia_tokenizer(
+                    ).english_normalizer.normalize(seg_text)
+                else:
+                    seg_canonical = seg_text
+                if seg_lang == "en":
+                    flat, seg_sentence_ends = self._espeak_flat_phones(
+                        seg_canonical, latin_locale, allow_empty=True
+                    )
+                    spans = _whitespace_spans(seg_canonical)
+                    words = [seg_canonical[a:b] for a, b in spans]
+                    groups, word_groups = self._blocks_from_words(
+                        flat, words, latin_locale,
+                        sentence_ends=seg_sentence_ends,
+                    )
+                    consumed = 0
+                    for group, block_words in zip(groups, word_groups):
+                        consumed += len(block_words)
+                        phone_blocks.append(group)
+                        block_ends.append(
+                            cursor
+                            + (spans[consumed - 1][1] if consumed else len(seg_canonical))
+                        )
+                else:
+                    phone = (
+                        emilia.tokenize_pinyin(seg_text)
+                        if seg_lang == "pinyin"
+                        else [seg_text]
+                    )
+                    if phone:
+                        phone_blocks.append(phone)
+                        block_ends.append(cursor + len(seg_canonical))
+            else:
+                # Its text is KEPT even though it yields no phones. Dropping
+                # it would delete those characters from the canonical text,
+                # and the canonical text is what Qwen is tokenized over --
+                # so an unsupported segment would silently remove context
+                # from every token after it. With no block emitted, its
+                # tokens simply join the following group.
+                logging.warning(
+                    "No English or Chinese characters found; segment "
+                    f"contributes no phones: {(seg_text, seg_lang)}"
+                )
+                seg_canonical = seg_text
+            parts.append(seg_canonical)
+            cursor += len(seg_canonical)
+
+        # A block whose phones are all separators (the space that ends a
+        # Han segment, say) owns a character range so narrow that a single
+        # lm_token straddles it, which starves the block after it and
+        # produces an empty group. Fold such blocks into their predecessor:
+        # a separator belongs to the unit it follows.
+        merged_phones: List[List[str]] = []
+        merged_ends: List[int] = []
+        for group, end in zip(phone_blocks, block_ends):
+            if merged_phones and all(p in _TRAILING_ATTACHABLE for p in group):
+                # Phones merge, but the character boundary does NOT move.
+                # Extending it would hand the following word's leading-space
+                # token to this block -- "Ġcùng" starts at the space -- and
+                # starve the next group. Whitespace characters belong to the
+                # block that follows them, matching the Latin path.
+                merged_phones[-1] = merged_phones[-1] + group
+            else:
+                merged_phones.append(list(group))
+                merged_ends.append(end)
+
+        return merged_phones, merged_ends, "".join(parts)
 
     # -- internal: plain espeak path (en/vi), matching EspeakTokenizer.g2p()
     # when use_normalizer[lang] is False --
 
     def _plain_phone_groups_and_spans(
         self, text: str
-    ) -> Tuple[List[List[str]], List[Optional[Tuple[int, int]]], str]:
+    ) -> Tuple[List[List[str]], Optional[List[List[str]]], str]:
+        """Blocks for the plain espeak path (en/vi).
+
+        Returns (phone_blocks, word_blocks, canonical_text) where
+        `word_blocks[i]` are the whitespace words whose phones are
+        `phone_blocks[i]`. A block is one word wherever possible and several
+        only where espeak forces it -- see `_blocks_from_words`.
+        """
         if self.lang == "en" and self.use_normalizer:
             canonical_text = _shared_emilia_tokenizer().english_normalizer.normalize(
                 text
             )
         else:
             canonical_text = text
-        locale = _ESPEAK_LOCALE[self.lang]
-        groups = _split_into_groups(self._espeak_flat_phones(canonical_text, locale))
-        word_spans = _whitespace_spans(canonical_text)
-
-        # One group per *text* word, which is what the lm_token side is
-        # anchored to. espeak does not give that for free: it expands some
-        # single text tokens into several spoken words -- "1997" becomes five
-        # ("mot nghin chin tram chin muoi bay"), "ui/ux" splits at the slash,
-        # acronyms spell out. Requiring len(groups) == len(word_spans) can
-        # therefore never reach full coverage; measured on this corpus it
-        # left 2.7% of utterances unaligned, 68% of those because espeak
-        # produced MORE groups than words, not fewer.
-        #
-        # So ask each word how many groups it is worth, by phonemizing it on
-        # its own, and let it consume exactly that many. "1997" alone also
-        # yields five groups, so it consumes its five and the following words
-        # stay in step. The whole-utterance phonemization is still what gets
-        # emitted -- these per-word calls only decide where the boundaries
-        # go, so cross-word phonology is untouched and the flat phone
-        # sequence remains byte-identical to EspeakTokenizer's (sprint 000's
-        # hard requirement). Verified separately that interleaving these
-        # extra espeak calls does not perturb whole-utterance output.
-        merged = self._merge_groups_per_word(groups, word_spans, canonical_text, locale)
-        if merged is not None:
-            return merged[0], merged[1], canonical_text
-
-        spans: List[Optional[Tuple[int, int]]] = (
-            list(word_spans) if len(word_spans) == len(groups) else [None] * len(groups)
+        # Latin-script text follows `lang`, and lang="zh" falls back to
+        # Vietnamese: "Chinese" says nothing about how to read Latin words,
+        # and _ESPEAK_LOCALE has no zh entry because Chinese never goes
+        # through espeak at all.
+        locale = _ESPEAK_LOCALE["vi" if self.lang == "zh" else self.lang]
+        flat, sentence_ends = self._espeak_flat_phones(canonical_text, locale)
+        words = canonical_text.split()
+        phone_blocks, word_blocks = self._blocks_from_words(
+            flat, words, locale, sentence_ends=sentence_ends
         )
-        return groups, spans, canonical_text
+        return phone_blocks, word_blocks, canonical_text
 
-    def _merge_groups_per_word(
+    def _blocks_from_words(
         self,
-        groups: List[List[str]],
-        word_spans: List[Tuple[int, int]],
-        canonical_text: str,
+        flat: List[str],
+        words: List[str],
         locale: str,
-    ) -> Optional[Tuple[List[List[str]], List[Optional[Tuple[int, int]]]]]:
-        """One group per whitespace word. Content matching first (the real
-        test), then the looser count match, then give up."""
-        if not word_spans:
-            return None
-        by_content = self._merge_groups_by_content(
-            groups, word_spans, canonical_text, locale
-        )
-        if by_content is not None:
-            return by_content
-        return self._merge_groups_by_count(groups, word_spans, canonical_text, locale)
+        sentence_ends: Sequence[int] = (),
+    ) -> Tuple[List[List[str]], List[List[str]]]:
+        """Cut `flat` into blocks, one per group of consecutive `words`.
 
-    def _merge_groups_by_content(
-        self,
-        groups: List[List[str]],
-        word_spans: List[Tuple[int, int]],
-        canonical_text: str,
-        locale: str,
-    ) -> Optional[Tuple[List[List[str]], List[Optional[Tuple[int, int]]]]]:
-        """Regroup the flat phone sequence so there is exactly one group per
-        whitespace word, by matching phone **content** rather than trusting
-        espeak's separators.
+        See docs/adr/2026-09-07__phone_lm_token_group_alignment.md. A block
+        is widened until the words in it phonemize, on their own, to the
+        phones actually present at that position -- separators and
+        punctuation ignored on both sides. Widening goes backward as well as
+        forward, because the context that decides a word's pronunciation
+        usually sits to its left: "the" is Vietnamese 'tˈɛ' alone and stays
+        so in "the mang", but is 'ðə' in "book of the".
 
-        Separator-based grouping cannot be made reliable. espeak omits the
-        separator in cases that are not predictable from punctuation rules --
-        measured on this corpus, "book of the" phonemizes with "of" and "the"
-        fused as a single run, and sentence boundaries drop it too -- while
-        also splitting single text tokens into several spoken words ("1997"
-        into five). Counting groups therefore fails in both directions.
-
-        So each word is phonemized on its own to learn its phone content, and
-        that content is consumed from the whole-utterance sequence in order.
-        Separators and punctuation are skipped on both sides during matching
-        and assigned to the group they trail, which keeps flattening lossless:
-        the emitted phones remain exactly the whole-utterance ones, so
-        cross-word phonology is preserved and the sequence stays
-        byte-identical to EspeakTokenizer's (sprint 000's hard requirement).
-
-        Returns None if the content does not line up, leaving the caller to
-        fall back to the plain count match and then to no alignment. That
-        still happens for genuine disagreements between a word alone and the
-        same word in context.
+        This cannot fail. If nothing matches, the block keeps widening until
+        it is the whole remaining utterance -- a coarse alignment, not a
+        dropped utterance. The phones emitted are always slices of `flat`,
+        never the per-word probes, so cross-word phonology is preserved.
         """
-        if not word_spans:
-            return None
-        flat = [p for group in groups for p in group]
-        skippable = _SENTENCE_END_PHONES | {" ", ",", "-", "\u2013", "\u2014"}
+        if not words:
+            return ([flat], [[]]) if flat else ([], [])
 
-        merged: List[List[str]] = []
-        i = 0
-        for start, end in word_spans:
-            word_content = [
-                p
-                for p in self._word_phones(canonical_text[start:end], locale)
-                if p not in skippable
-            ]
-            span_start = i
-            matched = 0
-            while i < len(flat) and matched < len(word_content):
-                symbol = flat[i]
-                if symbol in skippable:
-                    i += 1
-                    continue
-                if symbol != word_content[matched]:
-                    return None
-                i += 1
-                matched += 1
-            if matched != len(word_content):
-                return None
-            # Trailing separators/punctuation belong to the group they follow.
-            while i < len(flat) and flat[i] in skippable:
-                i += 1
-            merged.append(flat[span_start:i])
-
-        if i != len(flat) or any(not g for g in merged):
-            return None
-        assert [p for g in merged for p in g] == flat, (
-            "regrouping must not change the phone sequence"
-        )
-        return merged, list(word_spans)
-
-    def _merge_groups_by_count(
-        self,
-        groups: List[List[str]],
-        word_spans: List[Tuple[int, int]],
-        canonical_text: str,
-        locale: str,
-    ) -> Optional[Tuple[List[List[str]], List[Optional[Tuple[int, int]]]]]:
-        """Looser fallback for `_merge_groups_per_word`: trust each word's
-        group *count* without checking that the phones match.
-
-        Content matching is the better test and is tried first, but it is
-        strictly stronger, so it rejects cases this accepts. That matters for
-        the mislabelled-English subset, where espeak-en spells Vietnamese
-        characters out and a word's isolated phones drift from its in-context
-        ones while the group count still lines up: measured, content matching
-        alone aligned 74% of that subset and this fallback recovers it to
-        85%. Weaker evidence, but the alternative is no conditioning at all.
-        """
-        counts = [
-            len(_split_into_groups(self._word_phones(canonical_text[s:e], locale)))
-            for s, e in word_spans
-        ]
-        if sum(counts) != len(groups):
-            return None
-        merged: List[List[str]] = []
+        phone_blocks: List[List[str]] = []
+        word_blocks: List[List[str]] = []
         cursor = 0
-        for count in counts:
-            merged.append([p for g in groups[cursor : cursor + count] for p in g])
-            cursor += count
-        if any(not g for g in merged):
-            return None
-        return merged, list(word_spans)
+        i = 0
+        while i < len(words):
+            must_cover = i
+            emitted = False
+            while True:
+                upper = min(i + _MAX_BLOCK_WORDS, len(words))
+                for j in range(max(i + 1, must_cover + 1), upper + 1):
+                    probe = self._word_phones(" ".join(words[i:j]), locale)
+                    end = _match_phone_content(
+                        flat, cursor, probe, sentence_ends=sentence_ends
+                    )
+                    # `end == cursor` means the words consumed no phones at
+                    # all -- a punctuation-only token like "-" that espeak
+                    # renders as nothing. Emitting it as its own group would
+                    # give a group with no phones, which the artifact
+                    # forbids and the extractor would mark invalid exactly
+                    # like padding. Widen instead, so it joins its neighbour.
+                    if end is not None and end > cursor:
+                        phone_blocks.append(flat[cursor:end])
+                        word_blocks.append(words[i:j])
+                        cursor, i = end, j
+                        emitted = True
+                        break
+                if emitted or not phone_blocks:
+                    break
+                # Absorb the previous block and retry with more left context.
+                prev_phones = phone_blocks.pop()
+                prev_words = word_blocks.pop()
+                cursor -= len(prev_phones)
+                i -= len(prev_words)
+            if not emitted:
+                tail = flat[cursor:]
+                if tail:
+                    phone_blocks.append(tail)
+                    word_blocks.append(words[i:])
+                elif phone_blocks:
+                    # No phones left (trailing punctuation-only words):
+                    # attach the words to the last real group rather than
+                    # emitting a group with no phones.
+                    word_blocks[-1] = word_blocks[-1] + words[i:]
+                else:
+                    # Nothing phonemized at all. Callers reject non-empty
+                    # text with zero phones upstream; reaching here means a
+                    # direct call, and returning nothing beats asserting.
+                    return [], []
+                cursor, i = len(flat), len(words)
+
+        # A block can match a prefix and still leave phones behind -- with
+        # P("X")=[a], P("Y")=[b] but P("X Y")=[a,b,c], the greedy walk takes
+        # X then Y and never tries the span that would have consumed 'c'.
+        #
+        # Attaching the remainder to the final block restores the partition,
+        # but it is heuristic assignment, NOT verified correspondence: the
+        # leftover is evidence that an earlier cut was wrong, and appending
+        # it does not establish which. The honest reading is that this keeps
+        # a contradiction from crashing the batch. Note the boundary
+        # coarsening in `_lm_tokens_and_groups` does NOT repair this: it can
+        # only remove cuts an lm_token contradicts. If X and Y each own their
+        # own token, nothing there flags the uncertain assignment, so a
+        # successful grouping is not evidence the phone cut was right.
+        if cursor < len(flat) and phone_blocks:
+            phone_blocks[-1] = phone_blocks[-1] + flat[cursor:]
+        elif cursor < len(flat):
+            phone_blocks.append(flat[cursor:])
+            word_blocks.append([])
+
+        assert all(phone_blocks), "no phone block may be empty"
+        assert len(phone_blocks) == len(word_blocks), (
+            f"{len(phone_blocks)} phone blocks vs {len(word_blocks)} word blocks"
+        )
+        assert [p for b in phone_blocks for p in b] == flat, (
+            "block construction must not change the phone sequence"
+        )
+        assert [w for b in word_blocks for w in b] == words, (
+            "block construction must not lose or reorder words"
+        )
+        return phone_blocks, word_blocks
 
     def _word_phones(self, word: str, locale: str) -> List[str]:
         """Phones for a single word, cached. Only ever used to count groups,
@@ -811,14 +1103,16 @@ class FusionTokenizer:
         cached = _WORD_PHONE_CACHE.get(key)
         if cached is None:
             try:
-                cached = _flatten_espeak_output(phonemize_espeak(word, locale))
+                cached, _ = _flatten_espeak_output(phonemize_espeak(word, locale))
             except Exception:
                 cached = []
             if len(_WORD_PHONE_CACHE) < _WORD_PHONE_CACHE_MAX:
                 _WORD_PHONE_CACHE[key] = cached
         return cached
 
-    def _espeak_flat_phones(self, text: str, locale: str) -> List[str]:
+    def _espeak_flat_phones(
+        self, text: str, locale: str, allow_empty: bool = False
+    ) -> Tuple[List[str], List[int]]:
         try:
             sentences = phonemize_espeak(text, locale)
         except Exception as ex:
@@ -836,8 +1130,11 @@ class FusionTokenizer:
                 f"phonemization failed for locale {locale!r} on text "
                 f"{text[:80]!r}: {ex}"
             ) from ex
-        phones = _flatten_espeak_output(sentences)
-        if text.strip() and not phones:
+        phones, sentence_ends = _flatten_espeak_output(sentences)
+        # `allow_empty` is for per-SEGMENT calls on the mixed-script path: a
+        # segment can legitimately be punctuation only and phonemize to
+        # nothing, while a whole utterance that does so is a real failure.
+        if not allow_empty and text.strip() and not phones:
             raise ValueError(
                 f"phonemization of locale {locale!r} produced no phones for "
                 f"non-empty text {text[:80]!r}. An empty phone sequence is "
@@ -845,7 +1142,7 @@ class FusionTokenizer:
                 f"check silently because empty groups trivially match empty "
                 f"spans."
             )
-        return phones
+        return phones, sentence_ends
 
     # -- internal: Emilia-routed path (zh), matching
     # EmiliaTokenizer.texts_to_tokens() when use_normalizer is True
@@ -853,7 +1150,25 @@ class FusionTokenizer:
 
     def _zh_phone_groups_and_spans(
         self, text: str
-    ) -> Tuple[List[List[str]], List[Optional[Tuple[int, int]]], str]:
+    ) -> Tuple[List[List[str]], Optional[List[List[str]]], str]:
+        """Chinese phone groups. Returns `None` for the word blocks, so the
+        artifact carries no `lm_token_groups` and Chinese trains phone-only.
+
+        This is deliberate, and stricter than what it replaces. The previous
+        character-span mapping produced **overlapping** groups here --
+        measured, "你好世界。今天天气很好" gave groups
+        [[1],[2],[3],[4,5],[6],[6]], with lm_token 6 assigned to two
+        different phone groups and a one-position shift after punctuation.
+        Wrong conditioning is worse than none, so it is not emitted.
+
+        The block method used for en/vi does not port directly: it needs a
+        word segmentation whose per-piece tokenization concatenates back to
+        the whole-text tokenization, and Chinese has no whitespace, so that
+        property does not hold at jieba boundaries. Chinese is 0% of this
+        project's corpus; enabling it needs its own alignment design plus
+        the segment-preservation tests noted in the 2026-09-02 ADR's known
+        gaps.
+        """
         emilia = _shared_emilia_tokenizer()
         # Full/half-width punctuation mapping required for get_segment()'s
         # own routing to work correctly -- not gated by use_normalizer,
@@ -864,13 +1179,11 @@ class FusionTokenizer:
         text = emilia.preprocess_text(text)
 
         groups: List[List[str]] = []
-        spans: List[Optional[Tuple[int, int]]] = []
         canonical_parts: List[str] = []
-        cursor = 0
         for seg_text, seg_lang in emilia.get_segment(text):
             if seg_lang == "zh":
-                seg_groups, seg_spans, seg_canonical = self._zh_segment_groups_and_spans(
-                    seg_text, emilia, cursor
+                seg_groups, _, seg_canonical = self._zh_segment_groups_and_spans(
+                    seg_text, emilia, 0
                 )
             elif seg_lang == "en":
                 normalized = (
@@ -879,37 +1192,27 @@ class FusionTokenizer:
                     else seg_text
                 )
                 seg_groups = _split_into_groups(
-                    self._espeak_flat_phones(normalized, "en-us")
-                )
-                word_spans = _whitespace_spans(normalized)
-                seg_spans = (
-                    [(s + cursor, e + cursor) for s, e in word_spans]
-                    if len(word_spans) == len(seg_groups)
-                    else [None] * len(seg_groups)
+                    self._espeak_flat_phones(normalized, "en-us")[0]
                 )
                 seg_canonical = normalized
             elif seg_lang == "pinyin":
                 phone = emilia.tokenize_pinyin(seg_text)
                 seg_groups = [phone] if phone else []
-                seg_spans = [(cursor, cursor + len(seg_text))] if phone else []
                 seg_canonical = seg_text
             elif seg_lang == "tag":
                 seg_groups = [[seg_text]]
-                seg_spans = [(cursor, cursor + len(seg_text))]
                 seg_canonical = seg_text
             else:
                 logging.warning(
                     "No English or Chinese characters found, "
                     f"skipping segment of unknown language: {(seg_text, seg_lang)}"
                 )
-                seg_groups, seg_spans, seg_canonical = [], [], ""
+                seg_groups, seg_canonical = [], ""
 
             groups.extend(seg_groups)
-            spans.extend(seg_spans)
             canonical_parts.append(seg_canonical)
-            cursor += len(seg_canonical)
 
-        return groups, spans, "".join(canonical_parts)
+        return groups, None, "".join(canonical_parts)
 
     def _zh_segment_groups_and_spans(
         self, seg_text: str, emilia: EmiliaTokenizer, base_cursor: int

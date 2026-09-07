@@ -149,7 +149,9 @@ def _report_mismatches(mismatches, total, label):
     )
 
 
-def _check_corpus_equivalence(samples, old_phones_fn, new_groups_fn, label):
+def _check_corpus_equivalence(
+    samples, old_phones_fn, new_groups_fn, label, script="latin"
+):
     """Compute each tokenizer's output in its own clean, uninterrupted pass
     over all samples before comparing -- NOT interleaved per-sample.
 
@@ -164,6 +166,47 @@ def _check_corpus_equivalence(samples, old_phones_fn, new_groups_fn, label):
     e.g. tokenizer.py's `add_tokens()`), which requires computing all of one
     tokenizer's outputs before starting the other's.
     """
+    # Two classes of sample are excluded, both deliberately.
+    #
+    # 1. Text containing Han characters. Since 2026-09-07 the tokenizer
+    #    routes Han-script segments through the Chinese pinyin path whatever
+    #    `lang` is, because the alternative was espeak announcing "chinese
+    #    letter" once per character. Byte-identity with a single-voice
+    #    EspeakTokenizer therefore holds only for non-Han text, and that is
+    #    the point rather than a regression.
+    # 2. Non-empty text that phonemizes to nothing at all -- raw web corpus
+    #    lines like '[' or '-------'. The tokenizer now raises on those
+    #    rather than emitting an empty artifact, so they cannot be
+    #    equivalence cases.
+    from zipvoice.tokenizer.fusion_tokenizer import _has_han
+
+    # `script` says which half of the routing this call is checking.
+    #   "latin": non-Han text only. Han text now goes through the Chinese
+    #            path whatever `lang` is, so it is deliberately no longer
+    #            byte-identical to a single-voice EspeakTokenizer.
+    #   "han":   Han text only. Latin text under lang="zh" now follows the
+    #            Vietnamese fallback rather than EmiliaTokenizer's en-us, so
+    #            it is deliberately no longer Emilia-identical.
+    usable = []
+    for text in samples:
+        if (script == "latin") == _has_han(text):
+            continue
+        if script == "han" and any(c.isascii() and c.isalpha() for c in text):
+            # Mixed Han+Latin. Under lang="zh" a Latin segment follows the
+            # Vietnamese fallback by the author's routing rule, where
+            # EmiliaTokenizer used en-us -- so "Amazon.co.uk" inside Chinese
+            # is deliberately no longer Emilia-identical. What must stay
+            # identical is the Chinese phonemization itself, which Han-only
+            # samples test directly.
+            continue
+        try:
+            old_phones_fn(text)
+            new_groups_fn(text)
+        except ValueError:
+            continue
+        usable.append(text)
+    samples = usable
+
     old_results = [old_phones_fn(text) for text in samples]
     new_group_results = [new_groups_fn(text) for text in samples]
 
@@ -240,6 +283,7 @@ def test_zh_corpus_equivalence():
         lambda text: old.texts_to_tokens([text])[0],
         new.phone_groups,
         "zh",
+        script="han",
     )
 
 
@@ -510,27 +554,126 @@ def test_artifact_post_init_rejects_out_of_range_lm_token_groups_index():
 # correctness on one handpicked string.
 
 
-def test_split_into_groups_breaks_after_sentence_final_punctuation():
-    from zipvoice.tokenizer.fusion_tokenizer import _split_into_groups
+def test_flatten_reports_where_sentences_joined():
+    """espeak returns ONE LIST PER SENTENCE, and that boundary is real
+    information.
 
-    # espeak's real shape at a sentence boundary: '.' with no following ' '.
-    flat = ["a", " ", "b", ".", "c", " ", "d"]
-    groups = _split_into_groups(flat)
-    assert ["".join(g) for g in groups] == ["a ", "b.", "c ", "d"], (
-        "the word after a sentence-final period must start a new group"
+    The original code discarded it in `reduce(x + y)` and then guessed
+    boundaries back from punctuation, on the mistaken belief that espeak
+    "emits no space after a period". The concatenation itself must stay --
+    upstream `EspeakTokenizer.g2p` does the same and the source checkpoint
+    was trained on the concatenated sequence -- so the boundary is reported
+    alongside instead.
+    """
+    from zipvoice.tokenizer.fusion_tokenizer import _flatten_espeak_output
+    from zipvoice.tokenizer.tokenizer import phonemize_espeak
+
+    sentences = phonemize_espeak("mọi người. Rất nhiều", "vi")
+    assert len(sentences) == 2, "espeak should split this into two sentences"
+
+    flat, ends = _flatten_espeak_output(sentences)
+    assert flat == [p for s in sentences for p in s], "concatenation unchanged"
+    assert ends == [len(sentences[0]), len(flat)]
+    # the join really is separator-free -- that is why it had to be reported
+    assert flat[ends[0] - 1] == "." and flat[ends[0]] != " "
+
+
+def test_sentence_end_bounds_trailing_attachment():
+    """A separator emitted after a sentence end belongs to the NEXT sentence,
+    so trailing attachment stops there.
+
+    This is the only thing sentence metadata does. It is NOT a group
+    boundary: two sentences being phonemized independently means widening
+    across one is unnecessary to recover pronunciation context, not that a
+    shared conditioning group is invalid, and a conditioning group need not
+    be a phonological unit. Enforcing it as a hard cut made results strictly
+    worse -- a rejected match fell through to the whole-remainder fallback,
+    producing a coarser block that crossed the boundary anyway.
+    """
+    from zipvoice.tokenizer.fusion_tokenizer import _match_phone_content
+
+    flat = ["a", ".", " ", "b"]
+    # sentence 1 ends at index 2, so the space at index 2 is sentence 2's
+    assert _match_phone_content(flat, 0, ["a", "."], sentence_ends=[2, 4]) == 2
+    # without metadata the space is absorbed into the preceding block
+    assert _match_phone_content(flat, 0, ["a", "."]) == 3
+
+
+def test_trailing_limit_follows_the_match_not_its_start(monkeypatch):
+    """The limit must come from where content matching ENDED.
+
+    A match may legitimately span sentences -- boundaries constrain
+    separator ownership, not grouping. Deriving the limit from the starting
+    cursor then strands the match's own punctuation: with
+    flat=[a,'.',b,'.',c] and ends=[2,4,5], a probe of [a,'.',b,'.'] matches
+    through index 3, but a start-derived limit of 2 blocked the '.' and
+    handed it to the following word.
+    """
+    import zipvoice.tokenizer.fusion_tokenizer as module
+
+    tok = _vi_tokenizer_or_skip()
+    probes = {"X.Y.": ["a", ".", "b", "."], "Z": ["c"]}
+    monkeypatch.setattr(
+        module.FusionTokenizer,
+        "_word_phones",
+        lambda self, w, l: probes.get(w, list(w)),
+    )
+    flat = ["a", ".", "b", ".", "c"]
+    blocks, _ = tok._blocks_from_words(
+        flat, ["X.Y.", "Z"], "vi", sentence_ends=[2, 4, 5]
+    )
+    assert blocks == [["a", ".", "b", "."], ["c"]], (
+        f"the match's own trailing '.' was reassigned: {blocks}"
     )
 
 
-def test_split_into_groups_does_not_double_break_on_punct_then_space():
-    from zipvoice.tokenizer.fusion_tokenizer import _split_into_groups
+def test_sentence_metadata_does_not_change_grouping(monkeypatch):
+    """Metadata corrects separator OWNERSHIP; it must not otherwise alter
+    the segmentation.
 
-    # When a space *does* follow the punctuation, the space rule closes the
-    # group; breaking on both would emit a group consisting only of ' '.
-    groups = _split_into_groups(["a", ".", " ", "b"])
-    assert ["".join(g) for g in groups] == ["a. ", "b"]
-    assert all(g and "".join(g).strip(" .!?;:") for g in groups), (
-        "no group may consist solely of separators"
+    Asserted as exact output rather than a group count -- equal counts can
+    still hide wrong boundaries, which is how the previous version's defect
+    survived its own regression test. The empty-probe/backtracking case
+    below is adversarial, not observed espeak output; it pins the
+    interaction because the implementation permits empty probes.
+    """
+    import zipvoice.tokenizer.fusion_tokenizer as module
+
+    tok = _vi_tokenizer_or_skip()
+
+    probes = {
+        "X": ["b"], "X Y": [], "X Y Z": [".", "b", "."],
+        "Y": [], "Y Z": ["b"], "Z": ["b"],
+    }
+    monkeypatch.setattr(
+        module.FusionTokenizer,
+        "_word_phones",
+        lambda self, w, l: probes.get(w, list(w)),
     )
+    flat = [".", "b", "."]
+    without = tok._blocks_from_words(flat, ["X", "Y", "Z"], "vi")[0]
+    with_ends = tok._blocks_from_words(
+        flat, ["X", "Y", "Z"], "vi", sentence_ends=[1, 3]
+    )[0]
+    assert with_ends == without, f"metadata changed grouping: {without} -> {with_ends}"
+    # Pinned absolutely as well as relatively: equality alone would let a
+    # future regression that affects BOTH paths pass unnoticed.
+    assert without == [["."], ["b", "."]]
+
+    # The one case it is meant to change: separator ownership.
+    probes2 = {"X.": ["a", "."], "Y": ["b"], "X. Y": ["a", ".", "b"]}
+    monkeypatch.setattr(
+        module.FusionTokenizer,
+        "_word_phones",
+        lambda self, w, l: probes2.get(w, list(w)),
+    )
+    flat2 = ["a", ".", " ", "b"]
+    assert tok._blocks_from_words(flat2, ["X.", "Y"], "vi")[0] == [
+        ["a", ".", " "], ["b"]
+    ]
+    assert tok._blocks_from_words(
+        flat2, ["X.", "Y"], "vi", sentence_ends=[2, 4]
+    )[0] == [["a", "."], [" ", "b"]]
 
 
 def test_split_into_groups_flattening_is_lossless():
@@ -551,14 +694,15 @@ def test_split_into_groups_flattening_is_lossless():
 
 
 def test_multi_sentence_text_aligns_en(tmp_path):
-    """Multi-sentence English must produce lm_token_groups.
+    """Multi-sentence English aligns, and stays close to one group per word.
 
-    NOTE: this does NOT exercise the sentence-boundary bug, and must not be
-    mistaken for its regression test. espeak-en-us drops the sentence period
-    and emits a space, so English never had the merge -- verified: this test
-    passes unchanged against the old space-only splitter. The real
-    regression is test_multi_sentence_text_aligns_vi below. Kept because
-    multi-sentence alignment is worth covering in both voices.
+    NOTE this does not exercise the sentence-boundary merge that the
+    2026-09-02 work fixed -- espeak-en-us drops the period and emits a
+    space, so English never had it. The Vietnamese test below is that
+    regression. This one guards granularity: a group MAY span several words
+    (see the 2026-09-07 ADR) but should rarely need to, and a slide toward
+    coarse groups would silently weaken conditioning while alignment still
+    reported success.
     """
     from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
 
@@ -577,109 +721,14 @@ def test_multi_sentence_text_aligns_en(tmp_path):
         lm_tokenizer=LanguageModelTokenizer(),
     )
     artifact = tok.text_to_artifact(text)
-    assert artifact.lm_token_groups is not None, (
-        "multi-sentence text fell back to phone-only -- the sentence-boundary "
-        "merge has regressed"
-    )
+
+    assert artifact.lm_token_groups is not None
     assert len(artifact.lm_token_groups) == len(artifact.phone_groups)
-    assert len(artifact.phone_groups) == len(text.split())
-
-
-def test_vi_corpus_alignment_rate():
-    """Assert the alignment *success rate* on real corpus text.
-
-    This is the test whose absence let the sentence-boundary bug ship.
-    `lm_token_groups=None` is a legal, documented fallback, so no
-    correctness assertion anywhere could fail when it fired -- the only
-    observable symptom was its frequency, and nothing measured that. The
-    threshold is deliberately far below the ~94% currently measured: this
-    guards against a collapse of the mechanism, not against normal drift.
-
-    The residual failures are dominated by digits in the text (espeak
-    expands "1997" into five spoken words, so one whitespace token yields
-    five groups). Vietnamese runs with use_normalizer=False and text is
-    required to be normalized upstream, so digit-bearing text is
-    out-of-contract rather than a tokenizer defect.
-    """
-    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
-
-    token_file = (
-        "scripts/all/pretrained_model_cache/"
-        "hynt__ZipVoice-Vietnamese-2500h/tokens.txt"
-    )
-    if not os.path.exists(token_file):
-        pytest.skip(f"{token_file} not available")
-    samples = _vi_fixture_samples_or_skip()[:200]
-    tok = FusionTokenizer(
-        token_file=token_file, lang="vi", lm_tokenizer=LanguageModelTokenizer()
-    )
-    aligned = sum(
-        1 for text in samples if tok.text_to_artifact(text).lm_token_groups is not None
-    )
-    rate = aligned / len(samples)
-    assert rate >= 0.80, (
-        f"only {aligned}/{len(samples)} ({rate:.1%}) of real Vietnamese "
-        f"utterances produced lm_token_groups. Below this threshold the Qwen "
-        f"branch is disabled for most of training and the fusion "
-        f"architecture silently degrades to phone-only."
-    )
-
-
-def test_vi_corpus_group_correspondence_is_correct_not_just_present():
-    """Check the span -> lm_token half of the mapping.
-
-    SCOPE, precisely: word span i is assigned to phone group i *by position*
-    once the counts match, so decoding LM group i back to word i validates
-    that the character-offset overlap picked the right lm_tokens for that
-    span. It does NOT independently establish what phone group i contains --
-    a compensating merge and split would still decode correctly here. The
-    phone side is covered separately, against a reference that never touches
-    group indices, by
-    test_vi_phone_groups_match_independent_per_word_phonemization.
-    """
-    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
-    import unicodedata
-
-    from zipvoice.tokenizer.fusion_tokenizer import _whitespace_spans
-
-    token_file = (
-        "scripts/all/pretrained_model_cache/"
-        "hynt__ZipVoice-Vietnamese-2500h/tokens.txt"
-    )
-    if not os.path.exists(token_file):
-        pytest.skip(f"{token_file} not available")
-
-    lm_tokenizer = LanguageModelTokenizer()
-    tok = FusionTokenizer(
-        token_file=token_file, lang="vi", lm_tokenizer=lm_tokenizer
-    )
-
-    def canon(s):
-        return unicodedata.normalize("NFC", s.strip().strip(".,!?;:\"'()")).lower()
-
-    samples = _vi_fixture_samples_or_skip()[:60]
-    checked = 0
-    mismatches = []
-    for text in samples:
-        artifact = tok.text_to_artifact(text)
-        if artifact.lm_token_groups is None:
-            continue
-        words = [text[s:e] for s, e in _whitespace_spans(text)]
-        assert len(words) == len(artifact.lm_token_groups), (
-            "an aligned artifact must have exactly one group per whitespace word"
-        )
-        for i, group in enumerate(artifact.lm_token_groups):
-            decoded = lm_tokenizer.hf_tokenizer.decode(
-                [artifact.lm_token_ids[j] for j in group]
-            )
-            checked += 1
-            if canon(decoded) != canon(words[i]):
-                mismatches.append((i, words[i], decoded))
-
-    assert checked > 500, f"too few groups checked ({checked}) to be meaningful"
-    assert not mismatches, (
-        f"{len(mismatches)}/{checked} groups do not correspond to their word "
-        f"-- alignment is accepted but wrong. First 5: {mismatches[:5]}"
+    n_words = len(text.split())
+    assert len(artifact.phone_groups) >= n_words - 2, (
+        f"{len(artifact.phone_groups)} groups for {n_words} words -- groups "
+        f"are merging far more than expected; check that stress marks are "
+        f"still ignored when matching phone content"
     )
 
 
@@ -716,24 +765,22 @@ def test_multi_sentence_text_aligns_vi():
     )
 
 
-def test_vi_phone_groups_match_independent_per_word_phonemization():
-    """Independent phone-to-word check.
+def test_vi_single_word_groups_match_independent_phonemization():
+    """Independent phone-to-word check, for the groups that span one word.
 
-    The span/LM-token test above cannot establish this on its own: word span
-    i is assigned to phone group i *by position* after count matching, so
-    decoding LM group i back to word i is partly circular -- a compensating
-    merge and split would still decode correctly. This reference never
-    touches group indices: it phonemizes each word alone and compares.
+    The span/lm_token test cannot establish this: word span i is assigned to
+    group i by position, so decoding lm group i back to word i is partly
+    circular. This reference never consults group indices -- it phonemizes
+    the word alone and compares.
 
-    Scoped to Vietnamese, where per-word phonemization was verified to
-    reproduce whole-utterance output exactly (4521/4521 groups). Other
-    voices have contextual pronunciation that this reference would not
-    reproduce, so do not widen it without re-establishing that.
+    Scoped to single-word groups on purpose. A multi-word group exists
+    precisely because the words in it do not phonemize the same way alone as
+    together (the 2026-09-07 ADR), so comparing them against an isolated
+    reference would be testing the thing the design gives up on. Stress
+    marks are ignored, being prosody rather than segmental content.
     """
     from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
     from zipvoice.tokenizer.tokenizer import phonemize_espeak
-
-    from zipvoice.tokenizer.fusion_tokenizer import _whitespace_spans
 
     token_file = (
         "scripts/all/pretrained_model_cache/"
@@ -746,7 +793,6 @@ def test_vi_phone_groups_match_independent_per_word_phonemization():
         token_file=token_file, lang="vi", lm_tokenizer=LanguageModelTokenizer()
     )
     samples = _vi_fixture_samples_or_skip()[:15]
-    # espeak is stateful across calls, so do one clean pass per side.
     artifacts = [tok.text_to_artifact(t) for t in samples]
     per_word = {}
     for text in samples:
@@ -756,25 +802,453 @@ def test_vi_phone_groups_match_independent_per_word_phonemization():
                     p for sent in phonemize_espeak(word, "vi") for p in sent
                 )
 
-    strip = lambda s: s.strip(" .,!?;:")  # noqa: E731  separators only
-    checked, mismatches = 0, []
+    ignore = " .,!?;:\u02c8\u02cc"
+    strip = lambda s: "".join(c for c in s if c not in ignore)  # noqa: E731
+    checked, single, mismatches = 0, 0, []
     for text, artifact in zip(samples, artifacts):
-        if artifact.lm_token_groups is None:
-            continue
-        words = [text[s:e] for s, e in _whitespace_spans(text)]
-        phone_groups = [
-            [artifact.phones[i] for i in g] for g in artifact.phone_groups
-        ]
-        if len(phone_groups) != len(words):
-            continue
-        for word, group in zip(words, phone_groups):
+        assert artifact.lm_token_groups is not None, "alignment must not fail"
+        blocks, words, _ = tok._plain_phone_groups_and_spans(text)
+        for block, block_words in zip(blocks, words):
             checked += 1
-            if strip("".join(group)) != strip(per_word[word]):
-                mismatches.append((word, "".join(group), per_word[word]))
+            if len(block_words) != 1:
+                continue
+            single += 1
+            if strip("".join(block)) != strip(per_word[block_words[0]]):
+                mismatches.append((block_words[0], "".join(block)))
 
-    assert checked > 300, f"too few groups checked ({checked}) to be meaningful"
-    assert not mismatches, (
-        f"{len(mismatches)}/{checked} phone groups do not match the word "
-        f"phonemized on its own -- groups are misassigned even though the "
-        f"counts line up. First 5: {mismatches[:5]}"
+    assert single > 300, f"too few single-word groups checked ({single})"
+    assert single / checked > 0.95, (
+        f"only {100 * single / checked:.1f}% of groups span a single word; "
+        f"granularity has degraded"
     )
+    assert not mismatches, (
+        f"{len(mismatches)}/{single} single-word groups do not match the "
+        f"word phonemized on its own. First 5: {mismatches[:5]}"
+    )
+
+
+# --- The 2026-09-07 contract: groups may span several words ---------------
+#
+# The old construction required exactly one group per whitespace word and
+# dropped the whole utterance to phone-only when espeak would not divide
+# that way. Four rounds of boundary rules got that from 7.3% to 99.9% and
+# stalled. See docs/adr/2026-09-07__phone_lm_token_group_alignment.md for
+# why the frame was wrong. These tests pin the new contract, which is
+# strictly weaker per-group and strictly stronger overall: a group is one or
+# more consecutive words, and alignment cannot fail.
+
+
+def _vi_tokenizer_or_skip():
+    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
+
+    token_file = (
+        "scripts/all/pretrained_model_cache/"
+        "hynt__ZipVoice-Vietnamese-2500h/tokens.txt"
+    )
+    if not os.path.exists(token_file):
+        pytest.skip(f"{token_file} not available")
+    return FusionTokenizer(
+        token_file=token_file, lang="vi", lm_tokenizer=LanguageModelTokenizer()
+    )
+
+
+def test_alignment_never_fails_on_real_corpus():
+    """The property the whole redesign buys: `lm_token_groups` is never None.
+
+    Previously this was a rate to be maximized, and the last 0.1% was
+    written off as inherent to espeak. It is not inherent -- a block that
+    will not match simply widens, in the limit to the whole utterance. A
+    coarse group is a valid alignment; a dropped utterance is not.
+    """
+    tok = _vi_tokenizer_or_skip()
+    samples = _vi_fixture_samples_or_skip()[:150]
+    failures = [t for t in samples if tok.text_to_artifact(t).lm_token_groups is None]
+    assert not failures, (
+        f"{len(failures)}/{len(samples)} utterances produced no alignment; "
+        f"block widening should make that impossible. First: {failures[0][:120]!r}"
+    )
+
+
+def test_groups_stay_word_sized_on_real_corpus():
+    """Coverage must not be bought with granularity.
+
+    Alignment can always succeed by making one enormous group, so a 100%
+    rate alone would not detect a collapse. Assert the distribution too:
+    almost every group should still be a single word.
+    """
+    tok = _vi_tokenizer_or_skip()
+    samples = _vi_fixture_samples_or_skip()[:100]
+    single = total = 0
+    largest = 0
+    for text in samples:
+        _, word_blocks, _ = tok._plain_phone_groups_and_spans(text)
+        for block in word_blocks:
+            total += 1
+            single += len(block) == 1
+            largest = max(largest, len(block))
+    assert total > 5000, f"too few groups ({total}) to be meaningful"
+    assert single / total > 0.99, (
+        f"only {100 * single / total:.2f}% of groups span one word "
+        f"(largest {largest}); conditioning granularity has degraded"
+    )
+
+
+def test_artifact_invariants_hold_on_real_corpus():
+    """The three properties that make the construction safe, checked
+    end-to-end rather than only inside the builder's own asserts."""
+    from zipvoice.tokenizer.tokenizer import phonemize_espeak
+
+    tok = _vi_tokenizer_or_skip()
+    hf = tok.lm_tokenizer.hf_tokenizer
+    for text in _vi_fixture_samples_or_skip()[:40]:
+        artifact = tok.text_to_artifact(text)
+        assert artifact.lm_token_groups is not None
+
+        # 1. groups partition the phones, in order, without gaps or overlap
+        covered = [i for group in artifact.phone_groups for i in group]
+        assert covered == list(range(len(artifact.phone_ids)))
+
+        # 2. the lm_tokens are exactly the whole-text tokenization
+        if " ".join(text.split()) == text:
+            whole = hf.encode(text, add_special_tokens=False)
+            assert artifact.lm_token_ids[1:] == whole
+
+        # 3. one lm group per phone group, none empty, tag never in a group
+        assert len(artifact.lm_token_groups) == len(artifact.phone_groups)
+        assert all(artifact.lm_token_groups)
+        assert min(i for g in artifact.lm_token_groups for i in g) >= 1
+
+
+def test_a_fused_pair_is_kept_in_one_group():
+    """The case that motivated the redesign.
+
+    espeak-vi decides pronunciation from neighbouring words: "the" is
+    Vietnamese 'tˈɛ' alone but English 'ðə' inside "book of the", and it
+    fuses "of the" into one run with no separator. The old code failed the
+    whole utterance; the new one puts those two words in one group.
+    """
+    tok = _vi_tokenizer_or_skip()
+    text = "Quyển sách này là book of the măng của tháng hai"
+    artifact = tok.text_to_artifact(text)
+    assert artifact.lm_token_groups is not None
+
+    _, word_blocks, _ = tok._plain_phone_groups_and_spans(text)
+    merged = [b for b in word_blocks if len(b) > 1]
+    assert merged == [["of", "the"]], f"expected only 'of the' merged, got {merged}"
+
+    # and that group must carry BOTH words' lm_tokens
+    index = next(i for i, b in enumerate(word_blocks) if len(b) > 1)
+    tokens = [artifact.lm_tokens[i] for i in artifact.lm_token_groups[index]]
+    assert hf_decode(tok, artifact, index).strip() == "of the", tokens
+
+
+def hf_decode(tok, artifact, group_index):
+    ids = [artifact.lm_token_ids[i] for i in artifact.lm_token_groups[group_index]]
+    return tok.lm_tokenizer.hf_tokenizer.decode(ids)
+
+
+def test_punctuation_only_word_joins_its_neighbour():
+    """A token espeak renders as nothing must not become an empty group.
+
+    An empty group carries no Qwen evidence, and the extractor marks it
+    invalid exactly like padding -- so it would silently disable
+    conditioning for that position rather than fail.
+    """
+    tok = _vi_tokenizer_or_skip()
+    blocks, word_blocks, _ = tok._plain_phone_groups_and_spans("xin chao - cac ban")
+    assert all(blocks), "no phone block may be empty"
+    assert [w for b in word_blocks for w in b] == "xin chao - cac ban".split()
+
+
+def test_chinese_aligns_and_does_not_overlap():
+    """Chinese used to emit OVERLAPPING lm groups -- measured, lm_token 6
+    assigned to two different phone groups. It briefly returned no alignment
+    at all rather than a wrong one; with script routing plus boundary
+    coarsening it now aligns correctly, so assert the correctness rather
+    than the old containment.
+    """
+    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
+
+    token_file = (
+        "scripts/all/pretrained_model_cache/"
+        "hynt__ZipVoice-Vietnamese-2500h/tokens.txt"
+    )
+    if not os.path.exists(token_file):
+        pytest.skip(f"{token_file} not available")
+    tok = FusionTokenizer(
+        token_file=token_file, lang="zh", lm_tokenizer=LanguageModelTokenizer()
+    )
+    for text in ("你好世界", "今天天气很好", "我喜欢学习中文"):
+        artifact = tok.text_to_artifact(text)
+        assert artifact.phone_groups, text
+        assert artifact.lm_token_groups is not None, text
+        flat = [i for group in artifact.lm_token_groups for i in group]
+        assert flat == list(range(1, len(artifact.lm_token_ids))), (
+            f"{text}: every lm_token must be in exactly one group -- "
+            f"duplicates were the original Chinese defect"
+        )
+        assert len(artifact.lm_token_groups) == len(artifact.phone_groups)
+
+
+def test_token_crossing_a_boundary_coarsens_it():
+    """A boundary an lm_token straddles is not a usable group boundary.
+
+    jieba and BPE disagree: measured, jieba cuts "今天|天气|很好" while BPE
+    emits "很好" across the 天气/很好 boundary, and "我喜欢" across two
+    boundaries in "我喜欢学习中文". Assigning such a token to one side gives
+    that group a token containing the other group's text -- silent, since
+    every group is still non-empty and every token still used exactly once.
+    Routing decides which phonemizer runs; it need not survive as a
+    conditioning boundary, so the contradicted boundary is dropped.
+    """
+    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
+
+    token_file = (
+        "scripts/all/pretrained_model_cache/"
+        "hynt__ZipVoice-Vietnamese-2500h/tokens.txt"
+    )
+    if not os.path.exists(token_file):
+        pytest.skip(f"{token_file} not available")
+    tok = FusionTokenizer(
+        token_file=token_file, lang="vi", lm_tokenizer=LanguageModelTokenizer()
+    )
+    hf = tok.lm_tokenizer.hf_tokenizer
+
+    for text in ("今天天气很好", "我喜欢学习中文"):
+        artifact = tok.text_to_artifact(text)
+        assert artifact.lm_token_groups is not None
+        offsets = hf(
+            text, add_special_tokens=False, return_offsets_mapping=True
+        )["offset_mapping"]
+        # No surviving boundary may be straddled by a token. Reconstruct the
+        # boundaries from group sizes over the token offsets.
+        cuts = []
+        consumed = 0
+        for group in artifact.lm_token_groups[:-1]:
+            consumed += len(group)
+            cuts.append(offsets[consumed - 1][1])
+        for start, end in offsets:
+            for cut in cuts:
+                assert not (start < cut < end), (
+                    f"{text}: token ({start},{end}) still straddles cut {cut}"
+                )
+
+
+def test_all_oov_returns_no_alignment_instead_of_crashing():
+    """When every phone group is filtered away there is no destination group
+    for the offset walk. That used to raise IndexError; the full lm_tokens
+    are kept and alignment is reported as unavailable.
+    """
+    import tempfile
+
+    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
+
+    directory = tempfile.mkdtemp()
+    token_file = os.path.join(directory, "tokens.txt")
+    with open(token_file, "w", encoding="utf-8") as handle:
+        handle.write("_\t0\n")  # nothing but the pad symbol
+    tok = FusionTokenizer(
+        token_file=token_file, lang="vi", lm_tokenizer=LanguageModelTokenizer()
+    )
+    artifact = tok.text_to_artifact("xin chao")
+    assert artifact.lm_token_groups is None
+    assert len(artifact.lm_token_ids) > 1, "the lm_tokens must still be kept"
+
+
+# --- Defects found by external review of the 2026-09-07 redesign ----------
+#
+# All five were confirmed by measurement before being fixed. Each passed the
+# partition and byte-identity checks that were already in place, which is
+# why they need cases of their own: internally consistent bookkeeping is not
+# evidence of correct correspondence.
+
+
+def test_unusual_whitespace_does_not_change_qwen_input():
+    """The lm_token sequence must be the whole-text tokenization, always.
+
+    An earlier version tokenized each block separately and relied on Qwen's
+    BPE being concatenative at whitespace. It is not, for *runs* of
+    whitespace -- the vocabulary contains multi-whitespace tokens -- so
+    "xin  chao" (double space) tokenized differently whole than in pieces,
+    silently rewriting the text Qwen sees. Worse, the verification only ran
+    when the rebuilt text already matched, i.e. never on the inputs that
+    could break it.
+    """
+    tok = _vi_tokenizer_or_skip()
+    hf = tok.lm_tokenizer.hf_tokenizer
+    for text in ("xin chao cac ban", "xin  chao\tcac ban", " xin chao ", "xin\n chao"):
+        artifact = tok.text_to_artifact(text)
+        assert artifact.lm_token_ids[1:] == hf.encode(
+            text, add_special_tokens=False
+        ), f"lm_tokens differ from the whole-text tokenization for {text!r}"
+
+
+def test_every_lm_token_belongs_to_exactly_one_group():
+    """Total coverage, not just in-range indices.
+
+    A minimum-index check permits gaps and duplicates. The original
+    character-overlap rule left standalone space tokens in no group at all
+    (0.30% of lm_tokens, measured), and the Chinese path assigned one token
+    to two groups.
+    """
+    tok = _vi_tokenizer_or_skip()
+    for text in _vi_fixture_samples_or_skip()[:25]:
+        artifact = tok.text_to_artifact(text)
+        assert artifact.lm_token_groups is not None
+        flat = [i for group in artifact.lm_token_groups for i in group]
+        assert flat == list(range(1, len(artifact.lm_token_ids))), (
+            "lm_token_groups must partition every token exactly once, "
+            "excluding the [LANG:xx] tag at index 0"
+        )
+
+
+def test_oov_word_keeps_its_place_in_the_qwen_input():
+    """A word whose phones are all OOV must not vanish from the LM input.
+
+    Dropping it removes context from every token after it. Measured before
+    the fix: "xin chao ban" reached Qwen as "xin ban". The word now merges
+    into a neighbouring group -- the phone side loses what the vocabulary
+    cannot represent, the text side stays whole.
+    """
+    import tempfile
+
+    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
+
+    full = _vi_tokenizer_or_skip()
+    text = "xin chao ban"
+    blocks, words, _ = full._plain_phone_groups_and_spans(text)
+    middle = set(blocks[next(i for i, w in enumerate(words) if w == ["chao"])])
+    vocab = ["_"] + sorted({p for b in blocks for p in b} - middle)
+
+    directory = tempfile.mkdtemp()
+    token_file = os.path.join(directory, "tokens.txt")
+    with open(token_file, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(f"{s}\t{i}" for i, s in enumerate(vocab)))
+
+    tok = FusionTokenizer(
+        token_file=token_file, lang="vi", lm_tokenizer=LanguageModelTokenizer()
+    )
+    artifact = tok.text_to_artifact(text)
+    seen = tok.lm_tokenizer.hf_tokenizer.decode(artifact.lm_token_ids[1:])
+    assert "chao" in seen, f"the OOV word was deleted from Qwen's input: {seen!r}"
+    assert len(artifact.lm_token_groups) == len(artifact.phone_groups)
+
+
+def test_stress_mark_is_not_absorbed_by_the_preceding_group():
+    """Ignoring a symbol when comparing and deciding who owns it are
+    different operations.
+
+    Stress belongs to the syllable it precedes, i.e. the next word. Treating
+    every ignorable symbol as a trailing separator moved it backwards, and
+    both the partition and byte-identity checks still passed.
+    """
+    from zipvoice.tokenizer.fusion_tokenizer import _match_phone_content
+
+    flat = ["a", " ", "ˈ", "b"]
+    end = _match_phone_content(flat, 0, ["a"])
+    assert end == 2, (
+        f"consumed {flat[0:end]} -- the next syllable's stress mark was "
+        f"absorbed into the previous group"
+    )
+    assert _match_phone_content(flat, end, ["ˈ", "b"]) == 4
+
+
+def test_leftover_phones_are_attached_not_asserted_away():
+    """A greedy prefix match can leave phones behind.
+
+    With P("X")=[a], P("Y")=[b] but P("X Y")=[a,b,c], the walk accepts X then
+    Y, exhausts the words, and never tries the span that would consume 'c'.
+    That used to fail the partition assert -- a crash, killing the batch.
+    The words are exhausted, so the leftovers belong to the final block.
+    """
+    import zipvoice.tokenizer.fusion_tokenizer as module
+
+    tok = _vi_tokenizer_or_skip()
+    original = module.FusionTokenizer._word_phones
+    probes = {"X": ["a"], "Y": ["b"], "X Y": ["a", "b", "c"]}
+    module.FusionTokenizer._word_phones = lambda self, w, l: probes.get(w, list(w))
+    try:
+        blocks, words = tok._blocks_from_words(["a", "b", "c"], ["X", "Y"], "vi")
+    finally:
+        module.FusionTokenizer._word_phones = original
+
+    assert [p for b in blocks for p in b] == ["a", "b", "c"]
+    assert [w for b in words for w in b] == ["X", "Y"]
+    assert all(blocks)
+
+
+def test_text_with_no_phones_returns_nothing_rather_than_asserting():
+    """`words=["-"]` with no phones must not crash the partition assert.
+
+    Callers reject non-empty text that yields zero phones upstream, so this
+    is only reachable directly -- but an assert here would be a crash, and
+    the honest answer is "no blocks".
+    """
+    tok = _vi_tokenizer_or_skip()
+    assert tok._blocks_from_words([], ["-"], "vi") == ([], [])
+
+
+# --- Script routing (2026-09-07, author's rule) ---------------------------
+#
+# A Han segment is always phonemized as Chinese whatever `lang` is; a Latin
+# segment follows `lang`, with lang="zh" falling back to Vietnamese. Before
+# this, a VI-primary run rendered 你好 as espeak announcing "chinese letter"
+# once per character.
+
+
+def test_han_is_phonemized_as_chinese_whatever_the_lang():
+    """The rule's first half. Under lang="vi" espeak has no reading for Han
+    characters and announced their character class instead -- measured,
+    "你好世界" became 'tʃˈaɪniːzlˈetə' four times.
+    """
+    tok = _vi_tokenizer_or_skip()
+    artifact = tok.text_to_artifact("Tôi thích 你好世界 rồi")
+    phones = "".join(artifact.phones)
+    assert "n0i2h0ao3" in phones, f"Chinese not routed to pinyin: {phones}"
+    assert "aɪniːz" not in phones, f"espeak announced the character class: {phones}"
+    assert "t̪ˈoj" in phones, "Vietnamese must still be Vietnamese"
+
+
+def test_latin_follows_lang_and_zh_falls_back_to_vietnamese():
+    """The rule's second half, including the author's explicit choice that
+    lang="zh" reads Latin as Vietnamese rather than English. That trades
+    English-inside-Chinese ("Amazon" reads Vietnamese) for consistency with
+    a Vietnamese-primary project; it was raised and confirmed deliberately.
+    """
+    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
+
+    token_file = (
+        "scripts/all/pretrained_model_cache/"
+        "hynt__ZipVoice-Vietnamese-2500h/tokens.txt"
+    )
+    if not os.path.exists(token_file):
+        pytest.skip(f"{token_file} not available")
+
+    lm = LanguageModelTokenizer()
+    text = "你好 phở"
+    phones = {}
+    for lang in ("vi", "en", "zh"):
+        tok = FusionTokenizer(token_file=token_file, lang=lang, lm_tokenizer=lm)
+        phones[lang] = "".join(tok.text_to_artifact(text).phones)
+
+    # Chinese identical in all three -- it never follows `lang`.
+    assert "n0i2h0ao3" in phones["vi"]
+    assert "n0i2h0ao3" in phones["en"]
+    assert "n0i2h0ao3" in phones["zh"]
+    # Latin follows lang: en spells the Vietnamese word out, vi does not.
+    assert phones["vi"] != phones["en"]
+    # lang="zh" falls back to the Vietnamese voice for Latin.
+    assert phones["zh"] == phones["vi"]
+
+
+def test_mixed_script_utterance_aligns_completely():
+    """Routing must not cost alignment: every lm_token still belongs to
+    exactly one group, across a three-language utterance."""
+    tok = _vi_tokenizer_or_skip()
+    text = "Tôi thích ăn phở và 你好世界 cùng machine learning"
+    artifact = tok.text_to_artifact(text)
+    assert artifact.lm_token_groups is not None
+    flat = [i for group in artifact.lm_token_groups for i in group]
+    assert flat == list(range(1, len(artifact.lm_token_ids)))
+    assert len(artifact.lm_token_groups) == len(artifact.phone_groups)
+    assert all(artifact.lm_token_groups)
