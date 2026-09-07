@@ -656,6 +656,9 @@ def test_sentence_metadata_does_not_change_grouping(monkeypatch):
         flat, ["X", "Y", "Z"], "vi", sentence_ends=[1, 3]
     )[0]
     assert with_ends == without, f"metadata changed grouping: {without} -> {with_ends}"
+    # Pinned absolutely as well as relatively: equality alone would let a
+    # future regression that affects BOTH paths pass unnoticed.
+    assert without == [["."], ["b", "."]]
 
     # The one case it is meant to change: separator ownership.
     probes2 = {"X.": ["a", "."], "Y": ["b"], "X. Y": ["a", ".", "b"]}
