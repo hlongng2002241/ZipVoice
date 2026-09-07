@@ -558,7 +558,23 @@ def compute_fbank_loss(
             .unsqueeze(2)
         )
     model_fusion_kwargs = {}
-    if fusion_fields is not None:
+    if fusion_fields is None:
+        # The converse of the assert below, and the more dangerous direction.
+        # A configured fusion run whose batch carries no fusion fields looks
+        # *identical* to an intentional phone-only run: the model falls back
+        # to the phone embedding and trains happily. That is how a whole
+        # training run was spent ~93% phone-only without anything failing
+        # (see the sentence-boundary bug in `_split_into_groups`). Missing
+        # metadata on a fusion run is a pipeline error, not an alignment
+        # fallback, so it must not be absorbed silently.
+        assert qwen_extractor is None, (
+            "this run is configured for the fusion text frontend, but this "
+            "batch carries no fusion fields at all -- phone_groups never "
+            "reached the collator. That is a pipeline error, not the "
+            "per-utterance alignment fallback (which keeps the fields and "
+            "sets lm_token_groups=None for the affected utterances)."
+        )
+    else:
         assert qwen_extractor is not None, (
             "fusion_fields require a qwen_extractor to turn lm_tokens into "
             "per-group Qwen vectors"
@@ -570,6 +586,26 @@ def compute_fbank_loss(
             "phone_groups": fusion_fields["phone_groups"],
             "qwen_group_features": qwen_group_features.to(device),
             "qwen_group_valid": qwen_group_valid.to(device),
+        }
+        # Reason-specific coverage, so silent conditioning loss is visible in
+        # the training log instead of having to be discovered months later by
+        # auditing a checkpoint. Utterance-level *and* group-level: an
+        # utterance can align yet contribute empty groups that carry no Qwen
+        # evidence, which `qwen_group_valid` marks false exactly like padding.
+        groups_per_utt = fusion_fields["lm_token_groups"]
+        n_utt = len(groups_per_utt)
+        n_aligned = sum(1 for g in groups_per_utt if g is not None)
+        real_groups = sum(len(g) for g in groups_per_utt if g is not None)
+        n_valid = int(qwen_group_valid.sum().item())
+        # Stored pre-multiplied by num_frames, matching how `loss` is stored
+        # here: MetricsTracker.norm_items() divides by "frames", so the value
+        # that reaches the log is the ratio itself.
+        _frames = int(features_lens.sum().item())
+        info_coverage = {
+            "qwen_cov_utt": (n_aligned / n_utt if n_utt else 0.0) * _frames,
+            "qwen_cov_grp": (
+                n_valid / real_groups if real_groups else 0.0
+            ) * _frames,
         }
 
     with torch.set_grad_enabled(is_training):
@@ -590,6 +626,8 @@ def compute_fbank_loss(
     num_frames = features_lens.sum().item()
     info["frames"] = num_frames
     info["loss"] = loss.detach().cpu().item() * num_frames
+    if model_fusion_kwargs:
+        info.update(info_coverage)
 
     return loss, info
 
