@@ -315,6 +315,81 @@ class FusionTokenizerArtifact:
                     )
 
 
+def compose_artifacts(
+    prompt: "FusionTokenizerArtifact",
+    target: "FusionTokenizerArtifact",
+) -> "FusionTokenizerArtifact":
+    """Combine a prompt artifact and a target artifact into the single
+    artifact that inference actually conditions on.
+
+    This is the composition contract sprint 003 deliberately deferred ("how a
+    prompt artifact and a target artifact combine without putting two
+    ``[LANG:xx]`` tags in one causal Qwen context"). It is resolved the same
+    way the pre-fusion multilingual inference path already resolved it, at
+    `infer_zipvoice.py`: **only the prompt carries the language tag.**
+    `model.sample()` concatenates prompt and target into one sequence, and
+    training only ever saw a single utterance with one leading tag, so the
+    target's own tag is dropped rather than left mid-sequence.
+
+    Index arithmetic, both sides:
+
+      phones     target index i -> len(prompt.phone_ids) + i
+      lm_tokens  target index i -> len(prompt.lm_token_ids) + i - 1
+
+    The ``- 1`` is the dropped tag. It never underflows because index 0 is
+    the tag and the tag belongs to no group -- an invariant this artifact
+    documents and `__post_init__` does not need to re-derive (verified
+    empirically: the lowest index any group uses is 1).
+
+    Alignment failure on *either* side collapses the whole composition to
+    phone-only (``lm_token_groups=None``). Partial recovery would mean
+    conditioning the target on a prompt whose group structure is unknown,
+    which is a different premise than training; the honest fallback is the
+    documented one.
+    """
+    assert prompt.language == target.language, (
+        f"cannot compose artifacts from different languages: "
+        f"{prompt.language!r} (prompt) vs {target.language!r} (target). "
+        f"FusionTokenizer is locked to one language per instance."
+    )
+
+    phone_offset = len(prompt.phone_ids)
+    phone_groups = list(prompt.phone_groups) + [
+        [i + phone_offset for i in group] for group in target.phone_groups
+    ]
+
+    # Drop the target's leading [LANG:xx] tag and everything indexed to it.
+    lm_tokens = list(prompt.lm_tokens) + list(target.lm_tokens[1:])
+    lm_token_ids = list(prompt.lm_token_ids) + list(target.lm_token_ids[1:])
+    zero_duration_mask = list(prompt.zero_duration_mask) + list(
+        target.zero_duration_mask[1:]
+    )
+
+    if prompt.lm_token_groups is None or target.lm_token_groups is None:
+        lm_token_groups = None
+    else:
+        lm_offset = len(prompt.lm_token_ids) - 1
+        shifted = []
+        for group in target.lm_token_groups:
+            assert all(i >= 1 for i in group), (
+                f"target lm_token group {group} references index 0, the "
+                f"[LANG:xx] tag, which must belong to no group"
+            )
+            shifted.append([i + lm_offset for i in group])
+        lm_token_groups = list(prompt.lm_token_groups) + shifted
+
+    return FusionTokenizerArtifact(
+        language=target.language,
+        phones=list(prompt.phones) + list(target.phones),
+        phone_ids=list(prompt.phone_ids) + list(target.phone_ids),
+        phone_groups=phone_groups,
+        lm_tokens=lm_tokens,
+        lm_token_ids=lm_token_ids,
+        lm_token_groups=lm_token_groups,
+        zero_duration_mask=zero_duration_mask,
+    )
+
+
 class FusionTokenizer:
     """Wraps EmiliaTokenizer/EspeakTokenizer (never modifies them) to
     additionally recover word-equivalent groups within their phone output,
