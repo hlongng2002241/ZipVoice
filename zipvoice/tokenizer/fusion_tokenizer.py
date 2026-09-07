@@ -257,19 +257,25 @@ def _ends_from_word_blocks(
 
 
 def _has_han(text: str) -> bool:
-    """True if `text` contains any CJK ideograph.
+    """True if `text` contains a character the *segmenter* treats as Chinese.
 
-    Used to decide whether an utterance needs script routing at all. Text
-    without Han characters takes the plain single-voice path unchanged, so
-    the overwhelming majority of this corpus keeps byte-identical behaviour
-    and only genuinely mixed-script text pays for the extra machinery.
+    Delegates to `EmiliaTokenizer.is_chinese` rather than defining its own
+    range, so the outer routing gate and the segmenter cannot disagree. They
+    did when this had its own list: it accepted the CJK compatibility block
+    (U+F900..) which `is_chinese` (U+4E00..U+9FA5) rejects, so such text took
+    the mixed path only to be labelled Latin anyway -- and picked up
+    `preprocess_text` on the way, altering text for no reason.
+
+    Widening the class here alone would not help: supplementary ideographs
+    (U+20000 and beyond) are rejected by the segmenter too, so routing them
+    in would change nothing. Extending Chinese coverage means changing
+    `is_chinese`, and that belongs with the deferred Chinese work.
+
+    Text with no such character skips routing entirely and keeps the plain
+    single-voice path byte-for-byte.
     """
-    return any(
-        "\u4e00" <= ch <= "\u9fff"
-        or "\u3400" <= ch <= "\u4dbf"
-        or "\uf900" <= ch <= "\ufaff"
-        for ch in text
-    )
+    emilia = _shared_emilia_tokenizer()
+    return any(emilia.is_chinese(ch) for ch in text)
 
 
 def _match_phone_content(
@@ -864,7 +870,15 @@ class FusionTokenizer:
                         span[1] if span else cursor + len(seg_canonical)
                     )
             elif seg_lang in ("en", "pinyin", "tag"):
-                seg_canonical = seg_text
+                if seg_lang == "en" and self.lang == "en" and self.use_normalizer:
+                    # Same normalization the plain path applies. Without
+                    # this, adding one Han character to an utterance
+                    # silently turned off the English normalizer everywhere
+                    # else in it.
+                    seg_canonical = _shared_emilia_tokenizer(
+                    ).english_normalizer.normalize(seg_text)
+                else:
+                    seg_canonical = seg_text
                 if seg_lang == "en":
                     flat = self._espeak_flat_phones(
                         seg_canonical, latin_locale, allow_empty=True
@@ -892,11 +906,17 @@ class FusionTokenizer:
                         phone_blocks.append(phone)
                         block_ends.append(cursor + len(seg_canonical))
             else:
+                # Its text is KEPT even though it yields no phones. Dropping
+                # it would delete those characters from the canonical text,
+                # and the canonical text is what Qwen is tokenized over --
+                # so an unsupported segment would silently remove context
+                # from every token after it. With no block emitted, its
+                # tokens simply join the following group.
                 logging.warning(
-                    "No English or Chinese characters found, skipping segment "
-                    f"of unknown language: {(seg_text, seg_lang)}"
+                    "No English or Chinese characters found; segment "
+                    f"contributes no phones: {(seg_text, seg_lang)}"
                 )
-                seg_canonical = ""
+                seg_canonical = seg_text
             parts.append(seg_canonical)
             cursor += len(seg_canonical)
 
@@ -1022,8 +1042,14 @@ class FusionTokenizer:
         # A block can match a prefix and still leave phones behind -- with
         # P("X")=[a], P("Y")=[b] but P("X Y")=[a,b,c], the greedy walk takes
         # X then Y and never tries the span that would have consumed 'c'.
-        # The words are exhausted, so those phones belong to the final
-        # block; attach them rather than failing the partition.
+        #
+        # Attaching the remainder to the final block restores the partition,
+        # but it is heuristic assignment, NOT verified correspondence: the
+        # leftover is evidence that an earlier cut was wrong, and appending
+        # it does not establish which. The honest reading is that this keeps
+        # a contradiction from crashing the batch, while the boundary
+        # coarsening in `_lm_tokens_and_groups` is what actually removes
+        # unusable cuts.
         if cursor < len(flat) and phone_blocks:
             phone_blocks[-1] = phone_blocks[-1] + flat[cursor:]
         elif cursor < len(flat):

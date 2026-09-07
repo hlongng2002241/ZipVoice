@@ -156,17 +156,44 @@ in four steps:
    real utterances and 0/9 adversarial cases, and the vocabulary's only
    multi-word tokens are runs of whitespace, so no merge crosses a space
    between real words. Re-checked by an assert per call.
-4. **Two-pointer merge.** Advance whichever side has consumed fewer words;
-   emit a group when both sides have consumed the same words. The result is
-   the coarsest common refinement of the two segmentations.
+4. **Assign tokens to blocks by character offset, then coarsen.** Each
+   token belongs to the first block whose end offset it has not passed, so
+   whitespace lands on the following block and every token is used exactly
+   once. Any boundary an lm_token *straddles* is then dropped and those
+   blocks merged.
 
-Every cut is a word boundary on both sides, so the construction cannot
-silently misalign: either the words agree at the cut (asserted) or nothing
-is emitted.
+That last step matters more than it sounds. A token covering substantive
+characters from two blocks cannot be split between them, and assigning it to
+one silently gives that group a token containing the other group's text --
+with every group non-empty and every token used once, so neither the
+coverage nor the partition check notices. It is not hypothetical: jieba cuts
+`今天|天气|很好` while BPE emits `很好` across that boundary, and `我喜欢`
+across two boundaries in `我喜欢学习中文`.
 
-**It cannot fail.** If no block matches, the block widens until, in the
-limit, it is the whole utterance -- one coarse group, not a dropped
-utterance.
+The resolution is that **routing and word boundaries decide which
+phonemizer runs; they need not survive as conditioning boundaries.** The
+result is the finest segmentation coarser than both -- a *common
+coarsening*, not a refinement, since cuts are only ever removed.
+
+(An earlier draft of this ADR described a symmetric two-pointer merge of two
+block lists. That is what the exploratory script does; the shipped tokenizer
+derives lm groups directly from the phone blocks' character offsets, which
+is why the coarsening step is needed and where it lives.)
+
+**It cannot fail** for want of a matching block: the block widens until, in
+the limit, it is the whole utterance -- one coarse group, not a dropped
+utterance. Alignment is still reported unavailable in two cases, both
+deliberate: when no phone group survives OOV filtering (there is nothing to
+condition), and when a group would end up with no lm_tokens even after
+coarsening.
+
+Note the limits of what "cannot fail" claims. It is a statement about
+producing *a* correspondence, not about that correspondence being useful:
+a whole-utterance group is one Qwen vector broadcast over every phone, which
+is weak conditioning whose value against the phone-only fallback has not
+been measured. Coverage is a feasibility measure. The `of the` case shows
+this from the other side -- 100% alignment of phones that were themselves
+nonsense, before script routing existed.
 
 ## Script routing (added after the block construction)
 
