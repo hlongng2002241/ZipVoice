@@ -374,7 +374,7 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--qwen-layers",
+        "--lm-layers",
         type=int,
         default=4,
         help="Number of Qwen transformer layers to run for the fusion "
@@ -508,8 +508,8 @@ def compute_fbank_loss(
     tokens: List[List[int]],
     is_training: bool,
     zero_duration_mask: Optional[List[List[bool]]] = None,
-    fusion_fields: Optional[dict] = None,
-    qwen_extractor=None,
+    group_alignment: Optional[dict] = None,
+    lm_extractor=None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute loss given the model and its inputs.
@@ -529,12 +529,12 @@ def compute_fbank_loss(
         True for training. False for validation. When it is True, this
         function enables autograd during computation; when it is False, it
         disables autograd.
-      fusion_fields:
+      group_alignment:
         The fusion frontend's per-utterance extras (`phone_groups`,
         `lm_token_ids`, `lm_token_groups`) from `prepare_input`, or None for
         every other tokenizer.
-      qwen_extractor:
-        A `TruncatedQwenExtractor`, required when `fusion_fields` is given.
+      lm_extractor:
+        A `TruncatedQwenExtractor`, required when `group_alignment` is given.
         Runs live here (per the ADR's point 6: no offline cache in v1 --
         Qwen2.5-0.5B at 4 layers is cheap enough that a cache's
         invalidation/serialization complexity isn't justified yet). It is
@@ -558,7 +558,7 @@ def compute_fbank_loss(
             .unsqueeze(2)
         )
     model_fusion_kwargs = {}
-    if fusion_fields is None:
+    if group_alignment is None:
         # The converse of the assert below, and the more dangerous direction.
         # A configured fusion run whose batch carries no fusion fields looks
         # *identical* to an intentional phone-only run: the model falls back
@@ -567,7 +567,7 @@ def compute_fbank_loss(
         # (see the sentence-boundary bug in `_split_into_groups`). Missing
         # metadata on a fusion run is a pipeline error, not an alignment
         # fallback, so it must not be absorbed silently.
-        assert qwen_extractor is None, (
+        assert lm_extractor is None, (
             "this run is configured for the fusion text frontend, but this "
             "batch carries no fusion fields at all -- phone_groups never "
             "reached the collator. That is a pipeline error, not the "
@@ -575,35 +575,35 @@ def compute_fbank_loss(
             "sets lm_token_groups=None for the affected utterances)."
         )
     else:
-        assert qwen_extractor is not None, (
-            "fusion_fields require a qwen_extractor to turn lm_tokens into "
+        assert lm_extractor is not None, (
+            "group_alignment require a lm_extractor to turn lm_tokens into "
             "per-group Qwen vectors"
         )
-        qwen_group_features, qwen_group_valid = qwen_extractor.pooled_groups(
-            fusion_fields["lm_token_ids"], fusion_fields["lm_token_groups"]
+        lm_group_features, lm_group_mask = lm_extractor.pooled_groups(
+            group_alignment["lm_token_ids"], group_alignment["lm_token_groups"]
         )
         model_fusion_kwargs = {
-            "phone_groups": fusion_fields["phone_groups"],
-            "qwen_group_features": qwen_group_features.to(device),
-            "qwen_group_valid": qwen_group_valid.to(device),
+            "phone_groups": group_alignment["phone_groups"],
+            "lm_group_features": lm_group_features.to(device),
+            "lm_group_mask": lm_group_mask.to(device),
         }
         # Reason-specific coverage, so silent conditioning loss is visible in
         # the training log instead of having to be discovered months later by
         # auditing a checkpoint. Utterance-level *and* group-level: an
         # utterance can align yet contribute empty groups that carry no Qwen
-        # evidence, which `qwen_group_valid` marks false exactly like padding.
-        groups_per_utt = fusion_fields["lm_token_groups"]
+        # evidence, which `lm_group_mask` marks false exactly like padding.
+        groups_per_utt = group_alignment["lm_token_groups"]
         n_utt = len(groups_per_utt)
         n_aligned = sum(1 for g in groups_per_utt if g is not None)
         real_groups = sum(len(g) for g in groups_per_utt if g is not None)
-        n_valid = int(qwen_group_valid.sum().item())
+        n_valid = int(lm_group_mask.sum().item())
         # Stored pre-multiplied by num_frames, matching how `loss` is stored
         # here: MetricsTracker.norm_items() divides by "frames", so the value
         # that reaches the log is the ratio itself.
         _frames = int(features_lens.sum().item())
         info_coverage = {
-            "qwen_cov_utt": (n_aligned / n_utt if n_utt else 0.0) * _frames,
-            "qwen_cov_grp": (
+            "lm_cov_utt": (n_aligned / n_utt if n_utt else 0.0) * _frames,
+            "lm_cov_grp": (
                 n_valid / real_groups if real_groups else 0.0
             ) * _frames,
         }
@@ -644,7 +644,7 @@ def train_one_epoch(
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
-    qwen_extractor=None,
+    lm_extractor=None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -733,7 +733,7 @@ def train_one_epoch(
                 model=model,
                 valid_dl=valid_dl,
                 world_size=world_size,
-                qwen_extractor=qwen_extractor,
+                lm_extractor=lm_extractor,
             )
             model.train()
             logging.info(
@@ -756,7 +756,7 @@ def train_one_epoch(
         (
             tokens,
             zero_duration_mask,
-            fusion_fields,
+            group_alignment,
             features,
             features_lens,
         ) = prepare_input(
@@ -766,7 +766,7 @@ def train_one_epoch(
             return_tokens=True,
             return_feature=True,
             return_zero_duration_mask=True,
-            return_fusion_fields=True,
+            return_group_alignment=True,
         )
 
         try:
@@ -778,8 +778,8 @@ def train_one_epoch(
                     features_lens=features_lens,
                     tokens=tokens,
                     zero_duration_mask=zero_duration_mask,
-                    fusion_fields=fusion_fields,
-                    qwen_extractor=qwen_extractor,
+                    group_alignment=group_alignment,
+                    lm_extractor=lm_extractor,
                     is_training=True,
                 )
 
@@ -906,7 +906,7 @@ def compute_validation_loss(
     model: Union[nn.Module, DDP],
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
-    qwen_extractor=None,
+    lm_extractor=None,
 ) -> MetricsTracker:
     """Run the validation process."""
 
@@ -920,7 +920,7 @@ def compute_validation_loss(
         (
             tokens,
             zero_duration_mask,
-            fusion_fields,
+            group_alignment,
             features,
             features_lens,
         ) = prepare_input(
@@ -930,7 +930,7 @@ def compute_validation_loss(
             return_tokens=True,
             return_feature=True,
             return_zero_duration_mask=True,
-            return_fusion_fields=True,
+            return_group_alignment=True,
         )
 
         loss, loss_info = compute_fbank_loss(
@@ -940,8 +940,8 @@ def compute_validation_loss(
             features_lens=features_lens,
             tokens=tokens,
             zero_duration_mask=zero_duration_mask,
-            fusion_fields=fusion_fields,
-            qwen_extractor=qwen_extractor,
+            group_alignment=group_alignment,
+            lm_extractor=lm_extractor,
             is_training=False,
         )
         assert loss.requires_grad is False
@@ -992,7 +992,7 @@ def scan_pessimistic_batches_for_oom(
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     params: AttributeDict,
-    qwen_extractor=None,
+    lm_extractor=None,
 ):
     from lhotse.dataset import find_pessimistic_batches
 
@@ -1007,7 +1007,7 @@ def scan_pessimistic_batches_for_oom(
         (
             tokens,
             zero_duration_mask,
-            fusion_fields,
+            group_alignment,
             features,
             features_lens,
         ) = prepare_input(
@@ -1017,7 +1017,7 @@ def scan_pessimistic_batches_for_oom(
             return_tokens=True,
             return_feature=True,
             return_zero_duration_mask=True,
-            return_fusion_fields=True,
+            return_group_alignment=True,
         )
         try:
             with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
@@ -1029,8 +1029,8 @@ def scan_pessimistic_batches_for_oom(
                     features_lens=features_lens,
                     tokens=tokens,
                     zero_duration_mask=zero_duration_mask,
-                    fusion_fields=fusion_fields,
-                    qwen_extractor=qwen_extractor,
+                    group_alignment=group_alignment,
+                    lm_extractor=lm_extractor,
                     is_training=True,
                 )
             loss.backward()
@@ -1167,7 +1167,7 @@ def tokenize_text(
         c.supervisions[0].zero_duration_mask = None
     # Symmetrically to `tokenize_text_fusion`: the non-fusion frontends emit
     # no groups, so clear any that a fusion pass left behind. Otherwise the
-    # dataset would collate fusion fields for a run whose `qwen_extractor` is
+    # dataset would collate fusion fields for a run whose `lm_extractor` is
     # None, and `compute_fbank_loss` would reject the batch.
     c.supervisions[0].phone_groups = None
     c.supervisions[0].lm_token_ids = None
@@ -1179,7 +1179,7 @@ def tokenize_text(
 #: resume that changes one of these loads without error and then trains
 #: against a different representation than the checkpoint learned.
 RESUME_CRITICAL_KEYS = (
-    "qwen_layers",
+    "lm_layers",
     "tokenizer",
     "text_frontend",
     # Selects *which* frozen Qwen supplies the conditioning. A different
@@ -1197,7 +1197,7 @@ def _effective_setting(key: str, value):
     same frozen Qwen and must compare equal, or resuming a default-model run
     while passing the name explicitly would be rejected for no reason.
     """
-    from zipvoice.models.modules.qwen_extractor import DEFAULT_MODEL_NAME
+    from zipvoice.models.modules.lm_extractor import DEFAULT_MODEL_NAME
 
     if key == "pretrained_tokenizer_name":
         return value or DEFAULT_MODEL_NAME
@@ -1211,9 +1211,9 @@ def check_resume_text_frontend(params, checkpoints) -> None:
     other setting silently comes from this invocation's CLI rather than the
     checkpoint. For most settings that is intended -- you may well want a
     different learning rate on resume. For the frozen extractor's depth it
-    is not: `qwen_layers` changes which Qwen layer the conditioning comes
+    is not: `lm_layers` changes which Qwen layer the conditioning comes
     from, but *not* the pooled width (always 896), so
-    `--tokenizer fusion --start-epoch 2` with `--qwen-layers` omitted loads
+    `--tokenizer fusion --start-epoch 2` with `--lm-layers` omitted loads
     cleanly, silently falls back to the argparse default, and continues
     training against a different representation with nothing to indicate it.
     The same argument applies to `pretrained_tokenizer_name`, which selects
@@ -1291,7 +1291,7 @@ def run(rank, world_size, args):
     # Populated only by the fusion frontend; every other tokenizer leaves
     # these None and the fusion-specific code paths stay inert.
     fusion_tokenizers = None
-    qwen_extractor = None
+    lm_extractor = None
 
     if params.tokenizer == "emilia":
         tokenizer = EmiliaTokenizer(token_file=params.token_file)
@@ -1303,7 +1303,7 @@ def run(rank, world_size, args):
         # One FusionTokenizer per language (each instance is locked to a
         # single `lang`), sharing one LanguageModelTokenizer so the Qwen
         # tokenizer is loaded once. See the fusion ADR.
-        from zipvoice.models.modules.qwen_extractor import (
+        from zipvoice.models.modules.lm_extractor import (
             DEFAULT_MODEL_NAME,
             TruncatedQwenExtractor,
         )
@@ -1324,9 +1324,9 @@ def run(rank, world_size, args):
         # `tokenizer` still stands in for vocab_size/pad_id below: they are
         # the *phone* vocabulary's, identical across the three instances.
         tokenizer = fusion_tokenizers["vi"]
-        qwen_extractor = TruncatedQwenExtractor(
+        lm_extractor = TruncatedQwenExtractor(
             model_name=params.pretrained_tokenizer_name or DEFAULT_MODEL_NAME,
-            num_layers=params.qwen_layers,
+            num_layers=params.lm_layers,
             device=params.device,
         )
         # Same reason the multilingual path saves its tokenizer: inference
@@ -1354,7 +1354,7 @@ def run(rank, world_size, args):
         # the model (it enters as pooled features), so there is no second
         # vocab_size to thread through.
         tokenizer_config["text_frontend"] = "fusion"
-        tokenizer_config["qwen_hidden_size"] = qwen_extractor.hidden_size
+        tokenizer_config["lm_hidden_size"] = lm_extractor.hidden_size
         tokenizer_config["gate_init_eps"] = params.gate_init_eps
     params.update(tokenizer_config)
 
@@ -1564,7 +1564,7 @@ def run(rank, world_size, args):
             train_dl=train_dl,
             optimizer=optimizer,
             params=params,
-            qwen_extractor=qwen_extractor,
+            lm_extractor=lm_extractor,
         )
 
     logging.info("Training started")
@@ -1594,7 +1594,7 @@ def run(rank, world_size, args):
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,
-            qwen_extractor=qwen_extractor,
+            lm_extractor=lm_extractor,
         )
 
         if params.num_iters > 0 and params.batch_idx_train > params.num_iters:

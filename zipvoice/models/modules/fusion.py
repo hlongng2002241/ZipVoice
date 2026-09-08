@@ -32,7 +32,7 @@ The shape of the design, in one place:
     broadcast to every phone in its group.
   - A **learned per-group gate** decides how much of each to use:
 
-        fused[i] = (1 - g[grp(i)]) * phone_embed[i] + g[grp(i)] * qwen[grp(i)]
+        fused[i] = (1 - g[grp(i)]) * phone_embed[i] + g[grp(i)] * lm_vec[grp(i)]
 
     initialized at `g ≈ eps` (0.01), i.e. near-phone-only, with no floor and
     no entropy regularization (per the ADR, gate collapse is an accepted,
@@ -60,7 +60,7 @@ Branch-magnitude normalization (the ADR flags this as must-resolve, since
 then rescaled by a learnable scalar initialized to the phone embedding's own
 RMS. That makes "0.01" mean "1% of a phone-embedding-sized vector" rather
 than 1% of an arbitrary, freshly-initialized projection's output scale.
-`calibrate_qwen_scale()` re-derives that scalar after the phone embedding is
+`calibrate_lm_scale()` re-derives that scalar after the phone embedding is
 transplanted from a source checkpoint (its RMS at construction time is only
 the random init's).
 """
@@ -131,20 +131,20 @@ class PhoneQwenFusion(nn.Module):
         self,
         phone_vocab_size: int,
         embed_dim: int = 192,
-        qwen_hidden_size: int = 896,
+        lm_hidden_size: int = 896,
         gate_init_eps: float = 0.01,
     ):
         super().__init__()
         assert 0.0 < gate_init_eps < 1.0, gate_init_eps
 
         self.phone_embed = nn.Embedding(phone_vocab_size, embed_dim)
-        self.qwen_proj = nn.Linear(qwen_hidden_size, embed_dim)
+        self.lm_proj = nn.Linear(lm_hidden_size, embed_dim)
         # Gate sees both branches; see the module docstring.
         self.gate_proj = nn.Linear(2 * embed_dim, 1)
-        self.qwen_scale = nn.Parameter(torch.ones(()))
+        self.lm_scale = nn.Parameter(torch.ones(()))
 
         self.embed_dim = embed_dim
-        self.qwen_hidden_size = qwen_hidden_size
+        self.lm_hidden_size = lm_hidden_size
         self.gate_init_eps = gate_init_eps
 
         # Start the gate near `eps` and input-*almost*-independent. The bias
@@ -175,9 +175,9 @@ class PhoneQwenFusion(nn.Module):
         # GATE_WEIGHT_INIT_STD is small enough that it barely perturbs the
         # initial gate and large enough to be far above the RMS floor. As an
         # order-of-magnitude guide the logit spread is about
-        # std * qwen_scale * sqrt(2 * embed_dim) ~= 0.1, against a bias of
+        # std * lm_scale * sqrt(2 * embed_dim) ~= 0.1, against a bias of
         # logit(0.01) = -4.60 -- taking both halves of the gate input to have
-        # per-element RMS ~= qwen_scale. That holds by construction for the
+        # per-element RMS ~= lm_scale. That holds by construction for the
         # Qwen half (RMS-normalized, then scaled by it) but only loosely for
         # the phone half, which is a per-group *mean* of embeddings and so can
         # be considerably smaller than the table's RMS. The estimate is
@@ -190,10 +190,10 @@ class PhoneQwenFusion(nn.Module):
         with torch.no_grad():
             self.gate_proj.weight.normal_(0.0, GATE_WEIGHT_INIT_STD)
             self.gate_proj.bias.fill_(math.log(gate_init_eps / (1.0 - gate_init_eps)))
-            self.calibrate_qwen_scale()
+            self.calibrate_lm_scale()
 
     @torch.no_grad()
-    def calibrate_qwen_scale(self) -> float:
+    def calibrate_lm_scale(self) -> float:
         """Set the Qwen branch's output scale to the phone embedding's RMS.
 
         Call this again after transplanting a source checkpoint's phone
@@ -204,42 +204,42 @@ class PhoneQwenFusion(nn.Module):
         phone-only initialization" stops meaning anything specific.
         """
         rms = self.phone_embed.weight.pow(2).mean().sqrt()
-        self.qwen_scale.fill_(float(rms))
+        self.lm_scale.fill_(float(rms))
         return float(rms)
 
-    def _qwen_and_gate(
+    def _lm_and_gate(
         self,
         phone_embed: torch.Tensor,
         phone_group_ids: torch.Tensor,
         phone_in_group: torch.Tensor,
-        qwen_group_features: torch.Tensor,
+        lm_group_features: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Shared by `forward()` and `current_gate_values()` so the two can
         never drift apart.
 
-        Returns (qwen, gate, safe_ids): the scaled per-group Qwen vectors
+        Returns (lm_vec, gate, safe_ids): the scaled per-group Qwen vectors
         (B, G, D), the per-group gate (B, G, 1), and the clamped group index
         (B, S) both callers reuse for gathering.
         """
-        batch_size, num_groups, _ = qwen_group_features.shape
+        batch_size, num_groups, _ = lm_group_features.shape
 
         # Project, then put the Qwen branch on the phone branch's scale so
         # `gate_init_eps` has a defined functional meaning.
-        qwen = self.qwen_proj(qwen_group_features)  # (B, G, D)
-        qwen = qwen * torch.rsqrt(
-            qwen.pow(2).mean(dim=-1, keepdim=True) + 1e-8
+        lm = self.lm_proj(lm_group_features)  # (B, G, D)
+        lm = lm * torch.rsqrt(
+            lm.pow(2).mean(dim=-1, keepdim=True) + 1e-8
         )  # unit RMS per group vector
-        qwen = qwen * self.qwen_scale
+        lm = lm * self.lm_scale
 
         # Keep this block dtype-coherent by construction. Under autocast,
-        # `qwen_proj` returns fp16 while `phone_embed` -- an `nn.Embedding`,
+        # `lm_proj` returns fp16 while `phone_embed` -- an `nn.Embedding`,
         # which autocast does not cast -- stays fp32. As written above, the
-        # RMS normalization happens to promote `qwen` back to fp32 (autocast
+        # RMS normalization happens to promote `lm_vec` back to fp32 (autocast
         # runs `mean`/`rsqrt` in fp32) so the two agree, but that is
         # incidental to operation order: `scatter_add_` requires matching
         # dtypes and would raise the moment that ordering changed. Cast
         # explicitly rather than depend on autocast's promotion rules.
-        phones = phone_embed.to(qwen.dtype)
+        phones = phone_embed.to(lm.dtype)
 
         # Gate input: this group's Qwen vector alongside the mean embedding
         # of its own phones (mean used for gating only -- see docstring).
@@ -249,26 +249,26 @@ class PhoneQwenFusion(nn.Module):
         # out of `member` below, so a clamped index contributes nothing to
         # any group's mean.
         safe_ids = phone_group_ids.clamp(min=0, max=num_groups - 1)  # (B, S)
-        member = phone_in_group.unsqueeze(-1).to(qwen.dtype)  # (B, S, 1)
+        member = phone_in_group.unsqueeze(-1).to(lm.dtype)  # (B, S, 1)
         index = safe_ids.unsqueeze(-1).expand(-1, -1, self.embed_dim)
-        sums = torch.zeros_like(qwen).scatter_add_(1, index, phones * member)
+        sums = torch.zeros_like(lm).scatter_add_(1, index, phones * member)
         counts = torch.zeros(
-            batch_size, num_groups, device=qwen.device, dtype=qwen.dtype
+            batch_size, num_groups, device=lm.device, dtype=lm.dtype
         ).scatter_add_(1, safe_ids, member.squeeze(-1))
         phone_group_mean = sums / counts.clamp(min=1.0).unsqueeze(-1)  # (B, G, D)
 
         gate = torch.sigmoid(
-            self.gate_proj(torch.cat([qwen, phone_group_mean], dim=-1))
+            self.gate_proj(torch.cat([lm, phone_group_mean], dim=-1))
         )  # (B, G, 1)
-        return qwen, gate, safe_ids
+        return lm, gate, safe_ids
 
     def forward(
         self,
         phone_ids_padded: torch.Tensor,
         phone_group_ids: torch.Tensor,
         phone_in_group: torch.Tensor,
-        qwen_group_features: Optional[torch.Tensor] = None,
-        qwen_group_valid: Optional[torch.Tensor] = None,
+        lm_group_features: Optional[torch.Tensor] = None,
+        lm_group_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -296,24 +296,24 @@ class PhoneQwenFusion(nn.Module):
             Distinguish it from `phone_has_conditioning` below: this asks
             whether a slot is addressed, that one whether the slot holds
             real Qwen evidence.
-          qwen_group_features: (B, G, qwen_hidden_size) pooled Qwen vectors,
+          lm_group_features: (B, G, lm_hidden_size) pooled Qwen vectors,
             or None to run phone-only (equivalent to an all-invalid batch --
             used by tests, and by any caller without a Qwen branch).
-          qwen_group_valid: (B, G) bool marking real pooled groups.
+          lm_group_mask: (B, G) bool marking real pooled groups.
 
         Returns:
           (B, S, embed_dim) fused text embedding.
         """
         phone_embed = self.phone_embed(phone_ids_padded)  # (B, S, D)
 
-        if qwen_group_features is None:
+        if lm_group_features is None:
             return phone_embed
 
-        assert qwen_group_valid is not None, (
-            "qwen_group_valid must accompany qwen_group_features"
+        assert lm_group_mask is not None, (
+            "lm_group_mask must accompany lm_group_features"
         )
-        batch_size, num_groups, _ = qwen_group_features.shape
-        assert qwen_group_valid.shape == (batch_size, num_groups)
+        batch_size, num_groups, _ = lm_group_features.shape
+        assert lm_group_mask.shape == (batch_size, num_groups)
 
         # A phone group index can legitimately exceed the Qwen tensor's group
         # dimension. `TruncatedQwenExtractor.pooled_groups()` sizes that
@@ -333,26 +333,26 @@ class PhoneQwenFusion(nn.Module):
             # `FusionTokenizerArtifact.__post_init__` is supposed to prevent
             # -- fail loudly rather than silently drop its Qwen branch.
             offending = (~in_range).any(dim=1)
-            assert not bool((qwen_group_valid.any(dim=1) & offending).any()), (
+            assert not bool((lm_group_mask.any(dim=1) & offending).any()), (
                 "phone group index out of range for an utterance whose "
                 "lm_token alignment succeeded -- phone_groups and "
                 "lm_token_groups have diverged"
             )
             phone_in_group = phone_in_group & in_range
 
-        qwen, gate, safe_ids = self._qwen_and_gate(
-            phone_embed, phone_group_ids, phone_in_group, qwen_group_features
+        lm_vec, gate, safe_ids = self._lm_and_gate(
+            phone_embed, phone_group_ids, phone_in_group, lm_group_features
         )
         index = safe_ids.unsqueeze(-1).expand(-1, -1, self.embed_dim)
 
         # Broadcast group-level Qwen contribution and gate onto phones.
-        qwen_at_phone = torch.gather(qwen, 1, index)  # (B, S, D)
+        lm_at_phone = torch.gather(lm_vec, 1, index)  # (B, S, D)
         gate_at_phone = torch.gather(gate, 1, safe_ids.unsqueeze(-1))  # (B, S, 1)
         phone_has_conditioning = phone_in_group & torch.gather(
-            qwen_group_valid, 1, safe_ids
+            lm_group_mask, 1, safe_ids
         )  # (B, S)
 
-        fused = (1.0 - gate_at_phone) * phone_embed + gate_at_phone * qwen_at_phone
+        fused = (1.0 - gate_at_phone) * phone_embed + gate_at_phone * lm_at_phone
         # Anywhere without a real, valid group -- padding, the trailing
         # sentinel, and every position of an utterance whose lm_token
         # alignment failed -- falls back to the plain phone embedding.
@@ -364,15 +364,15 @@ class PhoneQwenFusion(nn.Module):
         phone_ids_padded: torch.Tensor,
         phone_group_ids: torch.Tensor,
         phone_in_group: torch.Tensor,
-        qwen_group_features: torch.Tensor,
-        qwen_group_valid: torch.Tensor,
+        lm_group_features: torch.Tensor,
+        lm_group_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Per-group gate values for logging/monitoring (sprint 004 watches
         these for collapse). Returns (B, G), zero where the group isn't real.
         """
         phone_embed = self.phone_embed(phone_ids_padded)
-        _, gate, _ = self._qwen_and_gate(
-            phone_embed, phone_group_ids, phone_in_group, qwen_group_features
+        _, gate, _ = self._lm_and_gate(
+            phone_embed, phone_group_ids, phone_in_group, lm_group_features
         )
         gate = gate.squeeze(-1)
-        return gate * qwen_group_valid.to(gate.dtype)
+        return gate * lm_group_mask.to(gate.dtype)

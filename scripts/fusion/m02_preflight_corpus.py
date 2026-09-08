@@ -20,7 +20,7 @@ Why this exists, concretely: the first fusion training run spent ~93% of its
 batches phone-only and nobody noticed for a full epoch, because
 `lm_token_groups=None` is a legal fallback that fires silently (see the
 sentence-boundary bug fixed in `_split_into_groups`). Training-time coverage
-metrics (`qwen_cov_utt`/`qwen_cov_grp`) now make that visible per log line,
+metrics (`lm_cov_utt`/`lm_cov_grp`) now make that visible per log line,
 but they only tell you *after* you have committed the GPU. This tells you
 before, in a few minutes, and it reports the losses those metrics cannot
 see:

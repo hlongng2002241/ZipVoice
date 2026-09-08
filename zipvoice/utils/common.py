@@ -221,7 +221,7 @@ def prepare_input(
     return_feature: bool = True,
     return_audio: bool = False,
     return_zero_duration_mask: bool = False,
-    return_fusion_fields: bool = False,
+    return_group_alignment: bool = False,
 ):
     """
     Parse the features and targets of the current batch.
@@ -241,7 +241,7 @@ def prepare_input(
         `return_tokens=True` matches the original (pre-multilingual) contract
         exactly -- callers that don't ask for the mask don't get an extra,
         unexpected item in the return list.
-      return_fusion_fields:
+      return_group_alignment:
         If True, also return the fusion frontend's extra per-utterance
         fields (see the Qwen+phoneme fusion ADR) as a dict with keys
         `phone_groups` / `lm_token_ids` / `lm_token_groups`, or None when the
@@ -252,8 +252,8 @@ def prepare_input(
     assert not (return_zero_duration_mask and not return_tokens), (
         "return_zero_duration_mask requires return_tokens=True"
     )
-    assert not (return_fusion_fields and not return_tokens), (
-        "return_fusion_fields requires return_tokens=True"
+    assert not (return_group_alignment and not return_tokens), (
+        "return_group_alignment requires return_tokens=True"
     )
     return_list = []
 
@@ -279,16 +279,21 @@ def prepare_input(
                     ]
             return_list += [zero_duration_mask]
 
-        if return_fusion_fields:
+        if return_group_alignment:
             if "phone_groups" in batch:
-                fusion_fields = {
+                # The group correspondence for both sides, plus the ids the
+                # LM branch reads. `lm_token_ids` is strictly an input rather
+                # than an alignment, but it travels with the two group lists
+                # because it is meaningless without them -- the indices in
+                # `lm_token_groups` point into it.
+                group_alignment = {
                     "phone_groups": batch["phone_groups"],
                     "lm_token_ids": batch["lm_token_ids"],
                     "lm_token_groups": batch["lm_token_groups"],
                 }
             else:
-                fusion_fields = None
-            return_list += [fusion_fields]
+                group_alignment = None
+            return_list += [group_alignment]
 
     if return_feature:
         features = batch["features"].to(device)
