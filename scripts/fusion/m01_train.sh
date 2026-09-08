@@ -44,7 +44,7 @@ fi
 TRAIN_ARGS=(
     --tokenizer fusion
     --token-file "$TOKEN_FILE"
-    --qwen-layers 4
+    --lm-layers 4
     --gate-init-eps 0.01
     --lang-auto-prob 0
     --lang-wrong-prob 0

@@ -1,5 +1,5 @@
 """Contract tests for the Qwen branch's truncated extractor (see
-zipvoice/models/modules/qwen_extractor.py and the ADR's point 6).
+zipvoice/models/modules/lm_extractor.py and the ADR's point 6).
 
 The load-bearing test here is `test_truncated_matches_full_forward`: it
 proves the extractor's shortened layer stack produces *exactly* the same
@@ -17,7 +17,7 @@ import gc
 import pytest
 import torch
 
-from zipvoice.models.modules.qwen_extractor import TruncatedQwenExtractor
+from zipvoice.models.modules.lm_extractor import TruncatedQwenExtractor
 
 MODEL_NAME = "Qwen/Qwen2.5-0.5B"
 NUM_LAYERS = 4

@@ -175,7 +175,7 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--qwen-layers",
+        "--lm-layers",
         type=int,
         default=4,
         help="Number of Qwen decoder layers the truncated extractor runs, "
@@ -414,7 +414,7 @@ def generate_sentence_raw_evaluation(
     feat_scale: float = 0.1,
     sampling_rate: int = 24000,
     lang: Optional[str] = None,
-    qwen_extractor=None,
+    lm_extractor=None,
 ):
     """
     Generate waveform of a text based on a given prompt waveform and its transcription,
@@ -467,7 +467,7 @@ def generate_sentence_raw_evaluation(
     # sequence, so tagging both would put two control tokens in what training
     # only ever saw as a single utterance with one leading tag.
     fusion_kwargs = {}
-    if qwen_extractor is not None:
+    if lm_extractor is not None:
         # Fusion frontend. `compose_artifacts` applies the same one-tag rule
         # as the branch below, on the artifact rather than on the raw text,
         # and shifts the target's group indices past the prompt's.
@@ -480,7 +480,7 @@ def generate_sentence_raw_evaluation(
         prompt_tokens = [prompt_artifact.phone_ids]
         tokens = [target_artifact.phone_ids]
         prompt_zero_duration_mask = None
-        qwen_group_features, qwen_group_valid = qwen_extractor.pooled_groups(
+        lm_group_features, lm_group_mask = lm_extractor.pooled_groups(
             [composed.lm_token_ids], [composed.lm_token_groups]
         )
         if composed.lm_token_groups is None:
@@ -490,8 +490,8 @@ def generate_sentence_raw_evaluation(
             )
         fusion_kwargs = {
             "phone_groups": [composed.phone_groups],
-            "qwen_group_features": qwen_group_features.to(device),
-            "qwen_group_valid": qwen_group_valid.to(device),
+            "lm_group_features": lm_group_features.to(device),
+            "lm_group_mask": lm_group_mask.to(device),
         }
     else:
         prompt_text = apply_lang_tag(prompt_text, tokenizer, lang)
@@ -577,7 +577,7 @@ def generate_sentence(
     max_duration: float = 100,
     remove_long_sil: bool = False,
     lang: Optional[str] = None,
-    qwen_extractor=None,
+    lm_extractor=None,
 ):
     """
     Generate waveform of a text based on a given prompt waveform and its transcription,
@@ -653,7 +653,7 @@ def generate_sentence(
     text = add_punctuation(text)
     prompt_text = add_punctuation(prompt_text)
 
-    if qwen_extractor is not None:
+    if lm_extractor is not None:
         raise NotImplementedError(
             "The chunking generation path does not support "
             "text_frontend='fusion' yet. It splits the target text into "
@@ -814,7 +814,7 @@ def generate_list(
     max_duration: float = 100,
     remove_long_sil: bool = False,
     lang: Optional[str] = None,
-    qwen_extractor=None,
+    lm_extractor=None,
 ):
     total_t = []
     total_t_no_vocoder = []
@@ -846,7 +846,7 @@ def generate_list(
             "feat_scale": feat_scale,
             "sampling_rate": sampling_rate,
             "lang": lang,
-            "qwen_extractor": qwen_extractor,
+            "lm_extractor": lm_extractor,
         }
 
         if raw_evaluation:
@@ -955,7 +955,7 @@ def main():
                 HUGGINGFACE_REPO, filename=f"{MODEL_DIR[params.model_name]}/tokens.txt"
             )
 
-    qwen_extractor = None  # fusion only; threaded through generation below
+    lm_extractor = None  # fusion only; threaded through generation below
     if params.tokenizer == "emilia":
         tokenizer = EmiliaTokenizer(token_file=token_file)
     elif params.tokenizer == "libritts":
@@ -980,7 +980,7 @@ def main():
         # Locked to one language per instance, like at training time, so the
         # phone branch is always built under a known language rather than a
         # guessed one. `--lang` selects it.
-        from zipvoice.models.modules.qwen_extractor import (
+        from zipvoice.models.modules.lm_extractor import (
             DEFAULT_MODEL_NAME,
             TruncatedQwenExtractor,
         )
@@ -999,9 +999,9 @@ def main():
         )
         # Built on CPU: params.device is only resolved further down. Moved
         # onto the model's device right after that.
-        qwen_extractor = TruncatedQwenExtractor(
+        lm_extractor = TruncatedQwenExtractor(
             model_name=params.pretrained_tokenizer_name or DEFAULT_MODEL_NAME,
-            num_layers=params.qwen_layers,
+            num_layers=params.lm_layers,
         )
     else:
         assert params.tokenizer == "simple"
@@ -1010,7 +1010,7 @@ def main():
     tokenizer_config = {"vocab_size": tokenizer.vocab_size, "pad_id": tokenizer.pad_id}
     if params.tokenizer == "fusion":
         tokenizer_config["text_frontend"] = "fusion"
-        tokenizer_config["qwen_hidden_size"] = qwen_extractor.hidden_size
+        tokenizer_config["lm_hidden_size"] = lm_extractor.hidden_size
         tokenizer_config["gate_init_eps"] = params.gate_init_eps
 
     with open(model_config, "r") as f:
@@ -1045,8 +1045,8 @@ def main():
 
     model = model.to(params.device)
     model.eval()
-    if qwen_extractor is not None:
-        qwen_extractor.to(params.device)
+    if lm_extractor is not None:
+        lm_extractor.to(params.device)
 
     if params.trt_engine_path:
         load_trt(model, params.trt_engine_path)
@@ -1086,7 +1086,7 @@ def main():
             max_duration=params.max_duration,
             remove_long_sil=params.remove_long_sil,
             lang=params.lang,
-            qwen_extractor=qwen_extractor,
+            lm_extractor=lm_extractor,
         )
     else:
         assert (
@@ -1112,7 +1112,7 @@ def main():
             max_duration=params.max_duration,
             remove_long_sil=params.remove_long_sil,
             lang=params.lang,
-            qwen_extractor=qwen_extractor,
+            lm_extractor=lm_extractor,
         )
         logging.info(f"Saved to: {params.res_wav_path}")
     logging.info("Done")

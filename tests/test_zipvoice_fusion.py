@@ -33,7 +33,7 @@ def _model(**overrides):
         vocab_size=PHONE_VOCAB,
         text_embed_dim=EMBED_DIM,
         text_frontend="fusion",
-        qwen_hidden_size=QWEN_DIM,
+        lm_hidden_size=QWEN_DIM,
         **_TINY_KWARGS,
     )
     kwargs.update(overrides)
@@ -47,17 +47,17 @@ def _batch():
     """
     tokens = [[5, 6, 7, 8, 9], [10, 11, 12]]
     phone_groups = [[[0, 1], [2, 3, 4]], [[0], [1, 2]]]
-    qwen = torch.randn(2, 2, QWEN_DIM)
+    lm_feats = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
-    return tokens, phone_groups, qwen, valid
+    return tokens, phone_groups, lm_feats, valid
 
 
 def test_fusion_model_shape_and_no_separate_embedding():
     model = _model()
     assert model.embed is None, "fusion owns its phone embedding; no dead table"
     assert model.fusion.phone_embed.weight.shape == (PHONE_VOCAB, EMBED_DIM)
-    assert model.fusion.qwen_proj.in_features == QWEN_DIM
-    assert model.fusion.qwen_proj.out_features == EMBED_DIM
+    assert model.fusion.lm_proj.in_features == QWEN_DIM
+    assert model.fusion.lm_proj.out_features == EMBED_DIM
     # The whole point of the repositioned in_proj: it is 192-wide again, so
     # the source checkpoint's own in_proj is shape-compatible.
     assert model.text_encoder.in_proj.in_features == EMBED_DIM
@@ -65,8 +65,8 @@ def test_fusion_model_shape_and_no_separate_embedding():
 
 def test_forward_text_embed_matches_padded_width():
     model = _model()
-    tokens, phone_groups, qwen, valid = _batch()
-    embed, lens = model.forward_text_embed(tokens, phone_groups, qwen, valid)
+    tokens, phone_groups, lm_feats, valid = _batch()
+    embed, lens = model.forward_text_embed(tokens, phone_groups, lm_feats, valid)
     # pad_labels appends one sentinel beyond the longest real sequence.
     assert embed.shape == (2, 6, 100)  # (B, max_len + 1, feat_dim out)
     assert torch.equal(lens, torch.tensor([5, 3]))
@@ -74,7 +74,7 @@ def test_forward_text_embed_matches_padded_width():
 
 def test_forward_runs_and_backprops():
     model = _model()
-    tokens, phone_groups, qwen, valid = _batch()
+    tokens, phone_groups, lm_feats, valid = _batch()
     features_lens = torch.tensor([40, 24])
     features = torch.randn(2, 40, 100)
     noise = torch.randn(2, 40, 100)
@@ -87,14 +87,14 @@ def test_forward_runs_and_backprops():
         noise=noise,
         t=t,
         phone_groups=phone_groups,
-        qwen_group_features=qwen,
-        qwen_group_valid=valid,
+        lm_group_features=lm_feats,
+        lm_group_mask=valid,
     )
     assert loss.ndim == 0 and torch.isfinite(loss)
 
     loss.backward()
     assert model.fusion.phone_embed.weight.grad is not None
-    assert model.fusion.qwen_proj.weight.grad.abs().sum() > 0
+    assert model.fusion.lm_proj.weight.grad.abs().sum() > 0
     assert model.fusion.gate_proj.weight.grad is not None
 
 
@@ -110,7 +110,7 @@ def test_duration_gather_reaches_the_sentinel_position():
 
     model = _model()
     model.eval()
-    tokens, phone_groups, qwen, valid = _batch()
+    tokens, phone_groups, lm_feats, valid = _batch()
     # The residual entry only carries frames when the feature length doesn't
     # divide evenly by the phone count (durations are `utt_duration //
     # n_tokens` each). 41/5 leaves a remainder, so index 5 is really emitted;
@@ -118,7 +118,7 @@ def test_duration_gather_reaches_the_sentinel_position():
     # pass even against a model that had no slot for it.
     features_lens = torch.tensor([41, 24])
 
-    embed, tokens_lens = model.forward_text_embed(tokens, phone_groups, qwen, valid)
+    embed, tokens_lens = model.forward_text_embed(tokens, phone_groups, lm_feats, valid)
     durations = prepare_avg_tokens_durations(features_lens, tokens_lens)
     index = get_tokens_index(durations, int(features_lens.max()))
 
@@ -143,9 +143,9 @@ def test_starts_near_phone_only():
     """
     model = _model()
     model.eval()  # the Zipformer is stochastic in train mode
-    tokens, phone_groups, qwen, valid = _batch()
+    tokens, phone_groups, lm_feats, valid = _batch()
 
-    fused, _ = model.forward_text_embed(tokens, phone_groups, qwen, valid)
+    fused, _ = model.forward_text_embed(tokens, phone_groups, lm_feats, valid)
     phone_only, _ = model.forward_text_embed(tokens, phone_groups, None, None)
 
     rel = (fused - phone_only).norm() / phone_only.norm()
@@ -155,7 +155,7 @@ def test_starts_near_phone_only():
 def test_none_groups_falls_back_to_phone_only():
     model = _model()
     model.eval()
-    tokens, phone_groups, qwen, valid = _batch()
+    tokens, phone_groups, lm_feats, valid = _batch()
     # Utterance 1's lm_token alignment failed (sprint 000's documented case).
     valid[1] = False
 
@@ -167,20 +167,20 @@ def test_none_groups_falls_back_to_phone_only():
     group_ids, has_group = build_phone_group_index(
         phone_groups, padded_len=padded.shape[1], device=torch.device("cpu")
     )
-    fused_raw = model.fusion(padded, group_ids, has_group, qwen, valid)
+    fused_raw = model.fusion(padded, group_ids, has_group, lm_feats, valid)
     torch.testing.assert_close(fused_raw[1], model.fusion.phone_embed(padded)[1])
 
     # And end-to-end through the text encoder.
-    fused, _ = model.forward_text_embed(tokens, phone_groups, qwen, valid)
+    fused, _ = model.forward_text_embed(tokens, phone_groups, lm_feats, valid)
     phone_only, _ = model.forward_text_embed(tokens, phone_groups, None, None)
     torch.testing.assert_close(fused[1], phone_only[1])
 
 
 def test_fusion_requires_phone_groups():
     model = _model()
-    tokens, _, qwen, valid = _batch()
+    tokens, _, lm_feats, valid = _batch()
     with pytest.raises(AssertionError, match="phone_groups"):
-        model.forward_text_embed(tokens, None, qwen, valid)
+        model.forward_text_embed(tokens, None, lm_feats, valid)
 
 
 def test_inference_refuses_fusion_without_the_composed_fields():

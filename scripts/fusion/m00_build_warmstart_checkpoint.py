@@ -33,9 +33,9 @@ initialization. This script therefore states the mapping explicitly:
     text_encoder.in_proj.{weight,bias}              ->  same name, same shape
     text_encoder.*  (176 tensors)                   ->  same name
     fm_decoder.*    (712 tensors)                   ->  same name
-    (nothing)                                       ->  fusion.qwen_proj.*   [fresh]
+    (nothing)                                       ->  fusion.lm_proj.*   [fresh]
     (nothing)                                       ->  fusion.gate_proj.*   [fresh]
-    (nothing)                                       ->  fusion.qwen_scale    [calibrated]
+    (nothing)                                       ->  fusion.lm_scale    [calibrated]
 
 Two things this buys that the old builder could not:
 
@@ -49,7 +49,7 @@ Two things this buys that the old builder could not:
     source's 360-symbol vocabulary, and both candidate source checkpoints
     ship that identical `tokens.txt` (see sprint 003, step 1).
 
-After transplanting, `PhoneQwenFusion.calibrate_qwen_scale()` is re-run so
+After transplanting, `PhoneQwenFusion.calibrate_lm_scale()` is re-run so
 the Qwen branch's output scale matches the *transplanted* phone embedding's
 RMS rather than the random init's -- without that, `--gate-init-eps` mixes
 in 1% of a vector whose magnitude is arbitrary relative to the phone branch
@@ -85,11 +85,11 @@ RENAMES = {"embed.weight": "fusion.phone_embed.weight"}
 
 # Tensors the source checkpoint cannot possibly provide.
 EXPECTED_FRESH = {
-    "fusion.qwen_proj.weight",
-    "fusion.qwen_proj.bias",
+    "fusion.lm_proj.weight",
+    "fusion.lm_proj.bias",
     "fusion.gate_proj.weight",
     "fusion.gate_proj.bias",
-    "fusion.qwen_scale",
+    "fusion.lm_scale",
 }
 
 
@@ -115,7 +115,7 @@ def get_args():
         "embedding rows being transplanted.",
     )
     parser.add_argument("--model-config", type=Path, default=DEFAULT_MODEL_CONFIG)
-    parser.add_argument("--qwen-hidden-size", type=int, default=896)
+    parser.add_argument("--lm-hidden-size", type=int, default=896)
     parser.add_argument("--gate-init-eps", type=float, default=0.01)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUT_PATH)
     return parser.parse_args()
@@ -145,7 +145,7 @@ def main():
         vocab_size=tokenizer.vocab_size,
         pad_id=tokenizer.pad_id,
         text_frontend="fusion",
-        qwen_hidden_size=args.qwen_hidden_size,
+        lm_hidden_size=args.lm_hidden_size,
         gate_init_eps=args.gate_init_eps,
     )
     our_state = model.state_dict()
@@ -220,14 +220,14 @@ def main():
         vocab_size=tokenizer.vocab_size,
         pad_id=tokenizer.pad_id,
         text_frontend="fusion",
-        qwen_hidden_size=args.qwen_hidden_size,
+        lm_hidden_size=args.lm_hidden_size,
         gate_init_eps=args.gate_init_eps,
     )
     check_model.load_state_dict(warmstart, strict=True)
-    rms = check_model.fusion.calibrate_qwen_scale()
-    warmstart["fusion.qwen_scale"] = check_model.state_dict()["fusion.qwen_scale"].clone()
+    rms = check_model.fusion.calibrate_lm_scale()
+    warmstart["fusion.lm_scale"] = check_model.state_dict()["fusion.lm_scale"].clone()
     print(
-        f"Calibrated fusion.qwen_scale to the transplanted phone embedding's "
+        f"Calibrated fusion.lm_scale to the transplanted phone embedding's "
         f"RMS: {rms:.6f}"
     )
 

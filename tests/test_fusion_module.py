@@ -37,7 +37,7 @@ PAD_ID = 0
 def fusion():
     torch.manual_seed(0)
     return PhoneQwenFusion(
-        phone_vocab_size=PHONE_VOCAB, embed_dim=EMBED_DIM, qwen_hidden_size=QWEN_DIM
+        phone_vocab_size=PHONE_VOCAB, embed_dim=EMBED_DIM, lm_hidden_size=QWEN_DIM
     )
 
 
@@ -92,9 +92,9 @@ def test_gate_starts_near_eps(fusion):
     tighter than anything that would disturb the near-phone-only start.
     """
     _, _, padded, group_ids, in_group = _batch()
-    qwen = torch.randn(2, 2, QWEN_DIM)
+    lm_feats = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
-    gates = fusion.current_gate_values(padded, group_ids, in_group, qwen, valid)
+    gates = fusion.current_gate_values(padded, group_ids, in_group, lm_feats, valid)
     assert torch.allclose(
         gates, torch.full_like(gates, fusion.gate_init_eps), atol=5e-3
     ), f"gate must start near eps, got {gates}"
@@ -127,10 +127,10 @@ def test_output_is_near_phone_only_at_init(fusion):
     what makes the source-checkpoint transplant meaningful.
     """
     _, _, padded, group_ids, in_group = _batch()
-    qwen = torch.randn(2, 2, QWEN_DIM)
+    lm_feats = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
 
-    fused = fusion(padded, group_ids, in_group, qwen, valid)
+    fused = fusion(padded, group_ids, in_group, lm_feats, valid)
     phone_only = fusion.phone_embed(padded)
 
     assert fused.shape == phone_only.shape
@@ -144,9 +144,9 @@ def test_phone_identity_is_preserved_within_a_group(fusion):
     collapse to the same vector.
     """
     _, _, padded, group_ids, in_group = _batch()
-    qwen = torch.randn(2, 2, QWEN_DIM)
+    lm_feats = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
-    fused = fusion(padded, group_ids, in_group, qwen, valid)
+    fused = fusion(padded, group_ids, in_group, lm_feats, valid)
 
     # Positions 0 and 1 are distinct phones in the same group (group 0).
     assert group_ids[0, 0] == group_ids[0, 1]
@@ -159,7 +159,7 @@ def test_phone_identity_is_preserved_within_a_group(fusion):
     phone_embed = fusion.phone_embed(padded)
     # The gate's actual value, not the nominal eps: the weights are small
     # random, so group 0's gate is near eps but not identical to it.
-    gate = fusion.current_gate_values(padded, group_ids, in_group, qwen, valid)[0, 0]
+    gate = fusion.current_gate_values(padded, group_ids, in_group, lm_feats, valid)[0, 0]
     torch.testing.assert_close(
         fused[0, 0] - fused[0, 1],
         (1.0 - gate) * (phone_embed[0, 0] - phone_embed[0, 1]),
@@ -174,12 +174,12 @@ def test_qwen_contribution_is_shared_within_a_group(fusion):
     """
     _, _, padded, group_ids, in_group = _batch()
     valid = torch.ones(2, 2, dtype=torch.bool)
-    qwen_a = torch.zeros(2, 2, QWEN_DIM)
-    qwen_b = qwen_a.clone()
-    qwen_b[0, 1] = torch.randn(QWEN_DIM)  # perturb utterance 0's group 1 only
+    lm_feats_a = torch.zeros(2, 2, QWEN_DIM)
+    lm_feats_b = lm_feats_a.clone()
+    lm_feats_b[0, 1] = torch.randn(QWEN_DIM)  # perturb utterance 0's group 1 only
 
-    out_a = fusion(padded, group_ids, in_group, qwen_a, valid)
-    out_b = fusion(padded, group_ids, in_group, qwen_b, valid)
+    out_a = fusion(padded, group_ids, in_group, lm_feats_a, valid)
+    out_b = fusion(padded, group_ids, in_group, lm_feats_b, valid)
     moved = (out_a - out_b).abs().sum(dim=-1) > 1e-8
 
     assert moved[0].tolist() == [False, False, True, True, True, False], (
@@ -190,9 +190,9 @@ def test_qwen_contribution_is_shared_within_a_group(fusion):
 
 def test_sentinel_and_padding_get_plain_phone_embeddings(fusion):
     _, _, padded, group_ids, in_group = _batch()
-    qwen = torch.randn(2, 2, QWEN_DIM)
+    lm_feats = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
-    fused = fusion(padded, group_ids, in_group, qwen, valid)
+    fused = fusion(padded, group_ids, in_group, lm_feats, valid)
     phone_only = fusion.phone_embed(padded)
 
     # Utterance 0's sentinel is position 5; utterance 1's are 3..5.
@@ -205,11 +205,11 @@ def test_invalid_groups_fall_back_to_phone_only(fusion):
     alignment-failure case) must yield exactly the phone-only path.
     """
     _, _, padded, group_ids, in_group = _batch()
-    qwen = torch.randn(2, 2, QWEN_DIM)
+    lm_feats = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
     valid[1] = False  # utterance 1's alignment failed
 
-    fused = fusion(padded, group_ids, in_group, qwen, valid)
+    fused = fusion(padded, group_ids, in_group, lm_feats, valid)
     phone_only = fusion.phone_embed(padded)
     torch.testing.assert_close(fused[1], phone_only[1])
     assert not torch.allclose(fused[0], phone_only[0]), "utterance 0 still fuses"
@@ -234,10 +234,10 @@ def test_failed_alignment_with_more_phone_groups_than_qwen_groups(fusion):
     assert int(group_ids.max()) == 4
 
     # What the extractor returns for [None, [[..],[..]]]: only 2 group slots.
-    qwen = torch.randn(2, 2, QWEN_DIM)
+    lm_feats = torch.randn(2, 2, QWEN_DIM)
     valid = torch.tensor([[False, False], [True, True]])
 
-    fused = fusion(padded, group_ids, in_group, qwen, valid)
+    fused = fusion(padded, group_ids, in_group, lm_feats, valid)
     phone_only = fusion.phone_embed(padded)
     assert fused.shape == phone_only.shape
     # The unaligned utterance degrades to phone-only...
@@ -256,10 +256,10 @@ def test_all_alignments_failed_in_a_batch(fusion):
     group_ids, in_group = build_phone_group_index(
         phone_groups, padded_len=padded.shape[1], device=torch.device("cpu")
     )
-    qwen = torch.zeros(2, 1, QWEN_DIM)
+    lm_feats = torch.zeros(2, 1, QWEN_DIM)
     valid = torch.zeros(2, 1, dtype=torch.bool)
 
-    fused = fusion(padded, group_ids, in_group, qwen, valid)
+    fused = fusion(padded, group_ids, in_group, lm_feats, valid)
     torch.testing.assert_close(fused, fusion.phone_embed(padded))
 
 
@@ -274,10 +274,10 @@ def test_diverged_groups_on_an_aligned_utterance_still_raises(fusion):
     group_ids, in_group = build_phone_group_index(
         phone_groups, padded_len=padded.shape[1], device=torch.device("cpu")
     )
-    qwen = torch.randn(1, 2, QWEN_DIM)  # ...but only 2 Qwen groups
+    lm_feats = torch.randn(1, 2, QWEN_DIM)  # ...but only 2 Qwen groups
     valid = torch.ones(1, 2, dtype=torch.bool)  # and it claims to have aligned
     with pytest.raises(AssertionError, match="diverged"):
-        fusion(padded, group_ids, in_group, qwen, valid)
+        fusion(padded, group_ids, in_group, lm_feats, valid)
 
 
 def test_no_qwen_features_is_pure_phone_path(fusion):
@@ -293,11 +293,11 @@ def test_qwen_scale_tracks_phone_embedding_rms(fusion):
     """
     with torch.no_grad():
         fusion.phone_embed.weight.mul_(7.0)  # stand-in for a transplant
-    before = float(fusion.qwen_scale.detach())
-    after = fusion.calibrate_qwen_scale()
+    before = float(fusion.lm_scale.detach())
+    after = fusion.calibrate_lm_scale()
     assert after == pytest.approx(before * 7.0, rel=1e-5)
     expected = float(fusion.phone_embed.weight.pow(2).mean().sqrt())
-    assert float(fusion.qwen_scale.detach()) == pytest.approx(expected, rel=1e-6)
+    assert float(fusion.lm_scale.detach()) == pytest.approx(expected, rel=1e-6)
 
 
 def test_gate_is_learnable_from_init(fusion):
@@ -305,14 +305,14 @@ def test_gate_is_learnable_from_init(fusion):
     gate could never become input-dependent.
     """
     _, _, padded, group_ids, in_group = _batch()
-    qwen = torch.randn(2, 2, QWEN_DIM)
+    lm_feats = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
-    fusion(padded, group_ids, in_group, qwen, valid).sum().backward()
+    fusion(padded, group_ids, in_group, lm_feats, valid).sum().backward()
     assert fusion.gate_proj.weight.grad is not None
     assert fusion.gate_proj.weight.grad.abs().sum() > 0, (
         "zero-init gate weights got no gradient -- the gate could never learn"
     )
-    assert fusion.qwen_proj.weight.grad.abs().sum() > 0
+    assert fusion.lm_proj.weight.grad.abs().sum() > 0
 
 
 @pytest.mark.parametrize("aligned", [True, False])
@@ -320,24 +320,24 @@ def test_forward_under_autocast(fusion, aligned):
     """Training runs with `--use-fp16 True`, so the fused path must survive
     autocast -- and nothing else in this suite exercises it.
 
-    The specific hazard: `qwen_proj` is autocast to half precision while
+    The specific hazard: `lm_proj` is autocast to half precision while
     `phone_embed` (an `nn.Embedding`) is not, and the two meet in a
     `scatter_add_`, which requires matching dtypes. Both the aligned and the
     alignment-failed path reach that reduction, so both are checked.
     """
     _, _, padded, group_ids, in_group = _batch()
-    qwen = torch.randn(2, 2, QWEN_DIM)
+    lm_feats = torch.randn(2, 2, QWEN_DIM)
     valid = torch.full((2, 2), aligned, dtype=torch.bool)
 
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-        fused = fusion(padded, group_ids, in_group, qwen, valid)
+        fused = fusion(padded, group_ids, in_group, lm_feats, valid)
     assert fused.shape == (2, padded.shape[1], EMBED_DIM)
     assert torch.isfinite(fused).all()
 
     fused.float().sum().backward()
     assert fusion.phone_embed.weight.grad is not None
     if aligned:
-        assert fusion.qwen_proj.weight.grad.abs().sum() > 0
+        assert fusion.lm_proj.weight.grad.abs().sum() > 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for fp16")
@@ -347,17 +347,17 @@ def test_forward_under_cuda_fp16_autocast():
     """
     torch.manual_seed(0)
     fusion = PhoneQwenFusion(
-        phone_vocab_size=PHONE_VOCAB, embed_dim=EMBED_DIM, qwen_hidden_size=QWEN_DIM
+        phone_vocab_size=PHONE_VOCAB, embed_dim=EMBED_DIM, lm_hidden_size=QWEN_DIM
     ).cuda()
     _, _, padded, group_ids, in_group = _batch(device=torch.device("cuda"))
-    qwen = torch.randn(2, 2, QWEN_DIM, device="cuda")
+    lm_feats = torch.randn(2, 2, QWEN_DIM, device="cuda")
     valid = torch.ones(2, 2, dtype=torch.bool, device="cuda")
 
     with torch.autocast(device_type="cuda", dtype=torch.float16):
-        fused = fusion(padded, group_ids, in_group, qwen, valid)
+        fused = fusion(padded, group_ids, in_group, lm_feats, valid)
     assert torch.isfinite(fused).all()
     fused.float().sum().backward()
-    assert fusion.qwen_proj.weight.grad.abs().sum() > 0
+    assert fusion.lm_proj.weight.grad.abs().sum() > 0
 
 
 def test_gate_can_reach_qwen_only(fusion):
@@ -365,10 +365,10 @@ def test_gate_can_reach_qwen_only(fusion):
     vector -- confirming the two ends of the mixing range are reachable.
     """
     _, _, padded, group_ids, in_group = _batch()
-    qwen = torch.randn(2, 2, QWEN_DIM)
+    lm_feats = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
     with torch.no_grad():
         fusion.gate_proj.bias.fill_(20.0)  # sigmoid(20) ~= 1
-    fused = fusion(padded, group_ids, in_group, qwen, valid)
+    fused = fusion(padded, group_ids, in_group, lm_feats, valid)
     # Positions 0 and 1 share group 0, so at gate~1 they must now coincide.
     torch.testing.assert_close(fused[0, 0], fused[0, 1], rtol=1e-4, atol=1e-5)

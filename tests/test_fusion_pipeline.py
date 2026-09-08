@@ -83,7 +83,7 @@ def fusion_tokenizers():
 
 @pytest.fixture(scope="module")
 def extractor():
-    from zipvoice.models.modules.qwen_extractor import TruncatedQwenExtractor
+    from zipvoice.models.modules.lm_extractor import TruncatedQwenExtractor
 
     return TruncatedQwenExtractor(num_layers=4, device=torch.device("cpu"))
 
@@ -158,7 +158,7 @@ def test_fusion_clears_a_stale_zero_duration_mask(fusion_tokenizers):
 def test_non_fusion_tokenizer_clears_stale_fusion_fields():
     """The mirror image: switching back to a non-fusion frontend must drop
     the group fields, or the dataset collates them for a run whose
-    `qwen_extractor` is None and `compute_fbank_loss` rejects the batch.
+    `lm_extractor` is None and `compute_fbank_loss` rejects the batch.
     """
 
     class _FakeTokenizer:
@@ -210,30 +210,30 @@ def test_extractor_rejects_unimplemented_lang_tag_removal():
     identical computation while claiming the tag was gone -- which would
     silently invalidate a tag-removal ablation rather than fail it.
     """
-    from zipvoice.models.modules.qwen_extractor import TruncatedQwenExtractor
+    from zipvoice.models.modules.lm_extractor import TruncatedQwenExtractor
 
     with pytest.raises(NotImplementedError, match="include_lang_tag"):
         TruncatedQwenExtractor(num_layers=1, include_lang_tag=False)
 
 
 def test_resume_rejects_a_changed_text_frontend():
-    """A resume that omits `--qwen-layers` falls back to the argparse default
+    """A resume that omits `--lm-layers` falls back to the argparse default
     and would train against a different Qwen layer than the checkpoint
     learned -- the pooled width is 896 either way, so nothing else catches it.
     """
     params = AttributeDict(
-        {"tokenizer": "fusion", "qwen_layers": 4, "text_frontend": "fusion"}
+        {"tokenizer": "fusion", "lm_layers": 4, "text_frontend": "fusion"}
     )
     # Matching checkpoint: fine.
     check_resume_text_frontend(
-        params, {"tokenizer": "fusion", "qwen_layers": 4, "text_frontend": "fusion"}
+        params, {"tokenizer": "fusion", "lm_layers": 4, "text_frontend": "fusion"}
     )
     # No checkpoint at all, or a checkpoint predating these keys: fine.
     check_resume_text_frontend(params, None)
     check_resume_text_frontend(params, {"batch_idx_train": 100})
 
-    with pytest.raises(ValueError, match="qwen_layers"):
-        check_resume_text_frontend(params, {"qwen_layers": 8})
+    with pytest.raises(ValueError, match="lm_layers"):
+        check_resume_text_frontend(params, {"lm_layers": 8})
     with pytest.raises(ValueError, match="tokenizer"):
         check_resume_text_frontend(params, {"tokenizer": "multilingual"})
     # Which frozen Qwen supplied the conditioning matters too: a different
@@ -246,7 +246,7 @@ def test_resume_rejects_a_changed_text_frontend():
 
     # Non-fusion runs are unaffected.
     check_resume_text_frontend(
-        AttributeDict({"tokenizer": "emilia", "qwen_layers": 4}), {"qwen_layers": 8}
+        AttributeDict({"tokenizer": "emilia", "lm_layers": 4}), {"lm_layers": 8}
     )
 
 
@@ -256,7 +256,7 @@ def test_resume_guard_handles_the_default_qwen_correctly():
     through a swap to a different same-width Qwen; comparing it literally
     against the explicit default name would reject an identical setup.
     """
-    base = {"tokenizer": "fusion", "text_frontend": "fusion", "qwen_layers": 4}
+    base = {"tokenizer": "fusion", "text_frontend": "fusion", "lm_layers": 4}
 
     # Saved the default implicitly, now resuming with a *different* model.
     with pytest.raises(ValueError, match="pretrained_tokenizer_name"):
@@ -367,7 +367,7 @@ def test_full_training_step(fusion_tokenizers, extractor):
         pad_id=fusion_tokenizers["vi"].pad_id,
         text_embed_dim=192,
         text_frontend="fusion",
-        qwen_hidden_size=extractor.hidden_size,
+        lm_hidden_size=extractor.hidden_size,
         **_TINY_KWARGS,
     )
 
@@ -380,13 +380,13 @@ def test_full_training_step(fusion_tokenizers, extractor):
         is_training=True,
         zero_duration_mask=mask,
         fusion_fields=fusion_fields,
-        qwen_extractor=extractor,
+        lm_extractor=extractor,
     )
     assert torch.isfinite(loss) and loss.requires_grad
     assert info["frames"] > 0
 
     loss.backward()
-    assert model.fusion.qwen_proj.weight.grad.abs().sum() > 0, (
+    assert model.fusion.lm_proj.weight.grad.abs().sum() > 0, (
         "no gradient reached the Qwen projection -- the branch is not wired in"
     )
     assert model.fusion.gate_proj.weight.grad is not None
@@ -400,7 +400,7 @@ def test_fusion_fields_without_extractor_is_rejected(fusion_tokenizers):
         text_frontend="fusion",
         **_TINY_KWARGS,
     )
-    with pytest.raises(AssertionError, match="qwen_extractor"):
+    with pytest.raises(AssertionError, match="lm_extractor"):
         compute_fbank_loss(
             params=params,
             model=model,
@@ -413,7 +413,7 @@ def test_fusion_fields_without_extractor_is_rejected(fusion_tokenizers):
                 "lm_token_ids": [[1, 2]],
                 "lm_token_groups": [[[0], [1]]],
             },
-            qwen_extractor=None,
+            lm_extractor=None,
         )
 
 
@@ -448,7 +448,7 @@ def test_configured_fusion_run_rejects_a_batch_with_no_fusion_fields(
             tokens=[[1, 2, 3]],
             is_training=True,
             fusion_fields=None,
-            qwen_extractor=extractor,
+            lm_extractor=extractor,
         )
 
 
@@ -481,11 +481,11 @@ def test_training_step_reports_qwen_coverage(fusion_tokenizers, extractor):
             # Second utterance failed alignment -- the legal fallback.
             "lm_token_groups": [[[0], [1]], None],
         },
-        qwen_extractor=extractor,
+        lm_extractor=extractor,
     )
     frames = int(features_lens.sum().item())
-    assert info["qwen_cov_utt"] / frames == pytest.approx(0.5), (
+    assert info["lm_cov_utt"] / frames == pytest.approx(0.5), (
         "one of two utterances aligned -> 50% utterance coverage"
     )
     # Both groups of the aligned utterance carry real lm_tokens.
-    assert info["qwen_cov_grp"] / frames == pytest.approx(1.0)
+    assert info["lm_cov_grp"] / frames == pytest.approx(1.0)
