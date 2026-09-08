@@ -508,7 +508,7 @@ def compute_fbank_loss(
     tokens: List[List[int]],
     is_training: bool,
     zero_duration_mask: Optional[List[List[bool]]] = None,
-    fusion_fields: Optional[dict] = None,
+    group_alignment: Optional[dict] = None,
     lm_extractor=None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
@@ -529,12 +529,12 @@ def compute_fbank_loss(
         True for training. False for validation. When it is True, this
         function enables autograd during computation; when it is False, it
         disables autograd.
-      fusion_fields:
+      group_alignment:
         The fusion frontend's per-utterance extras (`phone_groups`,
         `lm_token_ids`, `lm_token_groups`) from `prepare_input`, or None for
         every other tokenizer.
       lm_extractor:
-        A `TruncatedQwenExtractor`, required when `fusion_fields` is given.
+        A `TruncatedQwenExtractor`, required when `group_alignment` is given.
         Runs live here (per the ADR's point 6: no offline cache in v1 --
         Qwen2.5-0.5B at 4 layers is cheap enough that a cache's
         invalidation/serialization complexity isn't justified yet). It is
@@ -558,7 +558,7 @@ def compute_fbank_loss(
             .unsqueeze(2)
         )
     model_fusion_kwargs = {}
-    if fusion_fields is None:
+    if group_alignment is None:
         # The converse of the assert below, and the more dangerous direction.
         # A configured fusion run whose batch carries no fusion fields looks
         # *identical* to an intentional phone-only run: the model falls back
@@ -576,14 +576,14 @@ def compute_fbank_loss(
         )
     else:
         assert lm_extractor is not None, (
-            "fusion_fields require a lm_extractor to turn lm_tokens into "
+            "group_alignment require a lm_extractor to turn lm_tokens into "
             "per-group Qwen vectors"
         )
         lm_group_features, lm_group_mask = lm_extractor.pooled_groups(
-            fusion_fields["lm_token_ids"], fusion_fields["lm_token_groups"]
+            group_alignment["lm_token_ids"], group_alignment["lm_token_groups"]
         )
         model_fusion_kwargs = {
-            "phone_groups": fusion_fields["phone_groups"],
+            "phone_groups": group_alignment["phone_groups"],
             "lm_group_features": lm_group_features.to(device),
             "lm_group_mask": lm_group_mask.to(device),
         }
@@ -592,7 +592,7 @@ def compute_fbank_loss(
         # auditing a checkpoint. Utterance-level *and* group-level: an
         # utterance can align yet contribute empty groups that carry no Qwen
         # evidence, which `lm_group_mask` marks false exactly like padding.
-        groups_per_utt = fusion_fields["lm_token_groups"]
+        groups_per_utt = group_alignment["lm_token_groups"]
         n_utt = len(groups_per_utt)
         n_aligned = sum(1 for g in groups_per_utt if g is not None)
         real_groups = sum(len(g) for g in groups_per_utt if g is not None)
@@ -756,7 +756,7 @@ def train_one_epoch(
         (
             tokens,
             zero_duration_mask,
-            fusion_fields,
+            group_alignment,
             features,
             features_lens,
         ) = prepare_input(
@@ -766,7 +766,7 @@ def train_one_epoch(
             return_tokens=True,
             return_feature=True,
             return_zero_duration_mask=True,
-            return_fusion_fields=True,
+            return_group_alignment=True,
         )
 
         try:
@@ -778,7 +778,7 @@ def train_one_epoch(
                     features_lens=features_lens,
                     tokens=tokens,
                     zero_duration_mask=zero_duration_mask,
-                    fusion_fields=fusion_fields,
+                    group_alignment=group_alignment,
                     lm_extractor=lm_extractor,
                     is_training=True,
                 )
@@ -920,7 +920,7 @@ def compute_validation_loss(
         (
             tokens,
             zero_duration_mask,
-            fusion_fields,
+            group_alignment,
             features,
             features_lens,
         ) = prepare_input(
@@ -930,7 +930,7 @@ def compute_validation_loss(
             return_tokens=True,
             return_feature=True,
             return_zero_duration_mask=True,
-            return_fusion_fields=True,
+            return_group_alignment=True,
         )
 
         loss, loss_info = compute_fbank_loss(
@@ -940,7 +940,7 @@ def compute_validation_loss(
             features_lens=features_lens,
             tokens=tokens,
             zero_duration_mask=zero_duration_mask,
-            fusion_fields=fusion_fields,
+            group_alignment=group_alignment,
             lm_extractor=lm_extractor,
             is_training=False,
         )
@@ -1007,7 +1007,7 @@ def scan_pessimistic_batches_for_oom(
         (
             tokens,
             zero_duration_mask,
-            fusion_fields,
+            group_alignment,
             features,
             features_lens,
         ) = prepare_input(
@@ -1017,7 +1017,7 @@ def scan_pessimistic_batches_for_oom(
             return_tokens=True,
             return_feature=True,
             return_zero_duration_mask=True,
-            return_fusion_fields=True,
+            return_group_alignment=True,
         )
         try:
             with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
@@ -1029,7 +1029,7 @@ def scan_pessimistic_batches_for_oom(
                     features_lens=features_lens,
                     tokens=tokens,
                     zero_duration_mask=zero_duration_mask,
-                    fusion_fields=fusion_fields,
+                    group_alignment=group_alignment,
                     lm_extractor=lm_extractor,
                     is_training=True,
                 )

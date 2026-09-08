@@ -155,7 +155,7 @@ def test_fusion_clears_a_stale_zero_duration_mask(fusion_tokenizers):
     )
 
 
-def test_non_fusion_tokenizer_clears_stale_fusion_fields():
+def test_non_fusion_tokenizer_clears_stale_group_alignment():
     """The mirror image: switching back to a non-fusion frontend must drop
     the group fields, or the dataset collates them for a run whose
     `lm_extractor` is None and `compute_fbank_loss` rejects the batch.
@@ -276,7 +276,7 @@ def test_resume_guard_handles_the_default_qwen_correctly():
     )
 
 
-def test_dataset_collates_the_fusion_fields(fusion_tokenizers):
+def test_dataset_collates_the_group_alignment(fusion_tokenizers):
     ds = SpeechSynthesisDataset(
         feature_input_strategy=_FakeFeatureInputStrategy(), return_tokens=True
     )
@@ -303,44 +303,44 @@ def test_non_fusion_batches_keep_the_old_schema():
         assert key not in batch
 
 
-def test_prepare_input_returns_fusion_fields(fusion_tokenizers):
+def test_prepare_input_returns_group_alignment(fusion_tokenizers):
     ds = SpeechSynthesisDataset(
         feature_input_strategy=_FakeFeatureInputStrategy(), return_tokens=True
     )
     batch = ds[_tokenized_cuts(fusion_tokenizers)]
     params = AttributeDict({"feat_scale": 1.0})
 
-    tokens, mask, fusion_fields, features, features_lens = prepare_input(
+    tokens, mask, group_alignment, features, features_lens = prepare_input(
         params=params,
         batch=batch,
         device=torch.device("cpu"),
         return_tokens=True,
         return_feature=True,
         return_zero_duration_mask=True,
-        return_fusion_fields=True,
+        return_group_alignment=True,
     )
-    assert fusion_fields is not None
-    assert set(fusion_fields) == {"phone_groups", "lm_token_ids", "lm_token_groups"}
-    assert fusion_fields["phone_groups"] == batch["phone_groups"]
+    assert group_alignment is not None
+    assert set(group_alignment) == {"phone_groups", "lm_token_ids", "lm_token_groups"}
+    assert group_alignment["phone_groups"] == batch["phone_groups"]
     assert mask is None, "phones carry no control tokens, so no mask"
 
 
-def test_prepare_input_returns_none_without_fusion_fields():
+def test_prepare_input_returns_none_without_group_alignment():
     params = AttributeDict({"feat_scale": 1.0})
     batch = {
         "tokens": [[1, 2]],
         "features": torch.zeros(1, 4, 100),
         "features_lens": torch.tensor([4]),
     }
-    tokens, fusion_fields, features, features_lens = prepare_input(
+    tokens, group_alignment, features, features_lens = prepare_input(
         params=params,
         batch=batch,
         device=torch.device("cpu"),
         return_tokens=True,
         return_feature=True,
-        return_fusion_fields=True,
+        return_group_alignment=True,
     )
-    assert fusion_fields is None
+    assert group_alignment is None
 
 
 def test_full_training_step(fusion_tokenizers, extractor):
@@ -351,14 +351,14 @@ def test_full_training_step(fusion_tokenizers, extractor):
     batch = ds[_tokenized_cuts(fusion_tokenizers)]
     params = AttributeDict({"feat_scale": 1.0, "condition_drop_ratio": 0.0})
 
-    tokens, mask, fusion_fields, features, features_lens = prepare_input(
+    tokens, mask, group_alignment, features, features_lens = prepare_input(
         params=params,
         batch=batch,
         device=torch.device("cpu"),
         return_tokens=True,
         return_feature=True,
         return_zero_duration_mask=True,
-        return_fusion_fields=True,
+        return_group_alignment=True,
     )
 
     torch.manual_seed(0)
@@ -379,7 +379,7 @@ def test_full_training_step(fusion_tokenizers, extractor):
         tokens=tokens,
         is_training=True,
         zero_duration_mask=mask,
-        fusion_fields=fusion_fields,
+        group_alignment=group_alignment,
         lm_extractor=extractor,
     )
     assert torch.isfinite(loss) and loss.requires_grad
@@ -392,7 +392,7 @@ def test_full_training_step(fusion_tokenizers, extractor):
     assert model.fusion.gate_proj.weight.grad is not None
 
 
-def test_fusion_fields_without_extractor_is_rejected(fusion_tokenizers):
+def test_group_alignment_without_extractor_is_rejected(fusion_tokenizers):
     params = AttributeDict({"feat_scale": 1.0, "condition_drop_ratio": 0.0})
     model = ZipVoice(
         vocab_size=fusion_tokenizers["vi"].vocab_size,
@@ -408,7 +408,7 @@ def test_fusion_fields_without_extractor_is_rejected(fusion_tokenizers):
             features_lens=torch.tensor([40]),
             tokens=[[1, 2, 3]],
             is_training=True,
-            fusion_fields={
+            group_alignment={
                 "phone_groups": [[[0], [1, 2]]],
                 "lm_token_ids": [[1, 2]],
                 "lm_token_groups": [[[0], [1]]],
@@ -417,7 +417,7 @@ def test_fusion_fields_without_extractor_is_rejected(fusion_tokenizers):
         )
 
 
-def test_configured_fusion_run_rejects_a_batch_with_no_fusion_fields(
+def test_configured_fusion_run_rejects_a_batch_with_no_group_alignment(
     fusion_tokenizers, extractor
 ):
     """The dangerous converse of the assert above.
@@ -447,7 +447,7 @@ def test_configured_fusion_run_rejects_a_batch_with_no_fusion_fields(
             features_lens=torch.tensor([40]),
             tokens=[[1, 2, 3]],
             is_training=True,
-            fusion_fields=None,
+            group_alignment=None,
             lm_extractor=extractor,
         )
 
@@ -475,7 +475,7 @@ def test_training_step_reports_qwen_coverage(fusion_tokenizers, extractor):
         features_lens=features_lens,
         tokens=[[1, 2, 3], [4, 5, 6]],
         is_training=True,
-        fusion_fields={
+        group_alignment={
             "phone_groups": [[[0], [1, 2]], [[0], [1, 2]]],
             "lm_token_ids": [[1, 2], [3, 4]],
             # Second utterance failed alignment -- the legal fallback.

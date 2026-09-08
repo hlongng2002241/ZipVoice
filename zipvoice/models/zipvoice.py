@@ -474,7 +474,7 @@ class ZipVoice(nn.Module):
         )  # (B, T, F)
         return text_condition, padding_mask
 
-    def _require_inference_fusion_fields(
+    def _require_inference_group_alignment(
         self,
         phone_groups,
         lm_group_features,
@@ -553,7 +553,7 @@ class ZipVoice(nn.Module):
         `phone_groups`/`lm_group_features`/`lm_group_mask` describe the
         **concatenated** prompt+target sequence, matching `cat_tokens` below.
         """
-        self._require_inference_fusion_fields(phone_groups, lm_group_features)
+        self._require_inference_group_alignment(phone_groups, lm_group_features)
         cat_zero_duration_mask = _concat_zero_duration_masks(
             prompt_zero_duration_mask, zero_duration_mask, prompt_tokens, tokens
         )
@@ -591,7 +591,7 @@ class ZipVoice(nn.Module):
         `phone_groups`/`lm_group_features`/`lm_group_mask` describe the
         **concatenated** prompt+target sequence, matching `cat_tokens` below.
         """
-        self._require_inference_fusion_fields(phone_groups, lm_group_features)
+        self._require_inference_group_alignment(phone_groups, lm_group_features)
         device = (
             self.device if isinstance(self, DDP) else next(self.parameters()).device
         )
