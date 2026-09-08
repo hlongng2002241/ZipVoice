@@ -1252,3 +1252,30 @@ def test_mixed_script_utterance_aligns_completely():
     assert flat == list(range(1, len(artifact.lm_token_ids)))
     assert len(artifact.lm_token_groups) == len(artifact.phone_groups)
     assert all(artifact.lm_token_groups)
+
+
+def test_empty_group_is_asserted_not_tolerated():
+    """An empty lm group is unreachable, so it is asserted rather than
+    silently degraded to no alignment.
+
+    Unreachable because coarsening removes every boundary an lm_token
+    straddles, so each token overlapping a block is fully contained in it,
+    and byte-level BPE covers every character -- a block with a non-empty
+    character range therefore always contains a whole token. The precondition
+    is strictly increasing block ends; feeding duplicates breaks it and must
+    be caught loudly, since silently returning None would cost conditioning
+    for that utterance with nothing in the log above debug level.
+    """
+    from zipvoice.tokenizer.lm_tokenizer import LanguageModelTokenizer
+
+    token_file = (
+        "scripts/all/pretrained_model_cache/"
+        "hynt__ZipVoice-Vietnamese-2500h/tokens.txt"
+    )
+    if not os.path.exists(token_file):
+        pytest.skip(f"{token_file} not available")
+    tok = FusionTokenizer(
+        token_file=token_file, lang="vi", lm_tokenizer=LanguageModelTokenizer()
+    )
+    with pytest.raises(AssertionError, match="received no lm_tokens"):
+        tok._lm_tokens_and_groups("xin chao", [3, 3, 8], [[0], [1], [2]])
