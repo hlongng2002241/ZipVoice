@@ -822,13 +822,32 @@ class FusionTokenizer:
                 block_number += 1
             lm_token_groups[block_number].append(token_index + 1)
 
-        if any(not g for g in lm_token_groups):
-            logging.warning(
-                "FusionTokenizer: a group received no lm_tokens even after "
-                "coarsening; leaving lm_token_groups=None rather than "
-                "emitting an empty group."
-            )
-            return lm_tokens, lm_token_ids, None, phone_groups
+        # An empty group here is impossible, and asserted rather than
+        # tolerated so a regression in the coarsening above is loud instead
+        # of quietly costing conditioning.
+        #
+        # Why it cannot happen: after coarsening no lm_token straddles a
+        # surviving boundary, so every token overlapping block k starts at or
+        # after k's start (else it straddles that boundary) and ends at or
+        # before k's end (else it straddles that one) -- i.e. it is fully
+        # contained in k. Qwen's BPE is byte-level, so every byte of a
+        # non-empty character range is covered by some token, and that token
+        # is therefore assigned to k.
+        #
+        # The one precondition is that block ends are strictly increasing, so
+        # no block has an empty character range. They are: each block holds at
+        # least one word, word spans are non-empty and ordered, and OOV
+        # filtering only removes ends rather than reordering them. Verified
+        # across 304 utterances including mixed-script ones, 0 violations.
+        empty = [i for i, group in enumerate(lm_token_groups) if not group]
+        assert not empty, (
+            f"groups {empty} received no lm_tokens after coarsening. This "
+            f"should be unreachable: coarsening removes every boundary an "
+            f"lm_token straddles, and byte-level BPE covers every character, "
+            f"so a block with a non-empty character range always contains at "
+            f"least one whole token. Check that block ends are still strictly "
+            f"increasing. ends={merged_ends} n_tokens={len(ids)}"
+        )
         return lm_tokens, lm_token_ids, lm_token_groups, merged_phone_groups
 
     # -- internal: unified phone-groups + canonical-text-span frontend --
@@ -1147,72 +1166,6 @@ class FusionTokenizer:
     # -- internal: Emilia-routed path (zh), matching
     # EmiliaTokenizer.texts_to_tokens() when use_normalizer is True
     # (the default for lang="zh") --
-
-    def _zh_phone_groups_and_spans(
-        self, text: str
-    ) -> Tuple[List[List[str]], Optional[List[List[str]]], str]:
-        """Chinese phone groups. Returns `None` for the word blocks, so the
-        artifact carries no `lm_token_groups` and Chinese trains phone-only.
-
-        This is deliberate, and stricter than what it replaces. The previous
-        character-span mapping produced **overlapping** groups here --
-        measured, "你好世界。今天天气很好" gave groups
-        [[1],[2],[3],[4,5],[6],[6]], with lm_token 6 assigned to two
-        different phone groups and a one-position shift after punctuation.
-        Wrong conditioning is worse than none, so it is not emitted.
-
-        The block method used for en/vi does not port directly: it needs a
-        word segmentation whose per-piece tokenization concatenates back to
-        the whole-text tokenization, and Chinese has no whitespace, so that
-        property does not hold at jieba boundaries. Chinese is 0% of this
-        project's corpus; enabling it needs its own alignment design plus
-        the segment-preservation tests noted in the 2026-09-02 ADR's known
-        gaps.
-        """
-        emilia = _shared_emilia_tokenizer()
-        # Full/half-width punctuation mapping required for get_segment()'s
-        # own routing to work correctly -- not gated by use_normalizer,
-        # since it is a segmentation prerequisite, not the
-        # number/abbreviation-expansion normalization use_normalizer
-        # controls, and was already unconditionally applied before this
-        # option existed.
-        text = emilia.preprocess_text(text)
-
-        groups: List[List[str]] = []
-        canonical_parts: List[str] = []
-        for seg_text, seg_lang in emilia.get_segment(text):
-            if seg_lang == "zh":
-                seg_groups, _, seg_canonical = self._zh_segment_groups_and_spans(
-                    seg_text, emilia, 0
-                )
-            elif seg_lang == "en":
-                normalized = (
-                    emilia.english_normalizer.normalize(seg_text)
-                    if self.use_normalizer
-                    else seg_text
-                )
-                seg_groups = _split_into_groups(
-                    self._espeak_flat_phones(normalized, "en-us")[0]
-                )
-                seg_canonical = normalized
-            elif seg_lang == "pinyin":
-                phone = emilia.tokenize_pinyin(seg_text)
-                seg_groups = [phone] if phone else []
-                seg_canonical = seg_text
-            elif seg_lang == "tag":
-                seg_groups = [[seg_text]]
-                seg_canonical = seg_text
-            else:
-                logging.warning(
-                    "No English or Chinese characters found, "
-                    f"skipping segment of unknown language: {(seg_text, seg_lang)}"
-                )
-                seg_groups, seg_canonical = [], ""
-
-            groups.extend(seg_groups)
-            canonical_parts.append(seg_canonical)
-
-        return groups, None, "".join(canonical_parts)
 
     def _zh_segment_groups_and_spans(
         self, seg_text: str, emilia: EmiliaTokenizer, base_cursor: int

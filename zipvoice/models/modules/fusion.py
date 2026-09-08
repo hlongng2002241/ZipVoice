@@ -96,11 +96,11 @@ def build_phone_group_index(
       device: device for the returned tensors.
 
     Returns:
-      (group_ids, has_group): both (B, padded_len). `group_ids` holds the
+      (group_ids, in_group): both (B, padded_len). `group_ids` holds the
       group index for each real phone position and `NO_GROUP` (-1) elsewhere;
-      `has_group` is the corresponding bool mask. Positions without a group --
-      padding, the trailing sentinel, phones no group claimed, and every
-      position of a `None`-grouped utterance -- get pure phone embeddings.
+      `in_group` is the corresponding bool mask. Positions without a group --
+      padding, the trailing sentinel, and every position of a `None`-grouped
+      utterance -- get pure phone embeddings.
 
     Uses `repeat_interleave` over group sizes rather than scattering each
     phone index individually, which is valid because
@@ -211,7 +211,7 @@ class PhoneQwenFusion(nn.Module):
         self,
         phone_embed: torch.Tensor,
         phone_group_ids: torch.Tensor,
-        phone_has_group: torch.Tensor,
+        phone_in_group: torch.Tensor,
         qwen_group_features: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Shared by `forward()` and `current_gate_values()` so the two can
@@ -249,7 +249,7 @@ class PhoneQwenFusion(nn.Module):
         # out of `member` below, so a clamped index contributes nothing to
         # any group's mean.
         safe_ids = phone_group_ids.clamp(min=0, max=num_groups - 1)  # (B, S)
-        member = phone_has_group.unsqueeze(-1).to(qwen.dtype)  # (B, S, 1)
+        member = phone_in_group.unsqueeze(-1).to(qwen.dtype)  # (B, S, 1)
         index = safe_ids.unsqueeze(-1).expand(-1, -1, self.embed_dim)
         sums = torch.zeros_like(qwen).scatter_add_(1, index, phones * member)
         counts = torch.zeros(
@@ -266,7 +266,7 @@ class PhoneQwenFusion(nn.Module):
         self,
         phone_ids_padded: torch.Tensor,
         phone_group_ids: torch.Tensor,
-        phone_has_group: torch.Tensor,
+        phone_in_group: torch.Tensor,
         qwen_group_features: Optional[torch.Tensor] = None,
         qwen_group_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -282,7 +282,20 @@ class PhoneQwenFusion(nn.Module):
             from `self.embed(...)` in the pre-fusion model.
           phone_group_ids: (B, S) group index per position, `NO_GROUP` where
             none -- from `build_phone_group_index()`.
-          phone_has_group: (B, S) bool, `phone_group_ids != NO_GROUP`.
+          phone_in_group: (B, S) bool -- does this position map to a group
+            slot? Initially `phone_group_ids != NO_GROUP`, then narrowed
+            below by `& in_range`, after which it is no longer derivable
+            from `phone_group_ids`, which is why it travels separately.
+
+            It is NOT "is this a real phone". Within one aligned utterance
+            those coincide, but this tensor spans the padded batch, where
+            three other kinds of position exist: batch padding, the trailing
+            sentinel (present even for the longest utterance), and every
+            position of an utterance whose alignment returned None.
+
+            Distinguish it from `phone_has_conditioning` below: this asks
+            whether a slot is addressed, that one whether the slot holds
+            real Qwen evidence.
           qwen_group_features: (B, G, qwen_hidden_size) pooled Qwen vectors,
             or None to run phone-only (equivalent to an all-invalid batch --
             used by tests, and by any caller without a Qwen branch).
@@ -325,17 +338,17 @@ class PhoneQwenFusion(nn.Module):
                 "lm_token alignment succeeded -- phone_groups and "
                 "lm_token_groups have diverged"
             )
-            phone_has_group = phone_has_group & in_range
+            phone_in_group = phone_in_group & in_range
 
         qwen, gate, safe_ids = self._qwen_and_gate(
-            phone_embed, phone_group_ids, phone_has_group, qwen_group_features
+            phone_embed, phone_group_ids, phone_in_group, qwen_group_features
         )
         index = safe_ids.unsqueeze(-1).expand(-1, -1, self.embed_dim)
 
         # Broadcast group-level Qwen contribution and gate onto phones.
         qwen_at_phone = torch.gather(qwen, 1, index)  # (B, S, D)
         gate_at_phone = torch.gather(gate, 1, safe_ids.unsqueeze(-1))  # (B, S, 1)
-        valid_at_phone = phone_has_group & torch.gather(
+        phone_has_conditioning = phone_in_group & torch.gather(
             qwen_group_valid, 1, safe_ids
         )  # (B, S)
 
@@ -343,14 +356,14 @@ class PhoneQwenFusion(nn.Module):
         # Anywhere without a real, valid group -- padding, the trailing
         # sentinel, and every position of an utterance whose lm_token
         # alignment failed -- falls back to the plain phone embedding.
-        return torch.where(valid_at_phone.unsqueeze(-1), fused, phone_embed)
+        return torch.where(phone_has_conditioning.unsqueeze(-1), fused, phone_embed)
 
     @torch.no_grad()
     def current_gate_values(
         self,
         phone_ids_padded: torch.Tensor,
         phone_group_ids: torch.Tensor,
-        phone_has_group: torch.Tensor,
+        phone_in_group: torch.Tensor,
         qwen_group_features: torch.Tensor,
         qwen_group_valid: torch.Tensor,
     ) -> torch.Tensor:
@@ -359,7 +372,7 @@ class PhoneQwenFusion(nn.Module):
         """
         phone_embed = self.phone_embed(phone_ids_padded)
         _, gate, _ = self._qwen_and_gate(
-            phone_embed, phone_group_ids, phone_has_group, qwen_group_features
+            phone_embed, phone_group_ids, phone_in_group, qwen_group_features
         )
         gate = gate.squeeze(-1)
         return gate * qwen_group_valid.to(gate.dtype)
