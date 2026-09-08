@@ -46,31 +46,31 @@ def _batch(device=torch.device("cpu")):
     phone_ids = [[3, 4, 5, 6, 7], [8, 9, 10]]
     phone_groups = [[[0, 1], [2, 3, 4]], [[0], [1, 2]]]
     padded = pad_labels(phone_ids, pad_id=PAD_ID, device=device)  # (2, 6)
-    group_ids, has_group = build_phone_group_index(
+    group_ids, in_group = build_phone_group_index(
         phone_groups, padded_len=padded.shape[1], device=device
     )
-    return phone_ids, phone_groups, padded, group_ids, has_group
+    return phone_ids, phone_groups, padded, group_ids, in_group
 
 
 def test_build_phone_group_index_matches_groups():
-    _, _, padded, group_ids, has_group = _batch()
+    _, _, padded, group_ids, in_group = _batch()
     # Utterance 0: phones 0,1 -> group 0; phones 2,3,4 -> group 1; then the
     # trailing sentinel (and any padding) belong to no group.
     assert group_ids[0].tolist() == [0, 0, 1, 1, 1, NO_GROUP]
     # Utterance 1 is shorter, so it has both its sentinel and real padding.
     assert group_ids[1].tolist() == [0, 1, 1, NO_GROUP, NO_GROUP, NO_GROUP]
-    assert has_group.tolist() == [
+    assert in_group.tolist() == [
         [True, True, True, True, True, False],
         [True, True, True, False, False, False],
     ]
 
 
 def test_build_phone_group_index_handles_none_utterance():
-    group_ids, has_group = build_phone_group_index(
+    group_ids, in_group = build_phone_group_index(
         [[[0, 1]], None], padded_len=3, device=torch.device("cpu")
     )
     assert group_ids[1].tolist() == [NO_GROUP] * 3
-    assert not has_group[1].any(), "a None-grouped utterance claims no positions"
+    assert not in_group[1].any(), "a None-grouped utterance claims no positions"
 
 
 def test_pad_labels_appends_the_sentinel_position():
@@ -91,10 +91,10 @@ def test_gate_starts_near_eps(fusion):
     per-group values scatter slightly around eps. The tolerance below is far
     tighter than anything that would disturb the near-phone-only start.
     """
-    _, _, padded, group_ids, has_group = _batch()
+    _, _, padded, group_ids, in_group = _batch()
     qwen = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
-    gates = fusion.current_gate_values(padded, group_ids, has_group, qwen, valid)
+    gates = fusion.current_gate_values(padded, group_ids, in_group, qwen, valid)
     assert torch.allclose(
         gates, torch.full_like(gates, fusion.gate_init_eps), atol=5e-3
     ), f"gate must start near eps, got {gates}"
@@ -126,11 +126,11 @@ def test_output_is_near_phone_only_at_init(fusion):
     """At init the fused output must be ~the plain phone embedding -- that's
     what makes the source-checkpoint transplant meaningful.
     """
-    _, _, padded, group_ids, has_group = _batch()
+    _, _, padded, group_ids, in_group = _batch()
     qwen = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
 
-    fused = fusion(padded, group_ids, has_group, qwen, valid)
+    fused = fusion(padded, group_ids, in_group, qwen, valid)
     phone_only = fusion.phone_embed(padded)
 
     assert fused.shape == phone_only.shape
@@ -143,10 +143,10 @@ def test_phone_identity_is_preserved_within_a_group(fusion):
     its own embedding -- two different phones in the same group must not
     collapse to the same vector.
     """
-    _, _, padded, group_ids, has_group = _batch()
+    _, _, padded, group_ids, in_group = _batch()
     qwen = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
-    fused = fusion(padded, group_ids, has_group, qwen, valid)
+    fused = fusion(padded, group_ids, in_group, qwen, valid)
 
     # Positions 0 and 1 are distinct phones in the same group (group 0).
     assert group_ids[0, 0] == group_ids[0, 1]
@@ -159,7 +159,7 @@ def test_phone_identity_is_preserved_within_a_group(fusion):
     phone_embed = fusion.phone_embed(padded)
     # The gate's actual value, not the nominal eps: the weights are small
     # random, so group 0's gate is near eps but not identical to it.
-    gate = fusion.current_gate_values(padded, group_ids, has_group, qwen, valid)[0, 0]
+    gate = fusion.current_gate_values(padded, group_ids, in_group, qwen, valid)[0, 0]
     torch.testing.assert_close(
         fused[0, 0] - fused[0, 1],
         (1.0 - gate) * (phone_embed[0, 0] - phone_embed[0, 1]),
@@ -172,14 +172,14 @@ def test_qwen_contribution_is_shared_within_a_group(fusion):
     """The flip side: changing one group's Qwen vector must move every phone
     of that group and nothing else.
     """
-    _, _, padded, group_ids, has_group = _batch()
+    _, _, padded, group_ids, in_group = _batch()
     valid = torch.ones(2, 2, dtype=torch.bool)
     qwen_a = torch.zeros(2, 2, QWEN_DIM)
     qwen_b = qwen_a.clone()
     qwen_b[0, 1] = torch.randn(QWEN_DIM)  # perturb utterance 0's group 1 only
 
-    out_a = fusion(padded, group_ids, has_group, qwen_a, valid)
-    out_b = fusion(padded, group_ids, has_group, qwen_b, valid)
+    out_a = fusion(padded, group_ids, in_group, qwen_a, valid)
+    out_b = fusion(padded, group_ids, in_group, qwen_b, valid)
     moved = (out_a - out_b).abs().sum(dim=-1) > 1e-8
 
     assert moved[0].tolist() == [False, False, True, True, True, False], (
@@ -189,10 +189,10 @@ def test_qwen_contribution_is_shared_within_a_group(fusion):
 
 
 def test_sentinel_and_padding_get_plain_phone_embeddings(fusion):
-    _, _, padded, group_ids, has_group = _batch()
+    _, _, padded, group_ids, in_group = _batch()
     qwen = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
-    fused = fusion(padded, group_ids, has_group, qwen, valid)
+    fused = fusion(padded, group_ids, in_group, qwen, valid)
     phone_only = fusion.phone_embed(padded)
 
     # Utterance 0's sentinel is position 5; utterance 1's are 3..5.
@@ -204,12 +204,12 @@ def test_invalid_groups_fall_back_to_phone_only(fusion):
     """`lm_token_groups=None` for an utterance (sprint 000's documented
     alignment-failure case) must yield exactly the phone-only path.
     """
-    _, _, padded, group_ids, has_group = _batch()
+    _, _, padded, group_ids, in_group = _batch()
     qwen = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
     valid[1] = False  # utterance 1's alignment failed
 
-    fused = fusion(padded, group_ids, has_group, qwen, valid)
+    fused = fusion(padded, group_ids, in_group, qwen, valid)
     phone_only = fusion.phone_embed(padded)
     torch.testing.assert_close(fused[1], phone_only[1])
     assert not torch.allclose(fused[0], phone_only[0]), "utterance 0 still fuses"
@@ -228,7 +228,7 @@ def test_failed_alignment_with_more_phone_groups_than_qwen_groups(fusion):
     phone_ids = [[3, 4, 5, 6, 7], [8, 9]]
     phone_groups = [[[0], [1], [2], [3], [4]], [[0], [1]]]  # 5 groups vs 2
     padded = pad_labels(phone_ids, pad_id=PAD_ID, device=torch.device("cpu"))
-    group_ids, has_group = build_phone_group_index(
+    group_ids, in_group = build_phone_group_index(
         phone_groups, padded_len=padded.shape[1], device=torch.device("cpu")
     )
     assert int(group_ids.max()) == 4
@@ -237,7 +237,7 @@ def test_failed_alignment_with_more_phone_groups_than_qwen_groups(fusion):
     qwen = torch.randn(2, 2, QWEN_DIM)
     valid = torch.tensor([[False, False], [True, True]])
 
-    fused = fusion(padded, group_ids, has_group, qwen, valid)
+    fused = fusion(padded, group_ids, in_group, qwen, valid)
     phone_only = fusion.phone_embed(padded)
     assert fused.shape == phone_only.shape
     # The unaligned utterance degrades to phone-only...
@@ -253,13 +253,13 @@ def test_all_alignments_failed_in_a_batch(fusion):
     phone_ids = [[3, 4, 5], [6, 7]]
     phone_groups = [[[0], [1], [2]], [[0], [1]]]
     padded = pad_labels(phone_ids, pad_id=PAD_ID, device=torch.device("cpu"))
-    group_ids, has_group = build_phone_group_index(
+    group_ids, in_group = build_phone_group_index(
         phone_groups, padded_len=padded.shape[1], device=torch.device("cpu")
     )
     qwen = torch.zeros(2, 1, QWEN_DIM)
     valid = torch.zeros(2, 1, dtype=torch.bool)
 
-    fused = fusion(padded, group_ids, has_group, qwen, valid)
+    fused = fusion(padded, group_ids, in_group, qwen, valid)
     torch.testing.assert_close(fused, fusion.phone_embed(padded))
 
 
@@ -271,18 +271,18 @@ def test_diverged_groups_on_an_aligned_utterance_still_raises(fusion):
     phone_ids = [[3, 4, 5]]
     phone_groups = [[[0], [1], [2]]]  # 3 phone groups...
     padded = pad_labels(phone_ids, pad_id=PAD_ID, device=torch.device("cpu"))
-    group_ids, has_group = build_phone_group_index(
+    group_ids, in_group = build_phone_group_index(
         phone_groups, padded_len=padded.shape[1], device=torch.device("cpu")
     )
     qwen = torch.randn(1, 2, QWEN_DIM)  # ...but only 2 Qwen groups
     valid = torch.ones(1, 2, dtype=torch.bool)  # and it claims to have aligned
     with pytest.raises(AssertionError, match="diverged"):
-        fusion(padded, group_ids, has_group, qwen, valid)
+        fusion(padded, group_ids, in_group, qwen, valid)
 
 
 def test_no_qwen_features_is_pure_phone_path(fusion):
-    _, _, padded, group_ids, has_group = _batch()
-    fused = fusion(padded, group_ids, has_group, None, None)
+    _, _, padded, group_ids, in_group = _batch()
+    fused = fusion(padded, group_ids, in_group, None, None)
     torch.testing.assert_close(fused, fusion.phone_embed(padded))
 
 
@@ -304,10 +304,10 @@ def test_gate_is_learnable_from_init(fusion):
     """Zero-initialized gate weights must still receive gradient, or the
     gate could never become input-dependent.
     """
-    _, _, padded, group_ids, has_group = _batch()
+    _, _, padded, group_ids, in_group = _batch()
     qwen = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
-    fusion(padded, group_ids, has_group, qwen, valid).sum().backward()
+    fusion(padded, group_ids, in_group, qwen, valid).sum().backward()
     assert fusion.gate_proj.weight.grad is not None
     assert fusion.gate_proj.weight.grad.abs().sum() > 0, (
         "zero-init gate weights got no gradient -- the gate could never learn"
@@ -325,12 +325,12 @@ def test_forward_under_autocast(fusion, aligned):
     `scatter_add_`, which requires matching dtypes. Both the aligned and the
     alignment-failed path reach that reduction, so both are checked.
     """
-    _, _, padded, group_ids, has_group = _batch()
+    _, _, padded, group_ids, in_group = _batch()
     qwen = torch.randn(2, 2, QWEN_DIM)
     valid = torch.full((2, 2), aligned, dtype=torch.bool)
 
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-        fused = fusion(padded, group_ids, has_group, qwen, valid)
+        fused = fusion(padded, group_ids, in_group, qwen, valid)
     assert fused.shape == (2, padded.shape[1], EMBED_DIM)
     assert torch.isfinite(fused).all()
 
@@ -349,12 +349,12 @@ def test_forward_under_cuda_fp16_autocast():
     fusion = PhoneQwenFusion(
         phone_vocab_size=PHONE_VOCAB, embed_dim=EMBED_DIM, qwen_hidden_size=QWEN_DIM
     ).cuda()
-    _, _, padded, group_ids, has_group = _batch(device=torch.device("cuda"))
+    _, _, padded, group_ids, in_group = _batch(device=torch.device("cuda"))
     qwen = torch.randn(2, 2, QWEN_DIM, device="cuda")
     valid = torch.ones(2, 2, dtype=torch.bool, device="cuda")
 
     with torch.autocast(device_type="cuda", dtype=torch.float16):
-        fused = fusion(padded, group_ids, has_group, qwen, valid)
+        fused = fusion(padded, group_ids, in_group, qwen, valid)
     assert torch.isfinite(fused).all()
     fused.float().sum().backward()
     assert fusion.qwen_proj.weight.grad.abs().sum() > 0
@@ -364,11 +364,11 @@ def test_gate_can_reach_qwen_only(fusion):
     """Sanity: with the gate forced to 1, the output is the broadcast Qwen
     vector -- confirming the two ends of the mixing range are reachable.
     """
-    _, _, padded, group_ids, has_group = _batch()
+    _, _, padded, group_ids, in_group = _batch()
     qwen = torch.randn(2, 2, QWEN_DIM)
     valid = torch.ones(2, 2, dtype=torch.bool)
     with torch.no_grad():
         fusion.gate_proj.bias.fill_(20.0)  # sigmoid(20) ~= 1
-    fused = fusion(padded, group_ids, has_group, qwen, valid)
+    fused = fusion(padded, group_ids, in_group, qwen, valid)
     # Positions 0 and 1 share group 0, so at gate~1 they must now coincide.
     torch.testing.assert_close(fused[0, 0], fused[0, 1], rtol=1e-4, atol=1e-5)

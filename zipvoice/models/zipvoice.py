@@ -410,13 +410,13 @@ class ZipVoice(nn.Module):
                 "text_frontend='fusion' needs phone_groups (from "
                 "FusionTokenizerArtifact) to know which phones share a group"
             )
-            group_ids, has_group = build_phone_group_index(
+            group_ids, in_group = build_phone_group_index(
                 phone_groups, padded_len=tokens_padded.shape[1], device=device
             )
             embed = self.fusion(
                 tokens_padded,
                 group_ids,
-                has_group,
+                in_group,
                 qwen_group_features,
                 qwen_group_valid,
             )  # (B, S, C)
