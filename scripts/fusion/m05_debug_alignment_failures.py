@@ -33,11 +33,13 @@ fail before an utterance is reported here.
            Fails when the counts do not add up.
 
 Usage:
-    python3 scripts/fusion/m04_debug_alignment_failures.py \
+    python3 scripts/fusion/m05_debug_alignment_failures.py \
         --manifest data/all/manifests/train.jsonl.gz \
         --token-file .../tokens.txt [--limit 3000] [--max-show 15] \
         [--language Vietnamese]
 """
+
+raise NotImplementedError("Not debug yet")
 
 import argparse
 import collections

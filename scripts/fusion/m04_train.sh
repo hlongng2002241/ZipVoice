@@ -6,6 +6,11 @@
 # scripts/fusion/m02_preflight_corpus.py, on your training manifest -- both
 # are cheap relative to a training run and catch corpus problems (bad
 # characters, broken phone/lm_token alignment) that this script cannot.
+# Then, REQUIRED, not optional: scripts/fusion/m03_precompute_tokens.py.
+# tokenize_text_fusion() has no live fallback -- a cut with no precomputed
+# phone/lm_token artifact is now a hard error, not a slow-but-working path
+# -- so --train-manifest/--dev-manifest below MUST point at that script's
+# --output, not the raw manifest.
 #
 # Reuses the manifests scripts/all/m00_prepare_manifest.py already produced --
 # the data is unchanged by fusion; only the text frontend is.
@@ -37,6 +42,8 @@ set -euo pipefail
 
 WARMSTART=exp/fusion/warmstart_fusion.pt
 TOKEN_FILE=scripts/all/pretrained_model_cache/hynt__ZipVoice-Vietnamese-2500h/tokens.txt
+TRAIN_MANIFEST=data/all/manifests/train.fusion_precomputed.jsonl.gz
+DEV_MANIFEST=data/all/manifests/test.fusion_precomputed.jsonl.gz
 
 if [ ! -f "$WARMSTART" ]; then
     echo "ERROR: $WARMSTART not found. Build it first:"
@@ -44,6 +51,24 @@ if [ ! -f "$WARMSTART" ]; then
     echo "      --token-file $TOKEN_FILE"
     exit 1
 fi
+
+# tokenize_text_fusion() has no live fallback (see its docstring): a raw,
+# un-precomputed manifest fails on the very first cut, mid-training-startup,
+# rather than here. Catch it before that.
+for m in "$TRAIN_MANIFEST" "$DEV_MANIFEST"; do
+    if [ ! -f "$m" ]; then
+        echo "ERROR: $m not found. Precompute it first, e.g.:"
+        echo "  python3 scripts/fusion/m03_precompute_tokens.py \\"
+        echo "      --manifest data/all/manifests/train.jsonl.gz \\"
+        echo "      --token-file $TOKEN_FILE \\"
+        echo "      --output $TRAIN_MANIFEST"
+        echo "  python3 scripts/fusion/m03_precompute_tokens.py \\"
+        echo "      --manifest data/all/manifests/test.jsonl.gz \\"
+        echo "      --token-file $TOKEN_FILE \\"
+        echo "      --output $DEV_MANIFEST"
+        exit 1
+    fi
+done
 
 TRAIN_ARGS=(
     --tokenizer fusion
@@ -69,12 +94,12 @@ TRAIN_ARGS=(
     --num-buckets 100
     --num-workers 8
     --on-the-fly-feats True
-    --save-every-n 4000
+    --save-every-n 5000
 
     --dataset custom
-    --train-manifest data/all/manifests/train.jsonl.gz
-    --dev-manifest data/all/manifests/test.jsonl.gz
-    --max-duration 190
+    --train-manifest "$TRAIN_MANIFEST"
+    --dev-manifest "$DEV_MANIFEST"
+    --max-duration 102
 )
 
 # Same self-check as the other training scripts, kept for consistency -- but

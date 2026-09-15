@@ -88,17 +88,59 @@ def extractor():
     return TruncatedQwenExtractor(num_layers=4, device=torch.device("cpu"))
 
 
+def _precompute(fusion_tokenizers, c):
+    """Mirror `scripts/fusion/m03_precompute_tokens.py`'s own per-cut logic.
+
+    `tokenize_text_fusion` no longer computes live at all (precomputed
+    tokens are compulsory -- see its docstring); the live
+    phonemize+tokenize+align step now only exists in the precompute script.
+    Tests that need a real, freshly-computed artifact go through this
+    (duplicated, not imported -- the script isn't structured as an
+    importable module, matching every other scripts/fusion/*.py) instead of
+    through `tokenize_text_fusion`.
+    """
+    from zipvoice.tokenizer.lm_tokenizer import normalize_language_name
+
+    sup = c.supervisions[0]
+    lang = normalize_language_name(getattr(sup, "language", None))
+    if lang is None:
+        raise ValueError(
+            f"cut {c.id!r} has a missing or unrecognized language "
+            f"({getattr(sup, 'language', None)!r})."
+        )
+    if lang not in fusion_tokenizers:
+        raise ValueError(
+            f"cut {c.id!r} is {lang!r}, but no FusionTokenizer was built for "
+            f"that language (have: {sorted(fusion_tokenizers)})."
+        )
+    artifact = fusion_tokenizers[lang].text_to_artifact(sup.text)
+    sup.tokens = artifact.phone_ids
+    sup.phone_groups = artifact.phone_groups
+    sup.lm_token_ids = artifact.lm_token_ids
+    sup.lm_token_groups = artifact.lm_token_groups
+    sup.fusion_schema_version = artifact.schema_version
+    sup.zero_duration_mask = None
+    return c
+
+
 def _tokenized_cuts(fusion_tokenizers):
+    """Precompute then reuse, exactly like real training does: an offline
+    precompute pass followed by `tokenize_text_fusion`'s validated reuse."""
     cuts = [
         _cut("a", "Sau khi shopping xong, chloe di an pho.", "Vietnamese"),
         _cut("b", "Hello everyone, welcome back.", "English"),
     ]
-    return CutSet.from_cuts([tokenize_text_fusion(c, fusion_tokenizers) for c in cuts])
+    return CutSet.from_cuts(
+        [
+            tokenize_text_fusion(_precompute(fusion_tokenizers, c))
+            for c in cuts
+        ]
+    )
 
 
 def test_tokenize_attaches_all_artifact_fields(fusion_tokenizers):
     cut = tokenize_text_fusion(
-        _cut("a", "Sau khi shopping xong.", "Vietnamese"), fusion_tokenizers
+        _precompute(fusion_tokenizers, _cut("a", "Sau khi shopping xong.", "Vietnamese"))
     )
     sup = cut.supervisions[0]
     assert len(sup.tokens) > 0, "phone ids land on the usual `tokens` field"
@@ -116,11 +158,11 @@ def test_tokenize_attaches_all_artifact_fields(fusion_tokenizers):
 
 def test_language_selects_the_right_tokenizer(fusion_tokenizers):
     """Each FusionTokenizer is locked to one language, so the cut's own
-    `supervision.language` has to pick between them -- picking wrong would
-    silently phonemize under the wrong rules.
+    `supervision.language` has to pick between them at precompute time --
+    picking wrong would silently phonemize under the wrong rules.
     """
-    vi = tokenize_text_fusion(_cut("a", "xin chao cac ban", "Vietnamese"), fusion_tokenizers)
-    en = tokenize_text_fusion(_cut("b", "xin chao cac ban", "English"), fusion_tokenizers)
+    vi = _precompute(fusion_tokenizers, _cut("a", "xin chao cac ban", "Vietnamese"))
+    en = _precompute(fusion_tokenizers, _cut("b", "xin chao cac ban", "English"))
     assert vi.supervisions[0].tokens != en.supervisions[0].tokens, (
         "the same text under different languages must phonemize differently"
     )
@@ -128,9 +170,83 @@ def test_language_selects_the_right_tokenizer(fusion_tokenizers):
 
 def test_unknown_language_is_rejected(fusion_tokenizers):
     with pytest.raises(ValueError, match="unrecognized language"):
-        tokenize_text_fusion(_cut("a", "hello", "Klingon"), fusion_tokenizers)
+        _precompute(fusion_tokenizers, _cut("a", "hello", "Klingon"))
     with pytest.raises(ValueError, match="no FusionTokenizer"):
-        tokenize_text_fusion(_cut("a", "ni hao", "Chinese"), fusion_tokenizers)
+        _precompute(fusion_tokenizers, _cut("a", "ni hao", "Chinese"))
+
+
+def test_missing_precomputed_artifact_is_rejected(fusion_tokenizers):
+    """The core of "precompute is compulsory": a cut that was never run
+    through scripts/fusion/m03_precompute_tokens.py must fail immediately,
+    not silently (and slowly) compute live.
+    """
+    cut = _cut("a", "Sau khi shopping xong.", "Vietnamese")
+    with pytest.raises(ValueError, match="no precomputed fusion artifact"):
+        tokenize_text_fusion(cut)
+
+
+def test_stale_precomputed_artifact_is_rejected(fusion_tokenizers):
+    """A precomputed artifact from an older schema is correct-but-stale (the
+    alignment algorithm may have changed since) -- also a hard error, not a
+    silent live recompute, since "compulsory precompute" means there is no
+    live path left to fall back to.
+    """
+    cut = _cut("a", "Sau khi shopping xong.", "Vietnamese")
+    cut.supervisions[0].tokens = [0]
+    cut.supervisions[0].phone_groups = [[0]]
+    cut.supervisions[0].lm_token_ids = [0]
+    cut.supervisions[0].lm_token_groups = [[0]]
+    cut.supervisions[0].fusion_schema_version = -1  # deliberately stale/invalid
+
+    with pytest.raises(ValueError, match="stale"):
+        tokenize_text_fusion(cut)
+
+
+def test_fast_path_rejects_corrupted_precomputed_manifest(fusion_tokenizers):
+    """A well-formed schema_version with internally inconsistent group
+    indices means a corrupted or hand-edited precomputed manifest -- must
+    fail loudly here, not silently misalign duration allocation downstream.
+    """
+    from zipvoice.tokenizer.fusion_tokenizer import SCHEMA_VERSION
+
+    cut = _cut("a", "Sau khi shopping xong.", "Vietnamese")
+    cut.supervisions[0].tokens = [0, 1, 2]
+    # Covers only {0, 1}, not {0, 1, 2} -- corrupted.
+    cut.supervisions[0].phone_groups = [[0], [1]]
+    cut.supervisions[0].lm_token_ids = [0]
+    cut.supervisions[0].lm_token_groups = [[0]]
+    cut.supervisions[0].fusion_schema_version = SCHEMA_VERSION
+
+    with pytest.raises(AssertionError, match="looks corrupted"):
+        tokenize_text_fusion(cut)
+
+
+def test_fast_path_reuses_precomputed_artifact_without_recomputing(fusion_tokenizers, monkeypatch):
+    """The fast path must not touch FusionTokenizer.text_to_artifact at all
+    -- it's not importable/usable from tokenize_text_fusion any more, but
+    assert it structurally too: patch it to fail if ever called.
+    """
+    from zipvoice.tokenizer.fusion_tokenizer import SCHEMA_VERSION, FusionTokenizer
+
+    def _must_not_be_called(self, text):
+        raise AssertionError("tokenize_text_fusion must not call text_to_artifact")
+
+    monkeypatch.setattr(FusionTokenizer, "text_to_artifact", _must_not_be_called)
+
+    precomputed = _cut("a", "Sau khi shopping xong.", "Vietnamese")
+    precomputed.supervisions[0].tokens = [0, 1, 2]
+    precomputed.supervisions[0].phone_groups = [[0], [1, 2]]
+    precomputed.supervisions[0].lm_token_ids = [5]
+    precomputed.supervisions[0].lm_token_groups = [[0], []]
+    precomputed.supervisions[0].fusion_schema_version = SCHEMA_VERSION
+
+    result = tokenize_text_fusion(precomputed)
+    sup = result.supervisions[0]
+    assert sup.tokens == [0, 1, 2]
+    assert sup.phone_groups == [[0], [1, 2]]
+    assert sup.lm_token_ids == [5]
+    assert sup.lm_token_groups == [[0], []]
+    assert getattr(sup, "zero_duration_mask", None) is None
 
 
 def test_fusion_clears_a_stale_zero_duration_mask(fusion_tokenizers):
@@ -140,9 +256,9 @@ def test_fusion_clears_a_stale_zero_duration_mask(fusion_tokenizers):
     With a length mismatch it trips an assert; with a coincidental match it
     silently gives real phones zero duration, which is worse.
     """
-    cut = _cut("a", "Sau khi shopping xong.", "Vietnamese")
+    cut = _precompute(fusion_tokenizers, _cut("a", "Sau khi shopping xong.", "Vietnamese"))
     cut.supervisions[0].zero_duration_mask = [True, False, False]
-    cut = tokenize_text_fusion(cut, fusion_tokenizers)
+    cut = tokenize_text_fusion(cut)
 
     assert getattr(cut.supervisions[0], "zero_duration_mask", None) is None
     ds = SpeechSynthesisDataset(
@@ -170,6 +286,7 @@ def test_non_fusion_tokenizer_clears_stale_group_alignment():
     cut.supervisions[0].lm_token_ids = [7, 8]
     cut.supervisions[0].lm_token_groups = [[0], [1]]
     cut.supervisions[0].zero_duration_mask = [True, False]
+    cut.supervisions[0].fusion_schema_version = 3
     cut = tokenize_text(cut, _FakeTokenizer())
 
     sup = cut.supervisions[0]
@@ -178,6 +295,7 @@ def test_non_fusion_tokenizer_clears_stale_group_alignment():
         "lm_token_ids",
         "lm_token_groups",
         "zero_duration_mask",
+        "fusion_schema_version",
     ):
         assert getattr(sup, field, None) is None, f"{field} survived"
     ds = SpeechSynthesisDataset(

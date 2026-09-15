@@ -1083,47 +1083,104 @@ def scan_pessimistic_batches_for_oom(
         )
 
 
-def tokenize_text_fusion(c: Cut, tokenizers: dict):
-    """Tokenize one cut with the Qwen+phoneme fusion frontend.
+def tokenize_text_fusion(c: Cut):
+    """Validate and reuse a precomputed Qwen+phoneme fusion artifact.
 
-    Unlike the other tokenizers, `FusionTokenizer` is locked to a single
-    language per instance (see its docstring), so `tokenizers` maps a
-    canonical short code ("en"/"vi"/"zh") to the instance for that language,
-    and the cut's own `supervision.language` selects between them.
+    **Precomputed tokens are compulsory, with no live fallback.** This used
+    to also do the live computation (whole-utterance espeak phonemization +
+    Qwen BPE tokenization + the phone/lm_token alignment search) when a cut
+    had no precomputed artifact -- that live path was removed on purpose:
+    it is the expensive part of the fusion frontend, redone every epoch
+    since train/dev cuts are lazy lhotse CutSets, and letting it silently
+    run for a manifest someone forgot to precompute would (a) make a
+    "just run training" attempt silently slow instead of failing fast, and
+    (b) let a training run start on a manifest whose alignment was never
+    checked by `scripts/fusion/m02_preflight_corpus.py`. A cut without a
+    precomputed artifact is now a hard, immediate error instead. Live
+    computation still exists -- in
+    `scripts/fusion/m03_precompute_tokens.py`, which every fusion manifest
+    must be run through first (see docs/adr/2026-09-02__qwen_phone_fusion_text_frontend.md
+    and that script's own docstring for why this is safe to precompute:
+    everything here is a pure, deterministic function of
+    `(text, language, phonemizer, Qwen tokenizer)`, with no per-epoch
+    randomness on the phone-branch side to lose by caching).
 
-    That per-utterance language is exactly the "immutable ground truth" the
-    ADR's point 1 builds the phone branch on. Sprint 001 found it is *not*
-    reliable in this corpus (~95% of "English"-labelled utterances are
-    actually Vietnamese with embedded English words), which the author chose
-    to leave unfixed -- so this path knowingly phonemizes those utterances
-    under the wrong language. Recorded here rather than silently relied on;
-    see sprint 003's "Known accepted data-quality issue".
+    Re-validates the two cheap structural invariants
+    `FusionTokenizerArtifact.__post_init__` would (group coverage,
+    `lm_token_groups` index range) -- no phonemizer/Qwen calls, so this
+    stays fast, but it catches a corrupted or hand-edited precomputed
+    manifest immediately rather than failing confusingly downstream in
+    duration allocation. A stale (schema-version-mismatched) artifact is
+    also a hard error, not a silent recompute -- "compulsory precompute"
+    means there is no live path left to fall back to; regenerate it with
+    `scripts/fusion/m03_precompute_tokens.py`.
 
-    Attaches the whole artifact's fields to the supervision so the dataset
-    can collate them: `tokens` (phone ids -- same field name the rest of the
-    pipeline already reads), plus `phone_groups`, `lm_token_ids` and
-    `lm_token_groups` for the Qwen branch.
+    Does NOT concern `lm_group_features` (the live Qwen hidden states) --
+    those stay live regardless, since --train-lm True needs them in the
+    autograd graph and the frozen case was already judged cheap enough not
+    to cache (ADR point 6). Nothing about this function changes that.
     """
-    raw_lang = getattr(c.supervisions[0], "language", None)
-    lang = normalize_language_name(raw_lang)
-    if lang is None:
+    from zipvoice.tokenizer.fusion_tokenizer import SCHEMA_VERSION
+
+    sup = c.supervisions[0]
+    cached_version = getattr(sup, "fusion_schema_version", None)
+    if cached_version is None:
         raise ValueError(
-            f"cut {c.id!r} has a missing or unrecognized language "
-            f"({raw_lang!r}). Every utterance must have a valid language; "
-            f"this should have been caught during data preparation (see "
-            f"scripts/*/m00_prepare_manifest.py)."
+            f"cut {c.id!r} has no precomputed fusion artifact "
+            f"(fusion_schema_version is missing). text_frontend='fusion' "
+            f"requires precomputed tokens -- there is no live fallback. Run "
+            f"scripts/fusion/m03_precompute_tokens.py over your manifest "
+            f"and point --train-manifest/--dev-manifest at its --output."
         )
-    if lang not in tokenizers:
+    if cached_version != SCHEMA_VERSION:
         raise ValueError(
-            f"cut {c.id!r} is {lang!r}, but no FusionTokenizer was built for "
-            f"that language (have: {sorted(tokenizers)})."
+            f"cut {c.id!r} carries a precomputed fusion artifact at "
+            f"schema_version={cached_version}, but the current "
+            f"FusionTokenizerArtifact.SCHEMA_VERSION is {SCHEMA_VERSION} -- "
+            f"stale. Re-run scripts/fusion/m03_precompute_tokens.py to "
+            f"regenerate it; there is no live fallback to fall back to."
         )
 
-    artifact = tokenizers[lang].text_to_artifact(c.supervisions[0].text)
-    c.supervisions[0].tokens = artifact.phone_ids
-    c.supervisions[0].phone_groups = artifact.phone_groups
-    c.supervisions[0].lm_token_ids = artifact.lm_token_ids
-    c.supervisions[0].lm_token_groups = artifact.lm_token_groups
+    missing = [
+        field
+        for field in ("tokens", "phone_groups", "lm_token_ids", "lm_token_groups")
+        if not hasattr(sup, field)
+    ]
+    if missing:
+        raise ValueError(
+            f"cut {c.id!r} has fusion_schema_version={cached_version} but is "
+            f"missing {missing} -- the precomputed manifest looks corrupted "
+            f"or was written by something other than "
+            f"scripts/fusion/m03_precompute_tokens.py. Re-run it."
+        )
+
+    tokens = sup.tokens
+    phone_groups = sup.phone_groups
+    lm_token_ids = sup.lm_token_ids
+    lm_token_groups = sup.lm_token_groups
+    covered = sorted(i for g in phone_groups for i in g)
+    assert covered == list(range(len(tokens))), (
+        f"cut {c.id!r}: precomputed phone_groups do not partition tokens "
+        f"exactly ({len(tokens)} tokens) -- the precomputed manifest looks "
+        f"corrupted; re-run scripts/fusion/m03_precompute_tokens.py."
+    )
+    if lm_token_groups is not None:
+        assert len(lm_token_groups) == len(phone_groups), (
+            f"cut {c.id!r}: precomputed lm_token_groups/phone_groups length "
+            f"mismatch ({len(lm_token_groups)} vs {len(phone_groups)}) -- "
+            f"the precomputed manifest looks corrupted; re-run "
+            f"scripts/fusion/m03_precompute_tokens.py."
+        )
+        n_lm = len(lm_token_ids)
+        for group in lm_token_groups:
+            for idx in group:
+                assert 0 <= idx < n_lm, (
+                    f"cut {c.id!r}: precomputed lm_token_groups index {idx} "
+                    f"out of range for {n_lm} lm_token_ids -- the "
+                    f"precomputed manifest looks corrupted; re-run "
+                    f"scripts/fusion/m03_precompute_tokens.py."
+                )
+
     # The fusion frontend owns no zero-duration phones: `[LANG:xx]` lives on
     # the lm_token side only, and every phone this emits is acoustic. Cleared
     # rather than merely not-set, so a supervision that arrived carrying a
@@ -1132,7 +1189,7 @@ def tokenize_text_fusion(c: Cut, tokenizers: dict):
     # `prepare_avg_tokens_durations`' length assert or, if the two counts
     # happened to match, silently zero the duration of real phones.
     # Assigning None is lhotse's documented way to remove a custom field.
-    c.supervisions[0].zero_duration_mask = None
+    sup.zero_duration_mask = None
     return c
 
 
@@ -1203,6 +1260,7 @@ def tokenize_text(
     c.supervisions[0].phone_groups = None
     c.supervisions[0].lm_token_ids = None
     c.supervisions[0].lm_token_groups = None
+    c.supervisions[0].fusion_schema_version = None
     return c
 
 
@@ -1690,11 +1748,13 @@ def run(rank, world_size, args):
     if params.tokenizer == "fusion":
         # No tag sampling here at all: the fusion frontend's `[LANG:xx]` is
         # deterministic (the ADR requires --lang-auto-prob/--lang-wrong-prob
-        # to be 0, enforced above) and `FusionTokenizer` prepends it itself.
-        _tokenize_text_train = partial(
-            tokenize_text_fusion, tokenizers=fusion_tokenizers
-        )
-        _tokenize_text_dev = _tokenize_text_train
+        # to be 0, enforced above) and was baked in by
+        # scripts/fusion/m03_precompute_tokens.py already. tokenize_text_fusion
+        # now only validates/reuses the precomputed artifact -- it takes no
+        # tokenizers argument, since it never computes live (see its
+        # docstring: precomputed tokens are compulsory, no fallback).
+        _tokenize_text_train = tokenize_text_fusion
+        _tokenize_text_dev = tokenize_text_fusion
     else:
         _tokenize_text_train = partial(
             tokenize_text,
