@@ -20,16 +20,29 @@ truncated Qwen forward plus per-group pooling.
 See docs/adr/2026-09-02__qwen_phone_fusion_text_frontend.md (point 6, "Qwen
 extraction contract") and sprint 003's step 1/step 3.
 
-**Deliberately not an `nn.Module` member of `ZipVoice`.** Qwen's weights are
-frozen and fully reproducible from the HuggingFace id, so registering them as
-submodules would add ~196M frozen parameters (embedding table + N layers) to
-every saved checkpoint and to `model_avg`'s float64 copy, for no benefit --
-and would force sprint 003's warm-start builder to reason about tensors that
-never change. Instead the extractor lives beside the model: a caller runs it
-and passes the resulting per-group vectors into `ZipVoice`, exactly like
-`tokens` are already computed outside the model today. This also keeps the
-"run live vs. cache offline" decision a caller-side concern (v1 runs live --
-see the ADR), swappable later without touching model code.
+**Deliberately not an `nn.Module` member of `ZipVoice`**, regardless of
+`trainable`. When frozen (the ADR default), Qwen's weights are fully
+reproducible from the HuggingFace id, so registering them as submodules would
+add ~196M frozen parameters (embedding table + N layers) to every saved
+checkpoint and to `model_avg`'s float64 copy, for no benefit -- and would
+force sprint 003's warm-start builder to reason about tensors that never
+change. Instead the extractor lives beside the model: a caller runs it and
+passes the resulting per-group vectors into `ZipVoice`, exactly like `tokens`
+are already computed outside the model today. This also keeps the "run live
+vs. cache offline" decision a caller-side concern (v1 runs live -- see the
+ADR), swappable later without touching model code.
+
+**This still holds under `trainable=True`**: `ZipVoice.state_dict()` never
+sees this extractor's weights, since it is not a submodule. A caller that
+unfreezes this must therefore handle two things itself, which
+`zipvoice/bin/train_zipvoice.py`'s `--train-lm` path does:
+`TruncatedQwenExtractor.parameters()` must be added to the optimizer
+directly (it will not appear via
+`model.parameters()`/`get_parameter_groups_with_lrs(model, ...)`), and
+`TruncatedQwenExtractor.model` must be passed explicitly to
+`save_checkpoint`/`load_checkpoint`/`resume_checkpoint`'s `lm_extractor=`
+argument (`zipvoice/utils/checkpoint.py`) -- it is not covered by saving/
+loading `model`'s own state dict.
 
 Extraction contract implemented here (all four points pinned by the ADR):
   1. **Genuinely truncated**, not sliced: the decoder layer stack is
@@ -41,7 +54,11 @@ Extraction contract implemented here (all four points pinned by the ADR):
      the freshly-trainable `linear(896->192)` downstream absorbs the scale.
   3. `use_cache=False` explicitly (Qwen2 defaults to True, building an
      unused KV-cache on every forward).
-  4. `eval()` + `torch.no_grad()`: frozen, never trained, no graph built.
+  4. `trainable=False` (default, the ADR's design): `eval()` +
+     `torch.no_grad()` on every forward, frozen, no graph built.
+     `trainable=True` (opt-in, not part of the ADR): `train()`, every
+     parameter unfrozen, forward passes graphed -- see the `trainable`
+     kwarg's docstring below for what this trades away.
 """
 
 import logging
@@ -79,6 +96,19 @@ class TruncatedQwenExtractor:
         vector at position 0 rather than a meaningful language signal; the
         language hint that actually matters reaches the model through the
         phone branch's phonemization instead.
+      trainable: False (default) is the ADR's design -- frozen, `eval()`,
+        every forward under `torch.no_grad()`. True unfreezes every Qwen
+        parameter this extractor runs (only the truncated first `num_layers`
+        -- the rest were never constructed) and runs forward passes with
+        gradients enabled, so a caller that adds
+        `TruncatedQwenExtractor.model.parameters()` to the optimizer can
+        actually fine-tune it. This is a deliberate departure from the ADR
+        (see docs/adr/2026-09-02__qwen_phone_fusion_text_frontend.md point 6,
+        "frozen ... never trained, no graph built") -- the risk it accepted
+        (catastrophic forgetting of Qwen's pretrained lexical prior on a
+        small, imbalanced corpus, which is the exact thing this fusion
+        architecture leans on) is now the caller's to manage, not something
+        this class protects against.
     """
 
     def __init__(
@@ -88,6 +118,7 @@ class TruncatedQwenExtractor:
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
         include_lang_tag: bool = True,
+        trainable: bool = False,
     ):
         try:
             from transformers import AutoModel
@@ -121,11 +152,18 @@ class TruncatedQwenExtractor:
         model.layers = nn.ModuleList(list(model.layers[:num_layers]))
         # (2) Skip Qwen's own final RMSNorm (24-layer-calibrated).
         model.norm = nn.Identity()
-        # (3)/(4) frozen, eval, no cache.
+        # (3) no cache either way -- unused whether frozen or trainable.
         model.config.use_cache = False
-        model.eval()
-        for p in model.parameters():
-            p.requires_grad_(False)
+        # (4) frozen (ADR default) vs trainable (opt-in, caller's risk --
+        # see the `trainable` docstring above).
+        if trainable:
+            model.train()
+            for p in model.parameters():
+                p.requires_grad_(True)
+        else:
+            model.eval()
+            for p in model.parameters():
+                p.requires_grad_(False)
         if device is not None:
             model.to(device)
 
@@ -135,6 +173,7 @@ class TruncatedQwenExtractor:
         self.total_layers = total_layers
         self.dtype = dtype
         self.include_lang_tag = include_lang_tag
+        self.trainable = trainable
         self.hidden_size = model.config.hidden_size
 
         logging.info(
@@ -142,8 +181,18 @@ class TruncatedQwenExtractor:
             f"{total_layers} layers, hidden_size={self.hidden_size}, "
             f"dtype={dtype}, device={self.device}, "
             f"include_lang_tag={include_lang_tag}, "
-            f"final RMSNorm skipped, frozen."
+            f"final RMSNorm skipped, "
+            f"{'TRAINABLE (unfrozen)' if trainable else 'frozen'}."
         )
+
+    def parameters(self):
+        """Passthrough so a caller can add this extractor's weights to an
+        optimizer, e.g. when `trainable=True`. Empty-yielding but harmless
+        when frozen (nothing here has `requires_grad=True` to begin with)."""
+        return self.model.parameters()
+
+    def named_parameters(self, prefix: str = "lm_extractor"):
+        return self.model.named_parameters(prefix=prefix)
 
     @property
     def device(self) -> torch.device:
@@ -153,7 +202,6 @@ class TruncatedQwenExtractor:
         self.model.to(device)
         return self
 
-    @torch.no_grad()
     def hidden_states(
         self, lm_token_ids: Sequence[Sequence[int]]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -167,6 +215,11 @@ class TruncatedQwenExtractor:
         never read (`pooled_groups()` only gathers real indices) --
         tests/test_qwen_extractor.py checks batched output matches
         one-at-a-time output for every real position.
+
+        Runs under `torch.no_grad()` unless `self.trainable` -- when frozen
+        (the ADR default) this must stay ungraphed: a live Qwen forward pass
+        every training step is only "cheap enough" (see the ADR's point 6)
+        because no backward graph is built for it.
 
         Returns:
           (hidden, lens): hidden is (B, L_max, hidden_size); lens is (B,).
@@ -188,14 +241,14 @@ class TruncatedQwenExtractor:
             torch.arange(max_len, device=device).unsqueeze(0) < lens.unsqueeze(1)
         ).to(torch.int64)
 
-        out = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-        )
+        with torch.set_grad_enabled(self.trainable):
+            out = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
         return out.last_hidden_state, lens
 
-    @torch.no_grad()
     def pooled_groups(
         self,
         lm_token_ids: Sequence[Sequence[int]],

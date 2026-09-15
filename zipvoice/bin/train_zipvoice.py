@@ -393,6 +393,35 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--train-lm",
+        type=str2bool,
+        default=False,
+        help="DANGER, opt-in, not part of the fusion ADR. Only used when "
+        "--tokenizer=fusion. False (default) keeps the Qwen branch frozen, "
+        "exactly as docs/adr/2026-09-02__qwen_phone_fusion_text_frontend.md "
+        "specifies -- the fusion architecture's premise is that Qwen's own "
+        "*pretrained* per-word language prior (measured ~96-98% accurate "
+        "zero-shot, even at 2-4 layers) is what disambiguates code-switched "
+        "content the phone branch gets wrong; fine-tuning it on this "
+        "project's own small, imbalanced corpus risks catastrophically "
+        "forgetting exactly that prior on the rare/hard words it exists to "
+        "help with. True unfreezes every parameter of the truncated Qwen "
+        "extractor and adds it to the optimizer as its own parameter group "
+        "(same --base-lr as the rest of the model; ScaledAdam, not a "
+        "separate LLM-style AdamW/warmup schedule). The Qwen weights are "
+        "ALWAYS saved/restored on --resume regardless of --train-lm (as a "
+        "separate 'lm_extractor' entry in the checkpoint, not part of "
+        "ZipVoice's own state_dict) -- frozen or fine-tuned, every fusion "
+        "checkpoint pins down exactly which Qwen weights it was trained "
+        "against. The one exception is --checkpoint (the warm-start load): "
+        "that path always starts the Qwen branch fresh from "
+        "--pretrained-tokenizer-name, since a warm-start checkpoint "
+        "predates this run's own history. --train-lm True is not supported "
+        "with world_size > 1 (raises). A big warning is printed at startup "
+        "either way, stating which mode is active.",
+    )
+
+    parser.add_argument(
         "--pretrained-tokenizer-name",
         type=str,
         default=None,
@@ -688,6 +717,7 @@ def train_one_epoch(
             filename=params.exp_dir / f"bad-model{suffix}-{rank}.pt",
             model=model,
             model_avg=model_avg,
+            lm_extractor=_lm_extractor_module(lm_extractor),
             params=params,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -827,6 +857,7 @@ def train_one_epoch(
                 global_batch_idx=params.batch_idx_train,
                 model=model,
                 model_avg=model_avg,
+                lm_extractor=_lm_extractor_module(lm_extractor),
                 params=params,
                 optimizer=optimizer,
                 scheduler=scheduler,
@@ -1185,6 +1216,14 @@ RESUME_CRITICAL_KEYS = (
     # Selects *which* frozen Qwen supplies the conditioning. A different
     # checkpoint at the same hidden width loads and runs without complaint.
     "pretrained_tokenizer_name",
+    # The saved Qwen weights themselves load correctly either way (they are
+    # always checkpointed now, frozen or not -- see _lm_extractor_module).
+    # What a silent change here would still do: resume a partially
+    # fine-tuned Qwen and freeze it mid-run (True -> False) or resume a
+    # frozen one and suddenly start training it (False -> True) -- a real
+    # change to the training regime with nothing in the log to say it was
+    # deliberate, unless this is guarded like the others here.
+    "train_lm",
 )
 
 
@@ -1239,6 +1278,79 @@ def check_resume_text_frontend(params, checkpoints) -> None:
                 f"error and train against a different text representation -- "
                 f"pass the checkpoint's value explicitly if this is deliberate."
             )
+
+
+def _lm_extractor_module(lm_extractor):
+    """The raw `nn.Module` to hand `save_checkpoint`/`load_checkpoint`, or
+    None to omit it entirely.
+
+    Saved/restored unconditionally whenever a fusion `lm_extractor` exists --
+    frozen or trainable alike -- so every fusion checkpoint pins down exactly
+    which Qwen weights (and, transitively, which upstream model revision) it
+    was trained/evaluated against, rather than relying on
+    `--pretrained-tokenizer-name` to reproduce them identically later (a
+    HuggingFace repo can be updated in place). This is a deliberate choice to
+    trade a larger checkpoint for that guarantee, for both freeze states.
+    None only when there is no fusion extractor at all (--tokenizer != fusion).
+    """
+    if lm_extractor is None:
+        return None
+    return lm_extractor.model
+
+
+def _warn_lm_freeze_state(train_lm: bool, lm_extractor) -> None:
+    """Impossible-to-miss banner stating whether the Qwen branch is being
+    fine-tuned or kept frozen this run. Printed unconditionally (every rank,
+    not just rank 0) so it can't be missed in a scrollback -- this changes
+    the fusion architecture's actual risk profile (see --train-lm's help
+    text and lm_extractor.py's module docstring), not a cosmetic setting.
+    """
+    import textwrap
+
+    n_params = sum(p.numel() for p in lm_extractor.parameters())
+    depth = f"{lm_extractor.num_layers}/{lm_extractor.total_layers} Qwen layers"
+    adr = "docs/adr/2026-09-02__qwen_phone_fusion_text_frontend.md"
+    if train_lm:
+        title = "QWEN LM BRANCH: TRAINABLE (UNFROZEN)"
+        paragraphs = [
+            f"{n_params:,} parameters across {depth} will be fine-tuned.",
+            f"This is OFF the fusion ADR's design ({adr}, point 6: "
+            f"'frozen ... never trained'). Real risk: catastrophic "
+            f"forgetting of Qwen's pretrained per-word language prior on "
+            f"this corpus's rare/hard code-switched words -- exactly what "
+            f"the fusion architecture exists to lean on.",
+            "These Qwen weights ARE saved/restored across --resume (as a "
+            "separate 'lm_extractor' checkpoint entry), but NOT by "
+            "--checkpoint (the warm-start load) -- that always starts this "
+            "run's Qwen branch fresh from --pretrained-tokenizer-name.",
+        ]
+    else:
+        title = "QWEN LM BRANCH: FROZEN"
+        paragraphs = [
+            f"{n_params:,} parameters across {depth} are frozen "
+            f"(requires_grad=False, eval(), torch.no_grad() on every "
+            f"forward).",
+            f"This is the fusion ADR's design ({adr}, point 6). Pass "
+            f"--train-lm True to unfreeze (not recommended without a "
+            f"specific reason -- see that flag's help text).",
+            "These (frozen) Qwen weights are still saved/restored across "
+            "--resume (as a separate 'lm_extractor' checkpoint entry), so "
+            "every fusion checkpoint pins down exactly which Qwen weights "
+            "it was trained against, not just --pretrained-tokenizer-name.",
+        ]
+
+    body_width = 90
+    lines = [title, ""]
+    for i, para in enumerate(paragraphs):
+        if i > 0:
+            lines.append("")
+        lines.extend(textwrap.wrap(para, width=body_width) or [""])
+
+    width = max(len(line) for line in lines) + 4
+    border = "!" * width
+    padded = [f"! {line}".ljust(width - 1) + "!" for line in lines]
+    banner = "\n".join([border] + padded + [border])
+    logging.warning("\n" + banner)
 
 
 def run(rank, world_size, args):
@@ -1328,7 +1440,21 @@ def run(rank, world_size, args):
             model_name=params.pretrained_tokenizer_name or DEFAULT_MODEL_NAME,
             num_layers=params.lm_layers,
             device=params.device,
+            trainable=params.train_lm,
         )
+        _warn_lm_freeze_state(params.train_lm, lm_extractor)
+        if params.train_lm and world_size > 1:
+            # lm_extractor.model lives outside ZipVoice's nn.Module tree, so
+            # it never gets wrapped in DDP below -- its gradients would never
+            # be all-reduced across ranks and each rank would silently drift
+            # onto a different Qwen. Refuse rather than train something that
+            # looks fine and quietly corrupts.
+            raise ValueError(
+                "--train-lm True is not supported with world_size > 1 "
+                "(DDP): lm_extractor is not part of ZipVoice's DDP-wrapped "
+                "module tree, so its per-rank gradients would never be "
+                "synchronized. Use --world-size 1 for a --train-lm run."
+            )
         # Same reason the multilingual path saves its tokenizer: inference
         # must rebuild the identical lm_token vocabulary.
         lm_tokenizer.hf_tokenizer.save_pretrained(f"{params.exp_dir}/tokenizer")
@@ -1369,6 +1495,16 @@ def run(rank, world_size, args):
 
     if params.checkpoint is not None:
         logging.info(f"Loading pre-trained model from {params.checkpoint}")
+        # Deliberately NOT passing lm_extractor= here even when --train-lm is
+        # set: this is a warm-start/base checkpoint (e.g.
+        # exp/fusion/warmstart_fusion.pt from m00_build_warmstart_checkpoint.py),
+        # not a resume of THIS run's own --train-lm history, and it will
+        # never contain an "lm_extractor" entry -- that script builds it from
+        # a pure (non-fusion) source checkpoint. The Qwen branch always
+        # starts this run from its own --pretrained-tokenizer-name init,
+        # which is exactly what leaving lm_extractor unset already does.
+        # Continuing a run's own fine-tuned Qwen weights is resume_checkpoint's
+        # job, below, not this one's.
         _ = load_checkpoint(filename=params.checkpoint, model=model, strict=True)
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of parameters : {num_param}")
@@ -1385,11 +1521,15 @@ def run(rank, world_size, args):
                 params=params,
                 model=model,
                 model_avg=model_avg,
+                lm_extractor=_lm_extractor_module(lm_extractor),
                 resume_from_checkpoint=params.resume_from_checkpoint,
             )
         else:
             checkpoints = resume_checkpoint(
-                params=params, model=model, model_avg=model_avg
+                params=params,
+                model=model,
+                model_avg=model_avg,
+                lm_extractor=_lm_extractor_module(lm_extractor),
             )
 
         check_resume_text_frontend(params, checkpoints)
@@ -1399,12 +1539,31 @@ def run(rank, world_size, args):
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
+    optimizer_param_groups = get_parameter_groups_with_lrs(
+        model,
+        lr=params.base_lr,
+        include_names=True,
+    )
+    if params.train_lm:
+        # lm_extractor is not a submodule of `model` (see lm_extractor.py's
+        # module docstring), so get_parameter_groups_with_lrs(model, ...)
+        # above never sees it -- without this, --train-lm True would set
+        # requires_grad=True and build a backward graph for nothing: no
+        # optimizer step would ever touch these tensors.
+        lm_named_params = [
+            (name, p) for name, p in lm_extractor.named_parameters() if p.requires_grad
+        ]
+        optimizer_param_groups.append(
+            {"named_params": lm_named_params, "lr": params.base_lr}
+        )
+        logging.info(
+            f"--train-lm True: added {len(lm_named_params)} lm_extractor "
+            f"parameter tensors to the optimizer (same --base-lr as the "
+            f"rest of the model)."
+        )
+
     optimizer = ScaledAdam(
-        get_parameter_groups_with_lrs(
-            model,
-            lr=params.base_lr,
-            include_names=True,
-        ),
+        optimizer_param_groups,
         lr=params.base_lr,  # should have no effect
         clipping_scale=2.0,
     )
@@ -1610,6 +1769,7 @@ def run(rank, world_size, args):
             params=params,
             model=model,
             model_avg=model_avg,
+            lm_extractor=_lm_extractor_module(lm_extractor),
             optimizer=optimizer,
             scheduler=scheduler,
             sampler=train_dl.sampler,

@@ -40,6 +40,7 @@ def save_checkpoint(
     model: Union[nn.Module, DDP],
     model_avg: Optional[nn.Module] = None,
     model_ema: Optional[nn.Module] = None,
+    lm_extractor: Optional[nn.Module] = None,
     params: Optional[Dict[str, Any]] = None,
     optimizer: Optional[Optimizer] = None,
     scheduler: Optional[LRSchedulerType] = None,
@@ -58,6 +59,16 @@ def save_checkpoint(
         The stored model averaged from the start of training.
       model_ema:
         The EMA version of model.
+      lm_extractor:
+        The fusion frontend's `TruncatedQwenExtractor.model` (the truncated
+        Qwen `nn.Module` itself, not the wrapper). Saved as a separate
+        "lm_extractor" checkpoint entry whenever given -- regardless of
+        whether it is frozen or being fine-tuned (`--train-lm`) -- so every
+        fusion checkpoint pins down exactly which Qwen weights it was
+        trained/evaluated against, rather than relying on
+        `--pretrained-tokenizer-name` to reproduce them identically later.
+        None (the default) omits it entirely; pass None explicitly for any
+        run with no fusion extractor at all (`--tokenizer != fusion`).
       params:
         User defined parameters, e.g., epoch, loss.
       optimizer:
@@ -90,6 +101,9 @@ def save_checkpoint(
         "grad_scaler": scaler.state_dict() if scaler is not None else None,
         "sampler": sampler.state_dict() if sampler is not None else None,
     }
+
+    if lm_extractor is not None:
+        checkpoint["lm_extractor"] = lm_extractor.state_dict()
 
     if model_avg is not None:
         # `nn.Module.to()` mutates in place, which would permanently
@@ -129,6 +143,7 @@ def load_checkpoint(
     model: Optional[nn.Module] = None,
     model_avg: Optional[nn.Module] = None,
     model_ema: Optional[nn.Module] = None,
+    lm_extractor: Optional[nn.Module] = None,
     strict: bool = False,
 ) -> Dict[str, Any]:
     logging.info(f"Loading checkpoint from {filename}")
@@ -160,6 +175,27 @@ def load_checkpoint(
         logging.info("Loading ema model")
         model_ema.load_state_dict(checkpoint["model_ema"], strict=strict)
         checkpoint.pop("model_ema")
+
+    if lm_extractor is not None:
+        # Unlike model_avg/model_ema, a missing key here is not necessarily
+        # benign: the caller only passes `lm_extractor` when it plans to
+        # fine-tune it (--train-lm True), so a checkpoint with no
+        # "lm_extractor" entry means either it predates --train-lm support
+        # or was saved while frozen -- either way, silently keeping today's
+        # freshly-initialized/pretrained Qwen weights instead of a
+        # previously fine-tuned checkpoint's is a correctness trap, not a
+        # graceful fallback. Fail loudly rather than guess.
+        if "lm_extractor" not in checkpoint:
+            raise KeyError(
+                f"{filename} has no 'lm_extractor' entry, but a "
+                f"lm_extractor module was passed to load it into. Either "
+                f"this checkpoint was saved with --train-lm False (or "
+                f"predates --train-lm support), or you meant to omit "
+                f"lm_extractor= for this load."
+            )
+        logging.info("Loading lm_extractor (fine-tuned Qwen branch)")
+        lm_extractor.load_state_dict(checkpoint["lm_extractor"], strict=strict)
+        checkpoint.pop("lm_extractor")
 
     return checkpoint
 
@@ -423,6 +459,7 @@ def resume_checkpoint(
     model: nn.Module,
     model_avg: nn.Module,
     model_ema: Optional[nn.Module] = None,
+    lm_extractor: Optional[nn.Module] = None,
     resume_from_checkpoint: str = None,
 ) -> Optional[Dict[str, Any]]:
     """Load checkpoint from file.
@@ -439,6 +476,9 @@ def resume_checkpoint(
         The return value of :func:`get_params`.
       model:
         The training model.
+      lm_extractor:
+        The fusion frontend's fine-tuned Qwen module (--train-lm True), or
+        None to skip it entirely -- see `load_checkpoint`'s docstring.
     Returns:
       Return a dict containing previously saved training info.
     """
@@ -454,6 +494,7 @@ def resume_checkpoint(
         model=model,
         model_avg=model_avg,
         model_ema=model_ema,
+        lm_extractor=lm_extractor,
         strict=True,
     )
 
@@ -540,6 +581,7 @@ def save_checkpoint_with_global_batch_idx(
     global_batch_idx: int,
     model: Union[nn.Module, DDP],
     model_avg: Optional[nn.Module] = None,
+    lm_extractor: Optional[nn.Module] = None,
     params: Optional[Dict[str, Any]] = None,
     optimizer: Optional[Optimizer] = None,
     scheduler: Optional[LRSchedulerType] = None,
@@ -585,6 +627,7 @@ def save_checkpoint_with_global_batch_idx(
         filename=filename,
         model=model,
         model_avg=model_avg,
+        lm_extractor=lm_extractor,
         params=params,
         optimizer=optimizer,
         scheduler=scheduler,
