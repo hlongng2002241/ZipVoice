@@ -2,6 +2,10 @@
 # Train the Qwen+phoneme fusion architecture (sprint 003 -> sprint 004), from
 # the warm-start checkpoint that scripts/fusion/m00_build_warmstart_checkpoint.py
 # builds. Run that first if exp/fusion/warmstart_fusion.pt doesn't exist.
+# Before either: scripts/fusion/m01_check_corpus_charset.py, then
+# scripts/fusion/m02_preflight_corpus.py, on your training manifest -- both
+# are cheap relative to a training run and catch corpus problems (bad
+# characters, broken phone/lm_token alignment) that this script cannot.
 #
 # Reuses the manifests scripts/all/m00_prepare_manifest.py already produced --
 # the data is unchanged by fusion; only the text frontend is.

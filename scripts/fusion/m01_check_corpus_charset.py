@@ -43,7 +43,7 @@ corpus. Run it before m02_preflight_corpus.py -- that one measures the
 *consequences* on alignment, this one finds the cause.
 
 Usage:
-    python3 scripts/fusion/m03_check_corpus_charset.py \
+    python3 scripts/fusion/m01_check_corpus_charset.py \
         --manifest data/all/manifests/train.jsonl.gz [--limit 0] \
         [--max-examples 3]
 """
